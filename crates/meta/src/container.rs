@@ -82,11 +82,8 @@ pub fn encode(meta: &ObjectMeta) -> Result<Vec<u8>, DiskError> {
     }
 
     out.extend_from_slice(&crc32c::crc32c(&out).to_le_bytes());
-    // TODO(Task 2.3): 换成 meta.inline.encode()，解码侧换成 InlineData::decode(tail)。
-    out.extend_from_slice(
-        &rmp_serde::to_vec(&meta.inline)
-            .map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))?,
-    );
+    // 内联帧追加在 CRC 之后；空 map 也照编（CRC 不覆盖此区）。
+    out.extend_from_slice(&meta.inline.encode()?);
     Ok(out)
 }
 
@@ -160,13 +157,8 @@ pub fn decode(bytes: &[u8]) -> Result<ObjectMeta, DiskError> {
         return Err(DiskError::Corrupt(CorruptKind::CrcMismatch));
     }
 
-    let tail = &bytes[crc_pos + TRAILER_LEN..];
-    let inline = if tail.is_empty() {
-        InlineData::new()
-    } else {
-        // TODO(Task 2.3): 换成 InlineData::decode(tail)。
-        rmp_serde::from_slice(tail).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))?
-    };
+    // 空尾部由 InlineData::decode 承担，此处不再另判空。
+    let inline = InlineData::decode(&bytes[crc_pos + TRAILER_LEN..])?;
 
     Ok(ObjectMeta {
         versions,
