@@ -1,0 +1,9 @@
+[package]
+name = "rstore-s3-compat"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-common.workspace = true
+thiserror.workspace = true

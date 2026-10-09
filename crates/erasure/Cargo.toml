@@ -1,0 +1,11 @@
+[package]
+name = "rstore-erasure"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-common.workspace = true
+reed-solomon-simd.workspace = true
+thiserror.workspace = true
+lru.workspace = true

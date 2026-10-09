@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+# 内部
+rstore-common    = { path = "crates/common" }
+rstore-checksum  = { path = "crates/checksum" }
+rstore-erasure   = { path = "crates/erasure" }
+rstore-meta      = { path = "crates/meta" }
+rstore-disk      = { path = "crates/disk" }
+rstore-store     = { path = "crates/store" }
+rstore-api       = { path = "crates/api" }
+rstore-s3        = { path = "crates/s3" }
+rstore-s3-compat = { path = "crates/s3-compat" }
+
+# 外部
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+bytes = "1"
+blake3 = "1"
+crc32c = "0.6"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+reed-solomon-simd = "3"
+proptest = "1"
+tempfile = "3"
+futures = "0.3"
+async-trait = "0.1"
+lru = "0.12"

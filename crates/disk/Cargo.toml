@@ -1,0 +1,13 @@
+[package]
+name = "rstore-disk"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-common.workspace = true
+rstore-meta.workspace = true
+rstore-checksum.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true

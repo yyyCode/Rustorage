@@ -1,0 +1,9 @@
+[package]
+name = "rstore-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-common.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "rstore-s3"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-api.workspace = true
+rstore-common.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

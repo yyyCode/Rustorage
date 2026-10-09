@@ -1,0 +1,16 @@
+[package]
+name = "rstore-store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-common.workspace = true
+rstore-checksum.workspace = true
+rstore-erasure.workspace = true
+rstore-meta.workspace = true
+rstore-disk.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
