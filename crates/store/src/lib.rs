@@ -10,6 +10,7 @@ pub mod quorum;
 #[cfg(test)]
 mod quorum_boundaries;
 pub mod reader;
+pub mod reconcile;
 pub mod set;
 #[cfg(test)]
 mod testutil;
