@@ -6887,6 +6887,15 @@ pub fn validate_object_key(key: &str) -> Result<(), ApiError> {
 > 在发 `//`，那时的正确动作是回来看这一条、确认它想表达的 key 到底是什么，
 > **而不是先打开这个开关**——打开它只会把「客户端发错了什么」这个信息抹掉。
 
+> **这些 key 不是理论边角，客户端真能发出来。** s3s 在
+> `ops/mod.rs:696` / `:875` 对 URI path 做了 `urlencoding::decode` 之后才切出 key，
+> 所以 `--key 'a%2F%2Fb'`、`--key 'a%2F'` 解码后到达 `validate_object_key` 的
+> 就是 `a//b`、`a/`。**注意顺序**：校验看到的是**解码后**的 key，因此规则里
+> 不必考虑 `%2E` / `%2F` 这些编码形式——它们在那之前已经被解开了。
+> 最常撞上的是**目录占位对象**：`aws s3api put-object --bucket b --key dir/`
+> 只写一个 0 字节对象来标记「文件夹」。MVP 会对它回 400，这一条已经写进
+> 「已知限制」表。
+
 > **不要重复实现 key 长度上限**：s3s 的 `parse_path_style*` 已经调了
 > `crate::path::check_key`（≤ 1024 字节，超出返回 `KeyTooLong`）。
 > 本节只补它**没有**的两条规则。
@@ -8168,7 +8177,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
 | **载荷上限约 8 MiB** | 同上一条的推论：交付给客户端的大对象只能靠 < 8 MiB 的单次 PUT | 5.6 / 5.9 | 同 5.6 |
 | **条件请求只覆盖 GET / HEAD** | `PUT` 带 `If-None-Match: *`（条件创建）**不求值**，会被当成普通 PUT。`If-Range` 也不支持 | 5.10 | 需要先给 `ObjectStore` 加原子的 conditional-put——在 S3 层「先查再写」是 TOCTOU，不能这么补 |
-| **含空段 / `.` / `..` 的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b` 与 `a/b` 当两个 key，我们直接 400 `InvalidObjectName` | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
+| **含空段 / `.` / `..` / 首尾斜杠的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b`、`a/`、`/a` 都当成与 `a/b`、`a` 不同的独立 key，我们一律 400 `InvalidObjectName`。**客户端真能构造出这些 key**，不是理论边角：s3s 在 `ops/mod.rs:696` 对 URI path 做 `urlencoding::decode`，所以 `--key 'a%2F%2Fb'` 解码后到达校验的就是 `a//b`。实际会撞上的场景是**目录占位对象**（`aws s3api put-object --bucket b --key dir/` —— 只为了建一个「文件夹」），以及任何以 `/` 结尾的 key | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
 | **虚拟主机寻址默认关闭** | 默认纯 path-style；要按 `Host: bucket.example.com` 寻址必须显式传 `--base-domain` | 5.11 | 无。这是刻意的门控，见 Task 6.3 的启动契约表 |
 | **LIST 是全盘遍历** | 大数据集上很慢；没有索引、没有分页下推（分页只在 S3 层做） | 4.11 / 5.5 | Phase 2 的索引；接口已留挂钩位 |
 | **无并发锁** | DESIGN §16.1 的按 `(bucket, key)` 分片 `RwLock` **在 M1~M5 全篇没有任何任务实现它**（`crates/store/src/` 下 `grep -rn "RwLock\|Mutex"` 只命中 `testutil.rs` 的一句注释）。PUT/GET 并发目前由文件系统语义兜底：`.staging-*` + rename 提交保证了「看不到半成品」，但**不保证同一 key 上两个并发 PUT 的先后** | — | Phase 2。连同「heal 与写共用同一把锁」那条约束一起推迟——那条约束在 heal 存在之前没有意义 |
