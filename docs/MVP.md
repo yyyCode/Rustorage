@@ -5930,7 +5930,11 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/api/Cargo.toml`（加 `async-trait`）
 - **Modify** `crates/s3/src/lib.rs`（**已存在**的骨架）
 - Create: `crates/s3/src/impl_s3.rs`
-- Modify: `crates/s3/Cargo.toml`（加 `s3s` / `async-trait` / `serde_json`）
+- Modify: `crates/s3/Cargo.toml`（`s3s` / `async-trait` / `bytes` / `futures`；`http` **必须在
+  `[dependencies]`** 里——`S3Response::with_status` 要 `http::StatusCode`，而 s3s 没有
+  re-export 它。测试再加 `tower` / `http-body-util` / `s3s-sigv4`。
+  **不要加 `serde_json`**：错误响应的 XML 由 s3s 自己按 `S3Error` 生成，
+  我们没有一处要手写 JSON）
 - Modify: 根 `Cargo.toml` 的 `[workspace.dependencies]`（加 `s3s = "0.17"`，测试要用的
   `tower` 与 `http` 也一并加进去）
 
@@ -6181,6 +6185,25 @@ let service = builder.build();
 `RstoreFs` 实现 `s3s::S3`，每个方法把 `ObjectStore` 的结果译成 `S3Response`；
 **multipart 的六个方法一律 `Err(s3s::s3_error!(NotImplemented))`**（见 5.6）。
 
+> **5.1 就把全部非 multipart 方法写成「直接委托 + 翻译」，5.2~5.5 只在上面加各自的专门行为。**
+> 这两节看起来都写了「实现」，边界是：
+>
+> - **5.1**：九个方法各自一行委托，`get_object` 传 `range: None`，`list_objects_v2` 忽略
+>   `delimiter` / `max_keys` / `continuation_token`。目的是**骨架能跑通、认证能测**——
+>   5.1 Step 2 的 `accepts_valid_sigv4` 要求 `ListBuckets` 真的返回 200，所以
+>   `NopStore` 的九个桩必须全部被调到。
+> - **5.2~5.5**：只加「本组特有」的东西——5.4 的 `resolve_range`、5.5 的分页与
+>   `common_prefixes`，以及各自那组测试。
+>
+> 所以 5.2~5.5 的 Step 2 **不是**从头实现一遍，而是改 5.1 留下的那几处。
+> 若把 5.1 缩成「只实现 `list_buckets`」，5.1 的测试就退化成只验一条路径，
+> 而其余八个方法的编译错误要等到 5.2 才暴露。
+
+> **5.1 里 `ApiError → S3 错误` 先写成 `impl_s3.rs` 内的私有 `fn to_s3_error`，**
+> 并标 `// TODO(Task 5.2): 挪到 errors.rs`。**Task 5.2 负责建 `errors.rs` 并把它搬过去**
+> （见 Task 5.2 的 Files）。5.1 不建 `errors.rs` 是为了不在骨架阶段就分出两个文件；
+> 但**搬过去这件事必须在 5.2 做完**，别让它以 `TODO` 的形态漂到 5.8。
+
 > `S3ServiceBuilder` 默认带 `AwsNameValidation`（桶名规则）。**5.7 因此不再重复实现
 > 桶名校验**——见那里的说明。
 
@@ -6207,13 +6230,18 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 | 事实 | 后果 |
 |---|---|
 | `S3` trait 的**每个方法都有默认实现**，就是 `Err(s3_error!(NotImplemented, "… is not implemented yet"))` | **5.6 是零代码**：只要不覆写那六个 multipart 方法，它们天生返回 501。别再手写六个 `Err(...)` |
-| `BucketName` / `ObjectKey` / `Prefix` / `Delimiter` / `Token` / `NextToken` / `StartAfter` / `ETag` / `ContentRange` / `AcceptRanges` / `ObjectVersionId` 都是 `pub type X = String` | 直接当 `String` 用，不必 `into()` 猜类型 |
+| `BucketName` / `ObjectKey` / `Prefix` / `Delimiter` / `Token` / `NextToken` / `StartAfter` / `ContentRange` / `AcceptRanges` / `ObjectVersionId` 都是 `pub type X = String` | 直接当 `String` 用，不必 `into()` 猜类型 |
+| **`ETag` 是 `enum ETag { Strong(String), Weak(String) }`，不是 `String` 别名** | `e_tag: Some(ETag::Strong(etag))`。写成 `Some(etag)` 编译不过——这是本表里唯一一个「看着像 String 其实不是」的类型 |
 | `Size` / `ContentLength` / `ObjectSize` = `i64`；`MaxKeys` / `KeyCount` = `i32`；`IsTruncated` = `bool` | 注意 `Size` 是 **`i64`**，`ObjectData.size` 是 `u64`，要显式 `as i64` |
 | `pub type List<T> = Vec<T>`；`Buckets = List<Bucket>`；`ObjectList = List<Object>` | `contents: Some(vec![Object { … }])` |
 | `S3Response<T>` 的 `output` 字段**会被自动序列化成响应头**（`etag` → `ETag`、`content_length` → `Content-Length`、`last_modified` → `Last-Modified`、`e_tag`、`accept_ranges`、`content_range`…） | 只需要填 `output` 的字段；**不要**手工往 `S3Response.headers` 里塞这些头，塞了也是双份 |
 | `GetObjectOutput.content_range` 为 `Some` 时，序列化器**自动把状态码设成 206** | 5.4 不需要自己设 status，只要算出 `content_range` 字符串 |
 | `GetObjectInput.range` 已经被 s3s 解析成 `Range::Int { first, last: Option<u64> }` / `Range::Suffix { length: u64 }`（`Range::parse` 内部做） | **5.4 不写 `bytes=` 解析器**。s3s 只做到「语法解析」，它不知道对象多大，所以**闭合区间与越界检查仍是我们的活** |
-| `StreamingBlob::from_bytes(Bytes)`；`StreamingBlob` 实现 `Stream<Item = Result<Bytes, StdError>>` | 读请求体用 `futures::TryStreamExt::try_concat()`（`futures` 已在 workspace 依赖里）；造响应体用 `StreamingBlob::from_bytes` |
+| `StreamingBlob::from_bytes(Bytes)`；`StreamingBlob` 实现 `Stream<Item = Result<Bytes, StdError>>` | 读请求体用 `futures::TryStreamExt::try_collect::<Vec<Bytes>>()` 再 `.concat()`——**`try_concat()` 用不了**，它要求 `Bytes: Extend<u8>`，而 `Bytes` 不满足。造响应体用 `StreamingBlob::from_bytes` |
+| `http` 与 `http-body-util` **没有被 s3s 公开 re-export**（`s3s::http` 是私有模块） | 两者都要进 `crates/s3/Cargo.toml` 的 **`[dependencies]`**——不只是 dev-dependencies：`S3Response::with_status` 要 `http::StatusCode`，5.6 的测试要 `http_body_util::Full` |
+| `s3s-sigv4` 也**没有**被 s3s 完整 re-export（只公开了 `AmzDate`，`AuthorizationV4` 在 fuzzing cfg 后面） | 测试要自己签名时，把 `s3s-sigv4 = "0.17"` 显式加进 `[dev-dependencies]`。另外 `Payload::empty()` 是 `#[cfg(test)]` 的，用不了——用公开的 `EMPTY_STRING_SHA256_HASH` + `Payload::SingleChunk(..)` |
+| `S3ServiceBuilder` 默认容忍 **900 秒**时钟偏移 | 签名测试必须用**当前 UTC 时间**；credential scope 里的日期是 **`YYYYMMDD`（8 位）**，不是完整 ISO8601——写错会被判 `Authorization` malformed |
+| 测试请求体**不能**是 `Request<Vec<u8>>` | `Vec<u8>` 不实现 `http_body::Body`，而 `S3Service` 要求 `B: Body<Data = Bytes>`。测试里用 `http_body_util::Full<Bytes>` |
 | `Timestamp: From<SystemTime>` | `mod_time`（Unix 纳秒）→ `SystemTime::UNIX_EPOCH + Duration::from_nanos(n)` → `Timestamp::from(..)` |
 | `s3s::validation::NameValidation` 只有 `validate_bucket_name`；`S3ServiceBuilder` 默认挂 `AwsNameValidation` | 桶名校验白送；**对象 key 没有校验钩子**，只能自己写（5.7） |
 
@@ -6347,8 +6375,10 @@ Ok(S3Response::new(ListBucketsOutput {
 > （`.rstore.sys/bucket.meta` 的内容就是 `{}`）。补一个假时间戳会骗客户端。
 
 **`ApiError → S3 错误` 的映射在 `crates/s3/src/errors.rs` 里。**
-本 Task **先建这个文件**，只放 `NoSuchBucket` / `BucketNotEmpty` / `Internal` 三条
-（够 5.2 的测试跑起来）；5.3~5.6 各自用到哪条就补哪条；**Task 5.8 收尾时把它补齐成完整一张表**，
+本 Task **把这个文件建出来，并把 Task 5.1 留在 `impl_s3.rs` 里的私有
+`fn to_s3_error` 搬过去**（那里标了 `TODO(Task 5.2)`）。搬过去之后只放
+`NoSuchBucket` / `BucketNotEmpty` / `Internal` 三条（够 5.2 的测试跑起来）；
+5.3~5.6 各自用到哪条就补哪条；**Task 5.8 收尾时把它补齐成完整一张表**，
 并加上那份 `assert_code` 矩阵测试。这样安排是为了不让 5.2 的测试干等 5.8——
 但 5.8 必须**核对**前面的实现确实用了这张表，而不是各自手搓了几处
 `s3_error!(NoSuchBucket)` 散落在 `impl_s3.rs` 里。散落的那种写法会在
@@ -6403,7 +6433,7 @@ async fn put_object(&self, req: S3Request<PutObjectInput>)
     };
     let info = self.store.put_object(&req.input.bucket, &req.input.key, data).await?;
     Ok(S3Response::new(PutObjectOutput {
-        e_tag: Some(info.etag), ..Default::default()
+        e_tag: Some(ETag::Strong(info.etag)), ..Default::default()
     }))
 }
 ```
@@ -6419,7 +6449,7 @@ let out = self.store.get_object(&req.input.bucket, &req.input.key, None).await?;
 Ok(S3Response::new(GetObjectOutput {
     body: Some(StreamingBlob::from_bytes(Bytes::from(out.data))),
     content_length: Some(out.size as i64),
-    e_tag: Some(out.etag),
+    e_tag: Some(ETag::Strong(out.etag)),
     last_modified: Some(timestamp_of(out.mod_time)),
     accept_ranges: Some("bytes".to_string()),
     content_range: None,   // 无 Range → 序列化器不会设 206
@@ -6546,7 +6576,9 @@ let start_after = req.input.continuation_token.clone().or(req.input.start_after.
 1. `if let Some(s) = &start_after { if entry.key <= *s { continue; } }`（**字符串比较，不是下标**）
 2. 有 delimiter 且 `key[prefix.len()..]` 里含有 delimiter → 截到第一个 delimiter **含**它，
    得到 `cp`；`common_prefixes.insert(cp)`；
-3. 否则 `contents.push(Object { key, size, e_tag, last_modified, ..Default::default() })`；
+3. 否则 `contents.push(Object { key: Some(key), size: Some(size as i64),
+   e_tag: Some(ETag::Strong(etag)), last_modified: Some(ts), ..Default::default() })`
+   （注意 `Object` 的字段都是 `Option`，且 `ETag` 是枚举——见上面那张表）；
 4. **每推进一条就检查 `contents.len() + common_prefixes.len() == max_keys`**——到了就停，
    并记下 `is_truncated = true`、`next_continuation_token = 这一条的 key`。
 
