@@ -10,7 +10,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http::StatusCode;
-use rstore_api::ObjectStore;
+use rstore_api::{ApiError, ByteRange, ObjectStore};
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, S3};
 
@@ -114,19 +114,53 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        // Range 解析/裁剪是 Task 5.4 的职责，这里先整份返回。
-        let out = self
+        // 闭合 Range 需要对象长度，先 head 拿 size 再带 range get——MVP 不流式，
+        // 两次调用可接受，不必为此改 `ObjectStore` trait。
+        let info = self
             .store
-            .get_object(&req.input.bucket, &req.input.key, None)
+            .head_object(&req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
+        let resolved = match req.input.range {
+            Some(r) => Some(match resolve_range(r, info.size) {
+                Ok(br) => br,
+                Err(ApiError::InvalidRange) => {
+                    // 416 的头只有调用点能补（它手里有 info.size）；`resolve_range`
+                    // 保持纯函数，不掺 HTTP 头。
+                    let mut err = s3s::s3_error!(InvalidRange);
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(
+                        "content-range",
+                        format!("bytes */{}", info.size).parse().expect("ascii"),
+                    );
+                    err.set_headers(headers);
+                    return Err(err);
+                }
+                Err(e) => return Err(to_s3_error(e)),
+            }),
+            // 无 Range 时必须是 None：硬凑成 0..size-1 会让 content_range 变成 Some，
+            // 于是 s3s 把普通 GET 悄悄设成 206，破坏「无 Range → 200」的既有契约。
+            None => None,
+        };
+        let out = self
+            .store
+            .get_object(&req.input.bucket, &req.input.key, resolved)
+            .await
+            .map_err(to_s3_error)?;
+        // 有 Range 时 Content-Length 是切片长度，无 Range 时才是整份长度——
+        // 写错会让客户端对着短 body 等满整份长度，表现为下载卡住。
+        let content_length = match resolved {
+            Some(br) => (br.end - br.start + 1) as i64,
+            None => out.size as i64,
+        };
         Ok(S3Response::new(GetObjectOutput {
             body: Some(StreamingBlob::from_bytes(Bytes::from(out.data))),
-            content_length: Some(out.size as i64),
+            content_length: Some(content_length),
             e_tag: Some(ETag::Strong(out.etag)),
             last_modified: Some(timestamp_of(out.mod_time)),
             accept_ranges: Some("bytes".to_string()),
-            // content_range 留 None：序列化器只在它是 Some 时才设 206。
+            // 分母是整份对象长度 `out.size`，不是请求范围的；写错 rclone 会以为被截断。
+            content_range: resolved.map(|br| format!("bytes {}-{}/{}", br.start, br.end, out.size)),
             ..Default::default()
         }))
     }
@@ -197,6 +231,32 @@ impl S3 for RstoreFs {
 fn timestamp_of(mod_time_nanos: u64) -> Timestamp {
     let system_time = UNIX_EPOCH + Duration::from_nanos(mod_time_nanos);
     Timestamp::from(system_time)
+}
+
+/// 把 s3s 解析好的 `Range` 收敛成真实对象的闭区间。越界 → `ApiError::InvalidRange`。
+///
+/// s3s 只做 `bytes=` 的语法解析，不知道对象多大，所以闭合区间与越界检查在这一层。
+/// 保持纯函数：416 响应头需要 `info.size`，由调用点补，这里不掺 HTTP 头。
+fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
+    match r {
+        Range::Int { first, last } => {
+            if first >= size {
+                return Err(ApiError::InvalidRange);
+            }
+            let end = last.unwrap_or(size - 1).min(size - 1);
+            if end < first {
+                return Err(ApiError::InvalidRange);
+            }
+            Ok(ByteRange { start: first, end })
+        }
+        Range::Suffix { length } => {
+            if length == 0 || size == 0 {
+                return Err(ApiError::InvalidRange);
+            }
+            let start = size.saturating_sub(length);
+            Ok(ByteRange { start, end: size - 1 })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +685,85 @@ mod tests {
             );
             assert!(body.is_empty(), "DELETE 响应体应为空");
         }
+    }
+
+    // ---- Task 5.4: GetObject 的 HTTP Range ----
+
+    /// Range 用例共用的对象体，26 字节（断言 `Content-Range` 的分母是 `26`）。
+    const RANGE_BODY: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+    /// 构造一个带 `Range` 头的 GET 请求，其余走 `request` 夹具。
+    fn request_with_range(path: &str, range: &str) -> http::Request<TestBody> {
+        let mut req = request("GET", path, b"");
+        req.headers_mut()
+            .insert("range", range.parse().expect("valid range header"));
+        req
+    }
+
+    /// 存入 `RANGE_BODY` 后带 `range` 头 GET 一次。
+    async fn get_range(store: Arc<MockStore>, range: &str) -> (StatusCode, HeaderMap, Bytes) {
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", RANGE_BODY),
+        )
+        .await;
+        call_on(mock_service(store), request_with_range("/test-bucket/k", range)).await
+    }
+
+    #[tokio::test]
+    async fn range_int_form_returns_206_with_content_range() {
+        let (status, headers, body) = get_range(Arc::new(MockStore::default()), "bytes=2-5").await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"cdef");
+        assert_eq!(header(&headers, "content-range"), "bytes 2-5/26");
+        assert_eq!(header(&headers, "content-length"), "4");
+    }
+
+    #[tokio::test]
+    async fn range_open_ended_form() {
+        let (status, headers, body) = get_range(Arc::new(MockStore::default()), "bytes=22-").await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"wxyz");
+        assert_eq!(header(&headers, "content-range"), "bytes 22-25/26");
+        assert_eq!(header(&headers, "content-length"), "4");
+    }
+
+    #[tokio::test]
+    async fn range_suffix_form() {
+        let (status, headers, body) = get_range(Arc::new(MockStore::default()), "bytes=-4").await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"wxyz");
+        assert_eq!(header(&headers, "content-range"), "bytes 22-25/26");
+        assert_eq!(header(&headers, "content-length"), "4");
+    }
+
+    #[tokio::test]
+    async fn range_beyond_size_is_416() {
+        let (status, headers, body) =
+            get_range(Arc::new(MockStore::default()), "bytes=100-200").await;
+        assert_eq!(
+            status,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "InvalidRange");
+        // RFC 9110 §15.5.17 的 SHOULD：416 应带回整份长度，客户端据此判断对象没变短。
+        assert_eq!(header(&headers, "content-range"), "bytes */26");
     }
 }

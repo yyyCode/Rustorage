@@ -20,6 +20,8 @@ pub(crate) fn to_s3_error(err: ApiError) -> S3Error {
         ApiError::NoSuchBucket => s3s::s3_error!(NoSuchBucket),
         // 对象读写（5.3）：GET / HEAD 一个不存在的 key → 404 NoSuchKey。
         ApiError::NoSuchKey => s3s::s3_error!(NoSuchKey),
+        // Range 越界（5.4）：GET 带 Range 请求超出对象 → 416 RangeNotSatisfiable。
+        ApiError::InvalidRange => s3s::s3_error!(InvalidRange),
         ApiError::BucketNotEmpty => s3s::s3_error!(BucketNotEmpty),
         ApiError::Internal(msg) => s3s::s3_error!(InternalError, "internal error: {msg}"),
         // 5.3~5.6 按需在此前插入各自用到的变体；5.8 收敛成完整表。
@@ -50,5 +52,6 @@ mod tests {
     #[test]
     fn object_operation_errors_map_to_their_s3_codes() {
         assert_code(ApiError::NoSuchKey, "NoSuchKey", 404);
+        assert_code(ApiError::InvalidRange, "InvalidRange", 416);
     }
 }
