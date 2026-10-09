@@ -1348,6 +1348,8 @@ name = "rstore-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "http",
  "rstore-api",
  "rstore-common",
  "rstore-disk",
