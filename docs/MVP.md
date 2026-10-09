@@ -47,7 +47,11 @@ bucket 创建、对象 CRUD、Range 读取、Multipart 上传与列出；拔掉�
 ```
 Cargo.toml                          # workspace 根
 rust-toolchain.toml                 # 固定工具链版本
-scripts/check-layer-deps.sh         # M0 依赖方向护栏
+.gitattributes                      # 强制 LF，否则 shell 脚本在 Windows checkout 后失效
+.github/workflows/ci.yml            # 护栏 + lint + test
+scripts/check-layer-deps.sh         # M0 依赖方向护栏（shell 包装）
+scripts/check_layer_deps.py         # 护栏策略与检查逻辑
+scripts/tests/test_check_layer_deps.py  # 护栏自身的回归测试
 
 crates/common/
   src/lib.rs
@@ -123,6 +127,7 @@ crates/store/tests/
   commit_crash.rs                   # Task 4.10
 crates/s3/tests/
   compat_smoke.rs                   # Task 5.9 的 Rust 侧冒烟
+tests/acceptance.sh                 # 仓库根，M6 的端到端验收驱动
 tests/compat/                       # 仓库根，仅 shell 脚本，不参与 cargo 编译
   aws_cli.sh
   mc.sh
@@ -132,6 +137,14 @@ tests/compat/                       # 仓库根，仅 shell 脚本，不参与 c
 **设计单元边界：** 每个文件单一职责。`store/` 下按**操作**分文件（put/get/delete）而非按层，
 因为这些操作各自改动时天然一起变。`meta/` 下按**关注点**分（容器格式 / 数据模型 / 分布算法），
 因为它们被不同的调用方消费。
+
+**新增 crate 的固定动作：** 在 `crates/` 下新建一个 crate 时，护栏会立刻以
+`UNKNOWN CRATE` 拦下它（这是刻意的），但另外两项加固**不会**自动继承，必须手动补：
+
+1. `Cargo.toml` 的 `[package]` 段加 `publish.workspace = true`
+2. `Cargo.toml` 末尾加 `[lints] workspace = true`
+3. 在 `scripts/check_layer_deps.py` 的 `ALLOWED` 表中登记它的允许依赖
+   （若它有内部依赖，记得按传递闭包补齐，否则闭环自检会以退出码 2 报错）
 
 ---
 
@@ -243,9 +256,11 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 
 **Files:**
 - Create: `scripts/check-layer-deps.sh`
+- Create: `scripts/check_layer_deps.py`
+- Create: `scripts/tests/test_check_layer_deps.py`
 - Create: `.gitattributes`
 - Modify: `Cargo.toml`（`[workspace.package]` 加 `publish = false`；新增 `[workspace.lints]`）
-- Modify: 10 × `crates/*/Cargo.toml`（各加 `[lints] workspace = true`）
+- Modify: 10 × `crates/*/Cargo.toml`（各加 `[lints] workspace = true` 与 `publish.workspace = true`）
 - Modify: `rust-toolchain.toml`（固定版本）
 
 - [ ] **Step 1: 写**白名单**护栏脚本**
@@ -257,11 +272,18 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 「`api → X → store`」这类绕道违规——闭包完备性由本脚本的静态表保证。
 新增 crate 或新增跨层依赖都必须显式修改本表，改动会出现在 review diff 里。
 
+产出**两个**文件：shell 包装（找解释器、调 cargo）与 Python 检查器（装策略）。
+拆开是必需的——塞在 heredoc 里的程序无法单独运行，也就无法回归测试，
+而它本身就是其余一切测试基础设施的看门人。
+
+**1a. `scripts/check-layer-deps.sh`（shell 包装）**
+
 ```bash
 #!/usr/bin/env bash
-# 校验 DESIGN §5 的依赖方向规则（R1–R4）。
-# 白名单语义：只允许表中列出的内部依赖边。表已按传递闭包补齐。
+# 校验 DESIGN §5 的依赖方向规则（R1–R4）。策略在 check_layer_deps.py。
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 解释器探测：必须真正执行一段程序并核对输出，退出码不可信。
 # Windows 上 python3 可能是 Store/MSIX 别名：`python3 --version` 正常、
@@ -280,12 +302,35 @@ if [ -z "$PYTHON" ]; then
     exit 2
 fi
 
-# 注意：这里必须写成 python3 -c "$(cat <<'PY' ... PY)"。
-# 不能写成 `cargo metadata ... | python3 - <<'PY'`——管道虽先绑定 fd 0，
-# 但同一条命令上的 heredoc 重定向会覆盖它，于是 python 从 heredoc 读"程序"，
-# 而 json.load(sys.stdin) 读到 EOF。这是 shell 重定向语义，与平台无关。
-cargo metadata --format-version 1 --no-deps | "$PYTHON" -c "$(cat <<'PY'
-import json, sys
+# 注意：管道右侧的命令绝不能带 heredoc 重定向。
+# `cargo metadata ... | python3 - <<'PY'` 是错的——管道虽先绑定 fd 0，
+# 但同一条命令上的 heredoc 会覆盖它，于是 python 读到的是程序而非 JSON。
+# `set -o pipefail` 让 cargo 失败时整条管道失败；检查器的 2 号退出码
+# 再把「护栏自身跑不起来」与「发现违规」区分开。
+#
+# 左侧保持在工作区根目录执行（cargo 需要它）。右侧把 SCRIPT_DIR 作为参数
+# 传给原生 python 时，Git Bash 会做 POSIX→Windows 路径转换，
+# 因此 Windows 上也能跑通。若日后报 “No such file”，
+# 说明该转换失效，改用 `(cd "$SCRIPT_DIR" && "$PYTHON" ./check_layer_deps.py)`。
+cargo metadata --format-version 1 --no-deps | "$PYTHON" "$SCRIPT_DIR/check_layer_deps.py"
+```
+
+**1b. `scripts/check_layer_deps.py`（检查器）**
+
+```python
+#!/usr/bin/env python3
+"""校验 DESIGN §5 的依赖方向规则（R1–R4）。
+
+从 stdin 读 `cargo metadata --format-version 1 --no-deps` 的 JSON。
+
+退出码：
+  0  合规
+  1  发现违规（未登记 crate，或跨层边）
+  2  护栏自身无法工作（输入不是合法 JSON，或白名单未按传递闭包补齐）
+     必须与 1 分开，否则 CI 日志会把基础设施故障读成「有人加了违规依赖」。
+"""
+import json
+import sys
 
 ALLOWED = {
     "rstore-common":    set(),
@@ -304,27 +349,67 @@ ALLOWED = {
                          "rstore-api", "rstore-s3", "rstore-s3-compat"},
 }
 
-meta = json.load(sys.stdin)
-fail = False
 
-for pkg in meta["packages"]:
-    name = pkg["name"]
-    if name not in ALLOWED:
-        print(f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖")
-        fail = True
-        continue
-    for dep in pkg["dependencies"]:
-        dep_name = dep["name"]
-        if not dep_name.startswith("rstore-"):
-            continue                      # 只约束内部 crate
-        if dep_name not in ALLOWED[name]:
-            kind = dep.get("kind") or "normal"
-            print(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
-            fail = True
+def table_errors(table):
+    """白名单必须按传递闭包补齐。
 
-sys.exit(1 if fail else 0)
-PY
-)"
+    否则 `api → X → store` 这类绕道违规会溜过去：api 只直接依赖 X，看似合规，
+    但 X 依赖 store，实际传递依赖已经越界。这条不变量必须机器化检查，
+    不能指望 review 时有人拿手算一遍。
+    """
+    errors = []
+    for crate, deps in table.items():
+        for reachable in deps:
+            extra = table[reachable] - deps
+            if extra:
+                errors.append(
+                    f"白名单未闭包：{crate} → {reachable} → {sorted(extra)}；"
+                    f"应把 {sorted(extra)} 并入 {crate} 的允许集合"
+                )
+    return errors
+
+
+def check(meta):
+    """返回违规消息列表。空列表表示合规。"""
+    violations = []
+    for pkg in meta["packages"]:
+        name = pkg["name"]
+        if name not in ALLOWED:
+            violations.append(
+                f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖"
+            )
+            continue
+        for dep in pkg["dependencies"]:
+            dep_name = dep["name"]
+            if not dep_name.startswith("rstore-"):
+                continue                      # 只约束内部 crate
+            if dep_name not in ALLOWED[name]:
+                kind = dep.get("kind") or "normal"
+                violations.append(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
+    return violations
+
+
+def main():
+    errors = table_errors(ALLOWED)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        meta = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: 无法解析 cargo metadata 输出：{e}", file=sys.stderr)
+        return 2
+
+    violations = check(meta)
+    for v in violations:
+        print(v)
+    return 1 if violations else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 - [ ] **Step 2: 验证脚本在当前（合规）状态下通过**
@@ -332,34 +417,161 @@ PY
 Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0，无输出
 
-- [ ] **Step 3: 验证脚本能抓到违规（两个用例，后者是黑名单会漏掉的）**
+- [ ] **Step 3: 写检查器的回归测试**
 
-用例 A —— 明显的违规。临时给 `crates/api/Cargo.toml` 加 `rstore-store.workspace = true`：
+护栏是其余一切测试基础设施的看门人，它自己必须有自动化测试。人工"改一下再改回来"
+的验证记录不算——没有东西会在后续变更时重跑它。
+
+为什么用 fixtures 而不是真去改 `crates/*/Cargo.toml`：改真仓库既慢又会污染工作区，
+而且测的是 cargo 而不是检查器。检查器的输入契约就是"stdin 上的 cargo metadata JSON"，
+直接喂 JSON 即可。
+
+新建 `scripts/tests/test_check_layer_deps.py`：
+
+```python
+#!/usr/bin/env python3
+"""scripts/check_layer_deps.py 的回归测试。
+
+用 subprocess 走真实接口（stdin 喂 JSON，断言退出码与输出），
+测的是守卫本身而不是它的复刻。
+
+运行：python3 scripts/tests/test_check_layer_deps.py
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+CHECKER = SCRIPTS_DIR / "check_layer_deps.py"
+
+sys.path.insert(0, str(SCRIPTS_DIR))
+import check_layer_deps as chk  # noqa: E402
+
+
+def pkg(name, *deps):
+    return {"name": name, "dependencies": [{"name": d} for d in deps]}
+
+
+# (用例名, stdin 载荷, 期望退出码, 期望出现在 stdout 的片段)
+CASES = [
+    ("合规输入", {"packages": [
+        pkg("rstore-common"),
+        pkg("rstore-checksum", "rstore-common"),
+        pkg("rstore-api", "rstore-common"),
+    ]}, 0, None),
+
+    ("非法边 api -> store", {"packages": [
+        pkg("rstore-api", "rstore-store"),
+    ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store  (kind=normal)"),
+
+    ("非法边 s3-compat -> store", {"packages": [
+        pkg("rstore-s3-compat", "rstore-store"),
+    ]}, 1, "FORBIDDEN EDGE: rstore-s3-compat -> rstore-store  (kind=normal)"),
+
+    ("未登记 crate", {"packages": [
+        pkg("rstore-scratch"),
+    ]}, 1, "UNKNOWN CRATE: rstore-scratch"),
+
+    ("外部依赖不算违规", {"packages": [
+        pkg("rstore-common", "serde", "bytes", "tokio"),
+    ]}, 0, None),
+
+    ("未登记 crate 也要继续查其余包", {"packages": [
+        pkg("rstore-scratch"),
+        pkg("rstore-api", "rstore-store"),
+    ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
+
+    ("输入不是合法 JSON", None, 2, None),
+]
+
+
+def run_checker(payload):
+    stdin = "" if payload is None else json.dumps(payload)
+    return subprocess.run(
+        [sys.executable, str(CHECKER)],
+        input=stdin, capture_output=True, text=True,
+    )
+
+
+def test_real_table_is_closed():
+    """真实白名单必须闭包——这是「绕道违规不可能」这条论证的全部依据。"""
+    assert chk.table_errors(chk.ALLOWED) == []
+
+
+def test_closure_check_catches_non_closed_table():
+    """未闭包的表必须被检出，否则检查器形同虚设。"""
+    bad = {"rstore-api": {"rstore-mid"}, "rstore-mid": {"rstore-store"}}
+    assert chk.table_errors(bad) != []
+
+
+def main():
+    failures = []
+
+    for label, payload, want_code, want_substr in CASES:
+        proc = run_checker(payload)
+        problems = []
+        if proc.returncode != want_code:
+            problems.append(f"退出码 {proc.returncode}，期望 {want_code}")
+        if want_substr is not None and want_substr not in proc.stdout:
+            problems.append(f"stdout 缺少 {want_substr!r}（实际 {proc.stdout!r}）")
+        if want_substr is None and want_code == 0 and proc.stdout.strip():
+            problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
+        failures += [f"{label}: {p}" for p in problems]
+
+    for fn in (test_real_table_is_closed, test_closure_check_catches_non_closed_table):
+        try:
+            fn()
+        except AssertionError as e:
+            failures.append(f"{fn.__name__}: {e}")
+
+    for f in failures:
+        print(f"FAIL {f}")
+    print(f"\n{len(CASES) + 2 - len(failures)} 项通过，{len(failures)} 项失败")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Run: `python3 scripts/tests/test_check_layer_deps.py`
+Expected: 全部通过（`9 项通过，0 项失败`），退出码 0
+
+- [ ] **Step 3b: 端到端确认——真仓库上护栏仍能抓到违规**
+
+fixtures 测的是检查器；这一步测的是"包装脚本 + 真 cargo metadata"这条链路。
+用例 A —— 临时给 `crates/api/Cargo.toml` 加 `rstore-store.workspace = true`：
 
 Run: `bash scripts/check-layer-deps.sh`
 Expected: `FORBIDDEN EDGE: rstore-api -> rstore-store  (kind=normal)`，退出码 1
 
-撤销后，用例 B —— 旧黑名单漏掉的边。临时给 `crates/s3-compat/Cargo.toml` 加
+**撤销**（确认 `git diff` 干净）后，用例 B —— 临时给 `crates/s3-compat/Cargo.toml` 加
 `rstore-store.workspace = true`：
 
 Run: `bash scripts/check-layer-deps.sh`
 Expected: `FORBIDDEN EDGE: rstore-s3-compat -> rstore-store  (kind=normal)`，退出码 1
 
-撤销后，用例 C —— 未登记的 crate。临时新建 `crates/scratch/`（含 `Cargo.toml` 与空的 `src/lib.rs`）：
+**撤销**后，用例 C —— 临时新建 `crates/scratch/`（含 `Cargo.toml` 与空的 `src/lib.rs`）：
 
 Run: `bash scripts/check-layer-deps.sh`
 Expected: `UNKNOWN CRATE: rstore-scratch 未在护栏表中登记`，退出码 1
 
-三个用例全部**撤销**后，再跑一次确认回到退出码 0。
+三个用例全部**撤销**后，再跑一次确认回到退出码 0，且 `git status` 无残留。
 
 - [ ] **Step 4: 清单加固**
 
-在根 `Cargo.toml` 的 `[workspace.package]` 中加一行（这些 crate 不发布，
-现在就设好，避免日后改 10 个清单文件）：
+在根 `Cargo.toml` 的 `[workspace.package]` 中加一行：
 
 ```toml
 publish = false
 ```
+
+> **只加这一行是不够的，而且失败方式很隐蔽。** Cargo 的 workspace 继承是**逐字段
+> 显式 opt-in**：成员只有写了 `字段.workspace = true` 才会拿到 `[workspace.package]`
+> 里的值。只在根部写 `publish = false`，cargo 实际解析出来的每个 crate 仍然是
+> `publish = None`，也就是**可发布**。它比什么都不做更糟，因为它看起来像是设好了。
+> 所以下面每个 crate 都必须同时加 `publish.workspace = true`。
 
 在根 `Cargo.toml` 末尾新增共享 lint 配置：
 
@@ -386,6 +598,18 @@ await_holding_lock = "deny"
 [lints]
 workspace = true
 ```
+
+并在**每一个** `crates/*/Cargo.toml` 的 `[package]` 段内加：
+
+```toml
+publish.workspace = true
+```
+
+加完**必须验证**继承真的生效，而不是看着根部那行就放心：
+
+Run: `cargo metadata --format-version 1 --no-deps | python3 -c "import json,sys; print({p['name']: p['publish'] for p in json.load(sys.stdin)['packages']})"`
+Expected: 每个 crate 的 `publish` 都是 `[]`（空数组 = 禁止发布）。
+若显示 `None`，说明继承没生效，`publish.workspace = true` 漏了或写错了位置。
 
 把 `rust-toolchain.toml` 的 channel 从浮动的 `"stable"` 固定到已验证的版本：
 
@@ -418,15 +642,112 @@ Expected: 输出中不含 `CRLF`
 Run: `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: 均通过，无 warning
 
+Run: `cargo fmt --all -- --check`
+Expected: 退出码 0（后续 CI 会跑这一步，先确认本地是干净的）
+
 Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
+
+Run: `python3 scripts/tests/test_check_layer_deps.py`
+Expected: `9 项通过，0 项失败`，退出码 0
 
 - [ ] **Step 7: 提交**
 
 ```bash
-git add scripts/check-layer-deps.sh .gitattributes Cargo.toml rust-toolchain.toml crates/
+git add scripts/ .gitattributes Cargo.toml rust-toolchain.toml crates/
 git commit -m "chore: allowlist-based layer guard and workspace lint hardening"
 ```
+
+---
+
+### Task 0.3: CI 接线
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+
+- [ ] **Step 1: 说明为什么这一步不能省**
+
+DESIGN §5 和 §19.5 都写着护栏"由 CI 强制"。在接线之前那句话是假的：
+脚本存在但没有任何东西运行它，一条 `api → store` 的违规边可以静默合入，
+除非恰好有人记得手动跑一次。整个任务的价值主张——「用工具而非自觉维持架构」——
+只有在这一步之后才成立。
+
+- [ ] **Step 2: 新建 `.github/workflows/ci.yml`**
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 固定了 1.97.1；rustup 会按它自动装好工具链。
+      # 显式调一次让"装工具链"这一步在日志里可见，而不是混在 build 里。
+      - name: 安装固定工具链
+        run: rustup show
+
+      - name: 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 护栏排在最前：架构违规要第一条报出来，不要等 build 跑完。
+      # 注意本任务假定 CI 镜像里有 python3。ubuntu-latest 自带；
+      # 若日后换成 slim 镜像，这一步会以退出码 2 硬失败。
+      - name: 架构护栏（依赖方向）
+        run: bash scripts/check-layer-deps.sh
+
+      - name: 护栏自测
+        run: python3 scripts/tests/test_check_layer_deps.py
+
+      - name: 格式
+        run: cargo fmt --all -- --check
+
+      - name: 构建
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace
+```
+
+- [ ] **Step 3: 本地预演，避免推上去才发现 CI 红**
+
+Run: `bash scripts/check-layer-deps.sh && python3 scripts/tests/test_check_layer_deps.py && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
+Expected: 全部退出码 0
+
+YAML 语法本地校验（只解析，不执行）：
+
+Run: `python3 -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('.github/workflows/ci.yml').read_text()); print('yaml ok')"`
+Expected: `yaml ok`。若本机没有 PyYAML，跳过并在提交信息里注明未做语法校验，不要为此装依赖。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "ci: run layer guard, lint, and tests on every push and PR"
+```
+
+> **本任务的边界**：护栏只能校验 crate 之间的依赖边。DESIGN §5 规则 R4 还有一半是
+> 文件级约定（实现绑定只允许出现在 `rstore-server/src/wiring.rs`），
+> 依赖图看不出这一点——那一半仍然靠 review。别把这个脚本当成 R4 的完整保险。
 
 ---
 
@@ -2593,6 +2914,8 @@ MVP 交付时必须全部为真：
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --all-targets -- -D warnings` 通过
 - [ ] `bash scripts/check-layer-deps.sh` 退出码 0
+- [ ] `python3 scripts/tests/test_check_layer_deps.py` 全绿
+- [ ] CI 在 `main` 与 PR 上跑通（护栏、lint、test 三步都不是跳过状态）
 - [ ] `bash tests/acceptance.sh` 输出 `ACCEPTANCE: OK`
 - [ ] 4+2 配置下：掉 2 盘可读、掉 2 盘可写、掉 3 盘读返回 `ReadQuorum` 而非错误数据
 - [ ] `FaultyDisk` 注入静默字节损坏时，读路径能检出 `BitrotMismatch`
