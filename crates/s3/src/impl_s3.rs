@@ -272,7 +272,8 @@ impl S3 for RstoreFs {
         // 续传起点：**不解析 token 的内容，就当它是「上一个 key」**。S3 不规定 token
         // 的形状，裸 key 是最小实现（少一个 base64 依赖与一次编解码来回）；代价是
         // token 里能看到对象名，但本 API 本就把对象名给同一个调用方看，不算泄露。
-        let start_after = req.input
+        let start_after = req
+            .input
             .continuation_token
             .clone()
             .or_else(|| req.input.start_after.clone());
@@ -408,7 +409,10 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
                 return Err(ApiError::InvalidRange);
             }
             let start = size.saturating_sub(length);
-            Ok(ByteRange { start, end: size - 1 })
+            Ok(ByteRange {
+                start,
+                end: size - 1,
+            })
         }
     }
 }
@@ -429,6 +433,7 @@ mod tests {
     use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
 
     use super::*;
+    use crate::build_service;
     use crate::mock::{fake_etag, MockStore};
 
     const ACCESS_KEY: &str = "testkey";
@@ -549,30 +554,40 @@ mod tests {
         xml[start..end].to_string()
     }
 
-    /// 用 `s3s` 自带的 SigV4 工具签一个 ListBuckets（`GET /`）请求。
+    /// 用 `s3s` 自带的 SigV4 工具签一个请求，`secret` 显式给出（便于故意签错）。
     ///
     /// 签名实现来自 `s3s-sigv4`（`s3s` 的直接依赖），**不是**自己另写一份：
     /// 用与被测代码不同一条路径的签名实现来生成请求，才是真的在测「服务端的校验」。
-    fn signed_list_buckets(secret: &str) -> http::Request<TestBody> {
+    ///
+    /// `host` 会同时进 URI 的 authority、`Host` 头和被签的 `SignedHeaders`——
+    /// 三者必须一致，否则服务端校验时按声明的顺序读到的值对不上签名（虚拟主机
+    /// 寻址的关键恰恰是 `Host`，只改它而不重签会先撞 `SignatureDoesNotMatch`）。
+    fn signed_request_with_secret(
+        secret: &str,
+        method: &str,
+        path: &str,
+        host: &str,
+        body: &[u8],
+    ) -> http::Request<TestBody> {
         let date = jiff::Timestamp::now()
             .strftime("%Y%m%dT%H%M%SZ")
             .to_string();
         let amz_date = AmzDate::parse(&date).expect("valid amz date");
-        let payload_hash = s3s_sigv4::EMPTY_STRING_SHA256_HASH;
+        let payload_hash = sha256_hex(body);
 
         // 顺序必须与 `SignedHeaders` 完全一致：s3s 校验时按声明的顺序读头、不做排序。
         let signed_headers = [
-            ("host", HOST),
-            ("x-amz-content-sha256", payload_hash),
+            ("host", host),
+            ("x-amz-content-sha256", payload_hash.as_str()),
             ("x-amz-date", date.as_str()),
         ];
         let query: &[(String, String)] = &[];
         let canonical = s3s_sigv4::create_canonical_request(
-            "GET",
-            "/",
+            method,
+            path,
             query,
             signed_headers,
-            Payload::SingleChunk(payload_hash),
+            Payload::SingleChunk(&payload_hash),
         );
         let string_to_sign = s3s_sigv4::create_string_to_sign(&canonical, &amz_date, REGION, "s3");
         let signature =
@@ -586,14 +601,44 @@ mod tests {
         );
 
         http::Request::builder()
-            .method("GET")
-            .uri("http://s3.example.com/")
-            .header("host", HOST)
-            .header("x-amz-content-sha256", payload_hash)
+            .method(method)
+            .uri(format!("http://{host}{path}"))
+            .header("host", host)
+            .header("x-amz-content-sha256", &payload_hash)
             .header("x-amz-date", &date)
             .header("authorization", authorization)
-            .body(Full::new(Bytes::new()))
+            .body(Full::new(Bytes::copy_from_slice(body)))
             .expect("build request")
+    }
+
+    /// 用正式密钥签一个请求（5.1 与 5.11 的业务用例都用它）。
+    fn signed_request(
+        method: &str,
+        path: &str,
+        host: &str,
+        body: &[u8],
+    ) -> http::Request<TestBody> {
+        signed_request_with_secret(SECRET_KEY, method, path, host, body)
+    }
+
+    /// 5.1 的认证测试要故意用**错误的** secret 签名，所以保留这个可传 secret 的薄封装。
+    fn signed_list_buckets(secret: &str) -> http::Request<TestBody> {
+        signed_request_with_secret(secret, "GET", "/", HOST, b"")
+    }
+
+    /// 请求体的 `x-amz-content-sha256`。空体直接用 `s3s-sigv4` 提供的常量。
+    fn sha256_hex(body: &[u8]) -> String {
+        if body.is_empty() {
+            return s3s_sigv4::EMPTY_STRING_SHA256_HASH.to_string();
+        }
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(body);
+        // 手写十六进制：`digest 0.11` 的输出类型是否实现 `LowerHex` 不确定，手写循环两版都成立。
+        digest.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", *b);
+            s
+        })
     }
 
     #[tokio::test]
@@ -748,11 +793,8 @@ mod tests {
         assert!(!header(&headers, "etag").is_empty(), "PUT 应回非空 ETag");
 
         // GET /test-bucket/k → 200，体与长度都对
-        let (status, headers, body) = call_on(
-            mock_service(store),
-            request("GET", "/test-bucket/k", b""),
-        )
-        .await;
+        let (status, headers, body) =
+            call_on(mock_service(store), request("GET", "/test-bucket/k", b"")).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -776,11 +818,8 @@ mod tests {
         )
         .await;
 
-        let (status, headers, body) = call_on(
-            mock_service(store),
-            request("HEAD", "/test-bucket/k", b""),
-        )
-        .await;
+        let (status, headers, body) =
+            call_on(mock_service(store), request("HEAD", "/test-bucket/k", b"")).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -862,7 +901,11 @@ mod tests {
             request("PUT", "/test-bucket/k", RANGE_BODY),
         )
         .await;
-        call_on(mock_service(store), request_with_range("/test-bucket/k", range)).await
+        call_on(
+            mock_service(store),
+            request_with_range("/test-bucket/k", range),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -948,7 +991,8 @@ mod tests {
         } else {
             format!("/test-bucket?list-type=2&{query}")
         };
-        let (status, _headers, body) = call_on(mock_service(store), request("GET", &path, b"")).await;
+        let (status, _headers, body) =
+            call_on(mock_service(store), request("GET", &path, b"")).await;
         (status, body)
     }
 
@@ -1066,7 +1110,10 @@ mod tests {
             "body: {}",
             String::from_utf8_lossy(&body)
         );
-        assert!(content_keys(&body).is_empty(), "max-keys=0 不应返回任何对象");
+        assert!(
+            content_keys(&body).is_empty(),
+            "max-keys=0 不应返回任何对象"
+        );
         assert_eq!(scalar(&body, "KeyCount"), "0");
         // 桶里还有 5 条没返回——`is_truncated` 表示「还有没返回完的条目」。
         assert_eq!(scalar(&body, "IsTruncated"), "true");
@@ -1094,16 +1141,30 @@ mod tests {
     async fn continuation_token_resumes_without_gap_or_dup() {
         let store = seeded_store().await;
         let (status, page1) = list(store.clone(), "max-keys=2").await;
-        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page1));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&page1)
+        );
         let token = scalar(&page1, "NextContinuationToken");
 
         // 第二页不设 max-keys，把剩下的全取回。
         let (status, page2) = list(store, &format!("continuation-token={token}")).await;
-        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page2));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&page2)
+        );
 
         let first = content_keys(&page1);
         let second = content_keys(&page2);
-        assert_eq!(second, ["dir/x", "dir/y", "z.txt"], "第二页应无缺口地接着第一页");
+        assert_eq!(
+            second,
+            ["dir/x", "dir/y", "z.txt"],
+            "第二页应无缺口地接着第一页"
+        );
         // 核心断言：并集 == 全集、交集为空。`rclone sync` 依赖它——漏一条会被当成
         // 远端文件不存在而**删除**；重一条则目录里出现重复条目。
         let mut union: BTreeSet<String> = first.iter().cloned().collect();
@@ -1127,7 +1188,12 @@ mod tests {
         let (_, page1) = list(store.clone(), "max-keys=2").await;
         let token = scalar(&page1, "NextContinuationToken");
         let (status, page2) = list(store, &format!("max-keys=2&continuation-token={token}")).await;
-        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page2));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&page2)
+        );
         assert_eq!(content_keys(&page2), ["c", "d"]);
         // 恰好填满且已到底：必须 false，否则客户端会再多翻一页空页（循环不收敛）。
         assert_eq!(scalar(&page2, "IsTruncated"), "false");
@@ -1292,7 +1358,11 @@ mod tests {
         // 不命中而回 412，正确顺序是先查到对象（这里 404）再求条件。
         let (status, _headers, body) = call_on(
             mock_service(Arc::new(MockStore::default())),
-            request_with("GET", "/test-bucket/missing", &[("if-match", "\"deadbeef\"")]),
+            request_with(
+                "GET",
+                "/test-bucket/missing",
+                &[("if-match", "\"deadbeef\"")],
+            ),
         )
         .await;
         assert_eq!(
@@ -1302,5 +1372,171 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(error_code(&body), "NoSuchKey");
+    }
+
+    // ---- Task 5.11: 虚拟主机风格寻址 ----
+
+    #[tokio::test]
+    async fn virtual_host_style_host_header_selects_bucket() {
+        let store = Arc::new(MockStore::default());
+        // `build_service` 设了 auth，所以这一节的请求**必须签名**——这正是把
+        // `signed_list_buckets` 泛化成 `signed_request` 的原因。
+        let service = build_service(store.clone(), ACCESS_KEY, SECRET_KEY, Some("example.com"))
+            .expect("valid base domain");
+
+        let payload = b"hello vhost";
+        let (status, _headers, resp) = call_on(
+            service.clone(),
+            signed_request("PUT", "/obj", "test-bucket.example.com", payload),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // 本用例的核心：桶名被解析成 `test-bucket`，而不是整个 host。
+        let keys: Vec<String> = store
+            .list_objects("test-bucket", None)
+            .await
+            .expect("list objects")
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, ["obj"], "桶名应解析成 test-bucket");
+        let wrong = store
+            .list_objects("test-bucket.example.com", None)
+            .await
+            .expect("list objects");
+        assert!(wrong.is_empty(), "不应把整个 host 当桶名: {wrong:?}");
+
+        // GET 同一个路径、同一个 Host → 200，且体与 PUT 进去的一致。
+        let (status, _headers, resp) = call_on(
+            service,
+            signed_request("GET", "/obj", "test-bucket.example.com", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(resp.as_ref(), payload, "GET 体应与 PUT 进去的一致");
+    }
+
+    #[tokio::test]
+    async fn path_style_still_works_when_base_domain_is_set() {
+        // 开了虚拟主机没有把 path-style 关掉：`SingleDomain` 内部对 `host_part ==
+        // base_part` 返回**不带 bucket** 的 `VirtualHost`，于是回落到 path-style。
+        let store = Arc::new(MockStore::default());
+        let service = build_service(store.clone(), ACCESS_KEY, SECRET_KEY, Some("example.com"))
+            .expect("valid base domain");
+
+        let payload = b"hello path style";
+        let (status, _headers, resp) = call_on(
+            service.clone(),
+            signed_request("PUT", "/test-bucket/obj", "example.com", payload),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let (status, _headers, resp) = call_on(
+            service,
+            signed_request("GET", "/test-bucket/obj", "example.com", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(resp.as_ref(), payload, "GET 体应与 PUT 进去的一致");
+        assert_eq!(
+            store
+                .list_objects("test-bucket", None)
+                .await
+                .expect("list objects")
+                .into_iter()
+                .map(|e| e.key)
+                .collect::<Vec<_>>(),
+            ["obj"]
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_outside_base_domain_becomes_its_own_bucket() {
+        // **这记录的是一个反直觉的行为，不是我们想要的功能**：`SingleDomain` 的
+        // CNAME 回退（默认开启）把 base domain 之外的整个 host 当桶名，所以
+        // `Host: other.example.net` 会被解析成 `bucket = "other.example.net"`。
+        //
+        // 为什么是 `DELETE /` 而不是 `GET /`：`MockStore::list_objects` 对不存在的桶
+        // 回 `Ok(vec![])`（它不查桶是否存在），`GET /` 会得到 200，区分不出桶名对
+        // 不对；只有 `head_bucket` / `delete_bucket` 会真的回 `NoSuchBucket`。
+        // （`HEAD /` 也能拿到 404，但 s3s 会把 HEAD 的响应体剥掉，断言不了 `<Code>`。）
+        let store = Arc::new(MockStore::default());
+        let service = build_service(store, ACCESS_KEY, SECRET_KEY, Some("example.com"))
+            .expect("valid base domain");
+
+        let (status, _headers, body) = call_on(
+            service,
+            signed_request("DELETE", "/", "other.example.net", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "NoSuchBucket");
+    }
+
+    #[tokio::test]
+    async fn ip_host_is_path_style_even_with_base_domain() {
+        // 机制：`parse_request_host`（s3s 的 `ops/mod.rs:511`）的条件是
+        // `if let (Some(host_header), Some(s3_host)) = (host_header, ccx.host)
+        //  && !is_socket_addr_or_ip_addr(host_header)`——**IP / socket 形式的 host
+        // 会把虚拟主机解析整段跳过**，`SingleDomain` 根本不会被调用，Host 头被丢弃。
+        //
+        // 对比：`localhost:9000` 既不是合法 `SocketAddr` 也不是 `IpAddr`，**不**享受
+        // 这个豁免，会被 CNAME 回退拿去做桶名（而且那处**不剥端口**），于是桶名校验
+        // 失败。别把 `127.0.0.1` 和 `localhost` 混为一谈。
+        let store = Arc::new(MockStore::default());
+        let service = build_service(store, ACCESS_KEY, SECRET_KEY, Some("example.com"))
+            .expect("valid base domain");
+
+        let (status, _headers, body) =
+            call_on(service, signed_request("GET", "/", "127.0.0.1:9000", b"")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = std::str::from_utf8(&body).expect("xml body");
+        assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
+    }
+
+    #[test] // 同步的 `#[test]`：构造期校验，不起 runtime。
+    fn invalid_base_domain_is_rejected_at_construction() {
+        // 这属于**启动期**配置错误，要在进程启动时明确报错退出，而不是拖到第一个
+        // 请求变成一个费解的 400——那时运维看到的是「服务起来了但客户端全挂」，
+        // 没有任何线索指向 `--base-domain`。
+        let store = Arc::new(MockStore::default());
+        // `let-else` 而不是 `expect_err`：`S3Service` 没实现 `Debug`，`expect_err`
+        // 编译不过；而 `.err().expect()` 会被 clippy 的 `err_expect` 挡下。
+        let Err(err) = build_service(store, ACCESS_KEY, SECRET_KEY, Some("not a domain")) else {
+            panic!("非法域名应在构造期被拒绝");
+        };
+        assert!(err.contains("not a domain"), "错误应含原始输入: {err}");
     }
 }

@@ -1330,6 +1330,7 @@ dependencies = [
  "rstore-common",
  "s3s",
  "s3s-sigv4",
+ "sha2",
  "tokio",
  "tower",
 ]

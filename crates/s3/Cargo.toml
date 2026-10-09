@@ -31,6 +31,10 @@ jiff.workspace = true
 # s3s 只 re-export 了 `AmzDate` 与 `AuthorizationV4` 的 fuzzing 门控项）。
 # 认证测试需要它来**生成**请求——用被测代码的不同一条路径签字，才算真的在测校验。
 s3s-sigv4 = "0.17"
+# 算请求体的 SHA256（SigV4 的 `x-amz-content-sha256`）。**必须是 0.11**：
+# `Cargo.lock` 里已经有 `sha2 0.11.0`（s3s-sigv4 的依赖），写 0.10 会让锁文件里
+# 同时存在两份 sha2 + 两份 digest，白涨编译时间。
+sha2 = "0.11"
 
 [lints]
 workspace = true
