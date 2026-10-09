@@ -346,11 +346,23 @@ struct PartInfo {
 
 **msgpack（`rmp-serde`）**。理由：
 
-- map 语义天然支持**未知键跳过**，给格式演进留路（P3 的 fail-open）；
 - 生态成熟，与 MinIO 这类系统的做法一致；
+- 自描述，无需长度前缀即可定位记录边界（容器格式依赖这一点）；
 - 代价是比自定义二进制稍慢——但元数据是热路径上的小对象，可接受。
 
-**编码规范**：结构体一律 `#[serde(deny_unknown_fields)]` **不启用**（否则破坏向前兼容）；字段增删一律通过新的 minor 版本承载。
+**编码规范**：结构体一律 `#[serde(deny_unknown_fields)]` **不启用**；字段增删一律通过新的 minor 版本承载。
+
+> **注意 `rmp-serde` 的实际编码形状，别按错的模型推理兼容性**：
+>
+> - **结构体编成定长 array，不是 map**（实测 `FileVersionHeader` → `0x98` fixarray(8)，
+>   `ObjectBody` → `0x97` fixarray(7)）。因此**结构体不享有「未知键跳过」**：
+>   字段增减会改变 array 长度，旧解码器读不出来。这正是「字段增删一律走 minor」的由来——
+>   兼容性由 `minor` 版本闸门承担，不由 msgpack 承担。
+> - **`BTreeMap` 字段才真正编成 map**（`InlineData`、`meta_user`、`meta_sys`），
+>   「未知键跳过」的前向兼容只在这些地方成立。S3 用户元数据落在 `meta_user`，是对的位置。
+> - **UUID 有两种线格式**：header 走 `HeaderWire` 的 `[u8; 16]` → array16；
+>   而 `ObjectBody.id` 直接走 `Uuid` 的 serde → bin8（`0xc4 0x10`）。
+>   两者都是 16 字节原始 UUID、都无连字符，差异是有意接受的（见 `crates/meta/src/fileinfo.rs` 字段注释）。
 
 ### 8.4 内联数据
 
