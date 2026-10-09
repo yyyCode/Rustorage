@@ -9056,6 +9056,11 @@ MVP 交付时必须全部为真：
 - [ ] `cargo build --workspace` 无 warning
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过
+- [ ] `cargo fmt --all --check` 干净
+      （**原清单漏了这一条**，而 Task 0.3 接的 CI 是跑它的。漏掉的后果是实打实的：
+      Task 6.3 的 `crates/server/src/startup.rs` 带着格式不合规一路绿过了 6.4，
+      直到收尾复验才被 `cargo fmt --check` 抓出来。**清单与 CI 的门禁必须一一对应**，
+      否则「本机能过」与「CI 能过」会分叉。）
 - [ ] `bash scripts/check-layer-deps.sh` 退出码 0
 - [ ] `python scripts/tests/test_check_layer_deps.py` 全绿
       （用 `python` 不用 `python3`：本机 Windows 上 `python3` 可能是 Store/MSIX 别名，
@@ -9067,6 +9072,10 @@ MVP 交付时必须全部为真：
 - [ ] `FaultyDisk` 注入静默字节损坏时，读路径能检出 `BitrotMismatch`
 - [ ] 崩溃点测试覆盖 DESIGN §12.3 的全部窗口
 - [ ] `rstore-s3-compat` 中每个中间件都有对应的冒烟测试，且注释指明来源客户端
+      （**5.9 的实际结果是这个 crate 里一个中间件都没有**：真实客户端暴露的两处失败
+      都是**缺失的标准 S3 操作**（`GetBucketLocation` / `DeleteObjects`），归属是
+      `impl_s3.rs` 而不是中间件层。所以这条是**空真**——不是漏做。判据见 5.9 的 Step 3。
+      **不要**为了「让这条看起来被满足」去补没人调用的中间件。）
 - [ ] DESIGN §1.2 的非目标清单中，没有任何一项被意外实现（范围不蔓延）
 - [ ] 六个 multipart 操作各自返回 `501 NotImplemented`（MVP 明确推迟，见 Task 5.6；
       注意 `CompleteMultipartUpload` 的测试请求必须带合法的 XML body 与 `Content-Length`，

@@ -202,9 +202,8 @@ pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome> {
     for volume in &cfg.volumes {
         match std::fs::read(volume.join("format.json")) {
             Ok(bytes) => {
-                let fmt: FormatV1 = serde_json::from_slice(&bytes).map_err(|e| {
-                    anyhow!("盘 {} 的 format.json 解析失败: {e}", volume.display())
-                })?;
+                let fmt: FormatV1 = serde_json::from_slice(&bytes)
+                    .map_err(|e| anyhow!("盘 {} 的 format.json 解析失败: {e}", volume.display()))?;
                 formats.push((volume.clone(), fmt));
             }
             Err(e) => {
@@ -281,8 +280,7 @@ pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome> {
     }
 
     let set = Arc::new(
-        ErasureSet::new(disks, cfg.parity())
-            .map_err(|e| anyhow!("构造 erasure set 失败: {e}"))?,
+        ErasureSet::new(disks, cfg.parity()).map_err(|e| anyhow!("构造 erasure set 失败: {e}"))?,
     );
     Ok(OpenOutcome { set })
 }
@@ -327,7 +325,12 @@ async fn initialize_disks(cfg: &Config) -> anyhow::Result<Vec<Option<Arc<dyn Dis
             .map_err(|e| anyhow!("写盘 {} 的 .rstore.sys/disk_id 失败: {e}", volume.display()))?;
         disk.sync_file_and_parent(".rstore.sys/disk_id")
             .await
-            .map_err(|e| anyhow!("fsync 盘 {} 的 .rstore.sys/disk_id 失败: {e}", volume.display()))?;
+            .map_err(|e| {
+                anyhow!(
+                    "fsync 盘 {} 的 .rstore.sys/disk_id 失败: {e}",
+                    volume.display()
+                )
+            })?;
 
         disks.push(Some(Arc::new(disk) as Arc<dyn DiskAPI>));
     }
@@ -392,8 +395,7 @@ mod tests {
 
         // 把其中一块盘的 format.json 改写成另一个 identity（改参与身份的 `format.id`）。
         let target = dirs[1].path().join("format.json");
-        let mut fmt: FormatV1 =
-            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        let mut fmt: FormatV1 = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
         fmt.id = "different-deployment-id".into();
         std::fs::write(&target, serde_json::to_vec_pretty(&fmt).unwrap()).unwrap();
 
