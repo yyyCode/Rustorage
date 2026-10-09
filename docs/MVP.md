@@ -247,7 +247,9 @@ Expected: `Finished` 且无 warning
 
 ```bash
 git add Cargo.toml rust-toolchain.toml crates/ .gitignore
-git commit -m "chore: scaffold workspace with per-domain crates"
+git commit -m "chore: scaffold workspace with per-domain crates
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -940,7 +942,9 @@ Expected: `14 项通过，0 项失败`，退出码 0
 
 ```bash
 git add scripts/ .gitattributes .gitignore Cargo.toml rust-toolchain.toml crates/
-git commit -m "chore: allowlist-based layer guard and workspace lint hardening"
+git commit -m "chore: allowlist-based layer guard and workspace lint hardening
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -1048,7 +1052,9 @@ Expected: `yaml ok`。若本机没有 PyYAML，跳过并在提交信息里注明
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: run layer guard, lint, and tests on every push and PR"
+git commit -m "ci: run layer guard, lint, and tests on every push and PR
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 > **本任务的边界**：护栏只能校验 crate 之间的依赖边。DESIGN §5 规则 R4 还有一半是
@@ -1191,7 +1197,9 @@ Expected: 4 个测试全部 PASS
 
 ```bash
 git add crates/meta/src/distribution.rs crates/meta/src/lib.rs crates/common/src/error.rs
-git commit -m "feat(meta): shard distribution permutation with property tests"
+git commit -m "feat(meta): shard distribution permutation with property tests
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -1310,7 +1318,9 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/checksum/ Cargo.lock
-git commit -m "feat(checksum): keyed blake3 bitrot hashing with pinned KAT"
+git commit -m "feat(checksum): keyed blake3 bitrot hashing with pinned KAT
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -1520,7 +1530,9 @@ Expected: 全部 PASS（属性测试默认 256 次）
 
 ```bash
 git add crates/erasure/ Cargo.lock
-git commit -m "feat(erasure): codec facade with roundtrip and fail-closed property tests"
+git commit -m "feat(erasure): codec facade with roundtrip and fail-closed property tests
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -1595,7 +1607,9 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/erasure/
-git commit -m "feat(erasure): LRU cache for codec shells"
+git commit -m "feat(erasure): LRU cache for codec shells
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -1751,7 +1765,9 @@ Expected: PASS
 
 ```bash
 git add crates/meta/ crates/common/src/error.rs
-git commit -m "feat(meta): object metadata data model with nil/epoch semantics"
+git commit -m "feat(meta): object metadata data model with nil/epoch semantics
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -2815,37 +2831,110 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 4.1: bitrot 分片写入器
 
 **Files:**
+- Create: `crates/store/src/error.rs`（`StoreError`。4.4/4.5/4.7 都要用它，本任务是用得最早的）
 - Create: `crates/store/src/writer.rs`
+- Modify: `crates/store/src/lib.rs`（加 `pub mod error; pub mod writer;`；现在里面只有一个文档注释）
+- Modify: `crates/store/Cargo.toml`（`[dev-dependencies]` 加 `tempfile.workspace = true`）
 - Test: 同文件 `#[cfg(test)]`
+
+> **哈希与尺寸函数已经在 `rstore-checksum` 里了**（M2 完成）：`bitrot_hash(&[u8]) -> [u8;32]`、
+> `bitrot_size(size, shard_size) -> u64`、`HASH_LEN`，密钥常量 `BITROT_KEY_V1` 也在那儿。
+> **直接 `use rstore_checksum::...`，绝不要在 store 里再写一份。** 重写一份意味着
+> 两个密钥常量：今天写进去的数据，换了实现之后校验全失败。
+> 原计划把「`bitrot_size` 的算术表」当成本任务的测试来写——那几条断言
+> （`(1,1024)→33`、`(1025,1024)→1089` …）**已经在 checksum 的 `size_arithmetic` 里钉过了**，
+> 抄一遍只是把同一张表钉两次。本任务真正该测的是**写入器的实际落盘尺寸与
+> `bitrot_size` 的预言一致**（那是跨 crate 的接缝，单测各自的绿证明不了它）。
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[tokio::test]
-async fn writes_interleaved_hash_and_data() {
-    // 写 1500 字节、block_size=1024 → 期望落盘 = (32+1024) + (32+476) = 1564
-    let tmp = TempDir::new().unwrap();
-    let disk = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
-    let w = BitrotShardWriter::new(disk, "part.1".into(), 1024);
-    w.write_block(&vec![7u8; 1024]).await.unwrap();
-    w.write_block(&vec![9u8; 476]).await.unwrap();
-    w.finish().await.unwrap();
-    let size = tokio::fs::metadata(tmp.path().join("part.1")).await.unwrap().len();
-    assert_eq!(size, 32 + 1024 + 32 + 476);
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-#[test]
-fn bitrot_size_matches_writer_output() {
-    // (原始字节数, block_size, 落盘字节数 = ceil(size/bs)*32 + size)
-    let cases = [
-        (0u64, 1024u64, 0u64),
-        (1, 1024, 33),           // 1 块: 32 + 1
-        (1024, 1024, 1056),      // 1 块: 32 + 1024
-        (1025, 1024, 1089),      // 2 块: 64 + 1025
-        (5000, 512, 5320),       // 10 块: 320 + 5000
-    ];
-    for (size, bs, want) in cases {
-        assert_eq!(bitrot_size(size, bs), want, "size={size} bs={bs}");
+    use rstore_checksum::{bitrot_hash, bitrot_size, HASH_LEN};
+    use rstore_common::disk_id::DiskId;
+    use rstore_disk::{DiskAPI, LocalDisk};
+
+    use super::*;
+    use crate::error::StoreError;
+
+    /// 真实的 `LocalDisk` 而不是内存假盘：本任务要断言的正是「落到磁盘上的字节形状」。
+    fn temp_disk() -> (tempfile::TempDir, Arc<dyn DiskAPI>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d: Arc<dyn DiskAPI> = Arc::new(LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap());
+        (tmp, d)
+    }
+
+    #[tokio::test]
+    async fn writes_interleaved_hash_and_data() {
+        // 布局：每个 block 落盘为 `[hash(32B)][data]`（DESIGN §11）。
+        let (tmp, disk) = temp_disk();
+        let mut w = BitrotShardWriter::new(disk, "part.1".into(), 1024);
+        w.push_block(&[7u8; 1024]).unwrap();
+        w.push_block(&[9u8; 476]).unwrap();
+        assert_eq!(w.payload_len(), 1500);
+        w.finish().await.unwrap();
+
+        let raw = std::fs::read(tmp.path().join("part.1")).unwrap();
+
+        // 只断言总长度是不够的：把布局写成 `[data][hash]` 的实现，总长度一模一样。
+        // 必须逐块核对摘要与数据各自的位置。
+        assert_eq!(raw.len(), 1564);
+        assert_eq!(&raw[..HASH_LEN], &bitrot_hash(&[7u8; 1024])[..]);
+        assert_eq!(&raw[HASH_LEN..HASH_LEN + 1024], &[7u8; 1024][..]);
+        assert_eq!(&raw[1056..1056 + HASH_LEN], &bitrot_hash(&[9u8; 476])[..]);
+        assert_eq!(&raw[1056 + HASH_LEN..], &[9u8; 476][..]);
+    }
+
+    /// 落盘尺寸必须等于 `rstore_checksum::bitrot_size` 的预言。两者分居两个 crate，
+    /// 若各算各的，两边单测都会绿，只有读路径会按错误的偏移去取字节。
+    #[tokio::test]
+    async fn layout_agrees_with_shared_bitrot_size() {
+        for (len, bs) in [
+            (0usize, 1024usize),
+            (1, 1024),
+            (1024, 1024),
+            (1025, 1024),
+            (5000, 512),
+        ] {
+            let (tmp, disk) = temp_disk();
+            let payload = vec![0xABu8; len];
+            let mut w = BitrotShardWriter::new(disk, "part.1".into(), bs);
+            for chunk in payload.chunks(bs) {
+                w.push_block(chunk).unwrap();
+            }
+            w.finish().await.unwrap();
+
+            let on_disk = std::fs::metadata(tmp.path().join("part.1")).unwrap().len();
+            assert_eq!(on_disk, bitrot_size(len as u64, bs as u64), "len={len} bs={bs}");
+        }
+    }
+
+    /// 短块只允许出现在**末尾**。若中间混进短块而写入器默许，读侧按
+    /// `k * (32 + block_size)` 的固定步长定位就会整体错位；错位读出的字节哈希必然对不上，
+    /// 于是被报成 `Corrupt(BitrotMismatch)`——**写入方的 bug 伪装成盘损坏，
+    /// 进而触发对健康数据的 heal**。宁可在这里拒绝。
+    #[test]
+    fn rejects_misuse_that_would_desync_the_reader() {
+        let (_tmp, disk) = temp_disk();
+        let mut w = BitrotShardWriter::new(disk, "part.1".into(), 1024);
+        w.push_block(&[1u8; 100]).unwrap(); // 短块：可以，但必须是最后一块
+        assert!(matches!(
+            w.push_block(&[2u8; 100]),
+            Err(StoreError::ShardLayout(_))
+        ));
+
+        let (_tmp, disk) = temp_disk();
+        let mut w = BitrotShardWriter::new(disk, "part.1".into(), 1024);
+        // 超长块任何时候都不合法；空块也无意义（`bitrot_size` 不会为 0 字节产生块），
+        // 多出来的那 32 字节摘要没有对应的数据，读侧会把它当成一个空块。
+        assert!(matches!(
+            w.push_block(&[3u8; 1025]),
+            Err(StoreError::ShardLayout(_))
+        ));
+        assert!(matches!(w.push_block(&[]), Err(StoreError::ShardLayout(_))));
     }
 }
 ```
@@ -2857,9 +2946,64 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-`BitrotShardWriter` 持 `DiskAPI` + 相对路径 + `block_size`，每次 `write_block` 计算
-`bitrot_hash(block)` 并**一次**追加 `[hash][data]`（一次向量写，对应 DESIGN §11）。
-`finish()` 调 `sync_file_and_parent`。
+**先写 `crates/store/src/error.rs`：**
+
+```rust
+/// store 层的错误。跨盘操作的失败必须能区分「quorum 没凑够」与「盘本身报错」——
+/// 前者是本次写失败，后者要按 `DiskError` 的三级分类决定是重试、标记落后还是触发 heal。
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("disk error: {0}")]
+    Disk(#[from] DiskError),
+    #[error("write quorum not reached: {achieved}/{required}")]
+    WriteQuorum { achieved: u8, required: u8 },
+    #[error("read quorum not reached: {achieved}/{required}")]
+    ReadQuorum { achieved: u8, required: u8 },
+    #[error("bad shard layout: {0}")]
+    ShardLayout(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+```
+
+**再写 `crates/store/src/writer.rs`：**
+
+```rust
+pub struct BitrotShardWriter {
+    disk: Arc<dyn DiskAPI>,
+    rel_path: String,
+    block_size: usize,
+    buf: Vec<u8>,
+    /// 已推入一个短块：此后不允许再推入任何块。
+    short_seen: bool,
+}
+
+impl BitrotShardWriter {
+    pub fn new(disk: Arc<dyn DiskAPI>, rel_path: String, block_size: usize) -> Self;
+
+    /// 追加一个 block：把 `[hash(32B)][data]` 追加进内部缓冲。
+    /// `data.len() <= block_size`；短块只能出现在末尾；空块一律拒绝。
+    pub fn push_block(&mut self, data: &[u8]) -> Result<(), StoreError>;
+
+    /// 已推入的原始字节数（不含摘要）。读侧构造 `BitrotShardReader` 时要拿它当
+    /// `shard_len`，所以这里必须暴露出来而不是让调用方自己累加。
+    pub fn payload_len(&self) -> u64;
+
+    /// 一次性把整份分片落盘并 fsync（文件 + 父目录）。
+    pub async fn finish(self) -> Result<(), StoreError>;
+}
+```
+
+> **为什么是「缓冲 + 一次落盘」，而不是逐块追加**：`DiskAPI::write_all` 的实现是
+> `fsx::write_all_fsync` → `File::create`，**创建即截断**。逐块调 `write_all` 的话，
+> 每次调用都会把前一块抹掉，最后盘上只剩最后一块——而每个 `write_block` 都返回 `Ok`，
+> 从调用方看一切正常。`DiskAPI` 目前没有 `append`/`write_at`，本任务也不去加它：
+> MVP 的 PUT 本来就把整份对象拿在内存里（`PutArgs { data: Vec<u8> }`），
+> 缓冲分片不会比输入本身更占内存。流式分片写入属于 Phase 2，届时给 `DiskAPI`
+> 补一个定位写方法即可，本结构体的接口不用变。
+>
+> 顺带一提，这个形状反而更符合崩溃语义：整份分片一次性写进 staging 路径，
+> 再由 rename 提交（DESIGN §12），中途崩溃留下的是一个永远不会被看见的半截文件。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -2867,32 +3011,122 @@ Run: `cargo test -p rstore-store writer`
 Expected: PASS
 
 ```bash
-git add crates/store/src/writer.rs
-git commit -m "feat(store): bitrot shard writer with interleaved layout"
+git add crates/store/ Cargo.lock
+git commit -m "feat(store): StoreError and bitrot shard writer with interleaved layout
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
 
 ### Task 4.2: bitrot 分片读取器
 
-**Files:** Modify `crates/store/src/reader.rs`（新建）
+**Files:**
+- Create: `crates/store/src/reader.rs`
+- Modify: `crates/store/src/lib.rs`（加 `pub mod reader;`）
+- Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[tokio::test]
-async fn reads_back_what_was_written() { /* 往返 1500 字节，断言逐块校验通过且内容恒等 */ }
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-#[tokio::test]
-async fn detects_bitrot() {
-    // 写 → 手工破坏落盘文件的一个数据字节 → 读必须返回 Corrupt(BitrotMismatch)
-    let err = reader.read_block(0).await.unwrap_err();
-    assert!(matches!(err, DiskError::Corrupt(CorruptKind::BitrotMismatch)));
-}
+    use rstore_checksum::{bitrot_size, HASH_LEN};
+    use rstore_common::disk_id::DiskId;
+    use rstore_common::error::{CorruptKind, DiskError, TransientKind};
+    use rstore_disk::{DiskAPI, LocalDisk};
 
-#[tokio::test]
-async fn short_file_is_transient_not_corrupt() {
-    // 文件被截断 → Transient（因为可能是写入未完成），而不是 Corrupt
+    use super::*;
+    use crate::writer::BitrotShardWriter;
+
+    const BS: usize = 1024;
+    const PAYLOAD_LEN: usize = 1500;
+
+    fn temp_disk() -> (tempfile::TempDir, Arc<dyn DiskAPI>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d: Arc<dyn DiskAPI> = Arc::new(LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap());
+        (tmp, d)
+    }
+
+    /// 用 Task 4.1 的写入器造一份真实分片——读写的布局约定本来就该由它们彼此对齐。
+    async fn write_shard(disk: &Arc<dyn DiskAPI>) {
+        let mut w = BitrotShardWriter::new(Arc::clone(disk), "part.1".into(), BS);
+        for chunk in vec![0x5Au8; PAYLOAD_LEN].chunks(BS) {
+            w.push_block(chunk).unwrap();
+        }
+        w.finish().await.unwrap();
+    }
+
+    fn reader(disk: Arc<dyn DiskAPI>) -> BitrotShardReader {
+        BitrotShardReader::new(disk, "part.1".into(), BS, PAYLOAD_LEN as u64)
+    }
+
+    #[tokio::test]
+    async fn reads_back_what_was_written() {
+        let (_tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+        assert_eq!(reader(disk).read_all().await.unwrap(), vec![0x5Au8; PAYLOAD_LEN]);
+    }
+
+    #[tokio::test]
+    async fn detects_bitrot() {
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+
+        // 破坏**数据**字节（偏移 `HASH_LEN` 起是第一个 block 的数据，不是它的摘要）。
+        // 破坏摘要字节测出的是另一条路径：那条路径证明不了「重算的数据哈希」真的在比。
+        let path = tmp.path().join("part.1");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[HASH_LEN] ^= 0xFF;
+        std::fs::write(&path, &raw).unwrap();
+
+        let err = reader(disk).read_all().await.unwrap_err();
+        assert!(
+            matches!(err, DiskError::Corrupt(CorruptKind::BitrotMismatch)),
+            "got {err:?}"
+        );
+    }
+
+    /// 文件被截断 → `Transient(ShortRead)`，**不是** `Corrupt`。
+    /// 截断很可能只是写入尚未完成；报成 `Corrupt` 会把它统计进损坏、进而触发 heal（DESIGN §17）。
+    #[tokio::test]
+    async fn short_file_is_transient_not_corrupt() {
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+
+        let path = tmp.path().join("part.1");
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 10]).unwrap();
+
+        let err = reader(disk).read_all().await.unwrap_err();
+        assert!(
+            matches!(err, DiskError::Transient(TransientKind::ShortRead)),
+            "got {err:?}"
+        );
+    }
+
+    /// 比预期**长**的文件同样是损坏：多出来的字节没人能解释。
+    /// 这条同时钉住「读取器确实会比对文件长度」——不做这个检查的实现会读完
+    /// 自己需要的字节就返回 `Ok`，把多余的尾巴静默忽略掉。
+    #[tokio::test]
+    async fn overlong_file_is_corrupt() {
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+
+        let path = tmp.path().join("part.1");
+        let mut raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, bitrot_size(PAYLOAD_LEN as u64, BS as u64));
+        raw.extend_from_slice(&[0xFF; 10]);
+        std::fs::write(&path, &raw).unwrap();
+
+        let err = reader(disk).read_all().await.unwrap_err();
+        assert!(
+            matches!(err, DiskError::Corrupt(CorruptKind::LengthMismatch)),
+            "got {err:?}"
+        );
+    }
 }
 ```
 
@@ -2903,10 +3137,49 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-`BitrotShardReader` 按 `[hash][data]` 定位：读 block `k` 需要
-`offset = k * (32 + block_size)`，长度 `32 + block_len`（最后一块可能更短，由总大小推导）。
-重算哈希并对齐比较；不匹配 → `Corrupt(BitrotMismatch)`；
-文件长度不足 → `Transient`（写入可能未完成），**不是** `Corrupt`。
+```rust
+pub struct BitrotShardReader {
+    disk: Arc<dyn DiskAPI>,
+    rel_path: String,
+    block_size: usize,
+    /// 该分片上应有的原始字节数（不含摘要）。
+    shard_len: u64,
+}
+
+impl BitrotShardReader {
+    /// `shard_len` 是**必须传**的，不是可以从文件推出来的：
+    /// 不传的话，读取器无法区分「文件被截断」与「本来就该这么短」。
+    /// 按文件长度自行推导块数的实现，一旦推少了就会返回一段**截短的数据**——
+    /// 而每一块的摘要各自都是对的，哈希校验根本拦不住它。静默丢数据是最坏的失败模式。
+    /// PUT 侧本来就知道这个数（分片原始长度），让它传下来即可。
+    pub fn new(
+        disk: Arc<dyn DiskAPI>,
+        rel_path: String,
+        block_size: usize,
+        shard_len: u64,
+    ) -> Self;
+
+    /// 读回整份分片并逐块校验，返回 `shard_len` 字节的原始数据。
+    pub async fn read_all(&self) -> Result<Vec<u8>, DiskError>;
+}
+```
+
+`read_all` 的判定顺序：
+
+1. `disk.stat(rel_path)`，`None` → `NotFound`；
+2. 期望长度 `expected = bitrot_size(shard_len, block_size)`（从 `rstore-checksum` 取，
+   与写入器同源）。`actual < expected` → `Transient(ShortRead)`；
+   `actual > expected` → `Corrupt(LengthMismatch)`；
+3. 一次性 `read_exact_at` 整份（MVP 下分片本来就是内存里的整块）；
+4. 逐块：块数 `n = shard_len.div_ceil(block_size)`，块 `k` 的数据长度是
+   `block_size`，**但最后一块**是 `shard_len - (n-1) * block_size`；
+   偏移 `k * (HASH_LEN + block_size)`，先 32 字节摘要再数据；
+   重算 `bitrot_hash(数据)` 与摘要比对，不符 → `Corrupt(BitrotMismatch)`。
+
+> 读取器只对外暴露 `read_all`。原计划让测试调 `read_block(0)`，但那会引出一个
+> 越界索引该归哪一类错误的问题——而「调用方传了越界的下标」既不是损坏也不是瞬时故障，
+> 硬塞进 `DiskError` 的任何一个变体都是在污染语义（`Corrupt` 尤其糟：会白白触发 heal）。
+> 干脆不暴露这个口子。Task 4.7 若需要区段读，那时再带着明确的错误归类来加。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -2914,8 +3187,10 @@ Run: `cargo test -p rstore-store reader`
 Expected: PASS
 
 ```bash
-git add crates/store/src/reader.rs
-git commit -m "feat(store): bitrot shard reader with corruption classification"
+git add crates/store/
+git commit -m "feat(store): bitrot shard reader with corruption classification
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -2925,7 +3200,21 @@ git commit -m "feat(store): bitrot shard reader with corruption classification"
 **Files:**
 - Create: `crates/store/src/set.rs`
 - Create: `crates/store/src/pool.rs`
+- Create: `crates/store/src/testutil.rs`（`#![cfg(test)]` 的模块；M4 所有测试共用）
+- Modify: `crates/store/src/lib.rs`（加 `pub mod set; pub mod pool;` 与 `#[cfg(test)] mod testutil;`）
+- Modify: `crates/store/Cargo.toml`（见下方「依赖」）
 - Test: `crates/store/src/set.rs` 的 `#[cfg(test)]`
+
+> **依赖（原计划的 Files 清单完全没提，缺了它 M4 一个测试都编译不过）：**
+> ```toml
+> [dev-dependencies]
+> tempfile.workspace = true
+> rstore-disk = { workspace = true, features = ["fault-injection"] }
+> ```
+> 第二条是关键。`FaultyDisk` 在 `rstore-disk` 里是 `#[cfg(any(test, feature = "fault-injection"))]`
+> 门控的——`rstore-disk` **自己**跑单测时它才存在。store 编译时 `rstore-disk` 是被依赖的
+> crate，"它的 test cfg" 根本不生效，所以必须在 store 的 dev-dependencies 里显式开这个 feature。
+> （feature 只在测试构建里被打开；正常构建的 store 不会带进故障注入代码。）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -3001,26 +3290,98 @@ pub struct ErasureSet {
 }
 
 impl ErasureSet {
-    /// 测试辅助：建 `total` 块盘、parity 为 `parity` 的 set。
-    /// 返回的 set 已挂好 `FaultyDisk`，可用 `inject_fault_on(i, fault)` 注入故障。
-    pub async fn for_test(dir: &Path, total: u8, parity: u8) -> Self;
+    /// 槽位视图，下标即分片下标。`None` = 该盘掉线。Task 4.4/4.6/4.7 都要按槽位遍历。
+    pub fn disks(&self) -> &[Option<Arc<dyn DiskAPI>>];
+
+    pub fn data(&self) -> u8 { self.data }
+    pub fn parity(&self) -> u8 { self.parity }
     pub fn total(&self) -> u8 { self.data + self.parity }
     pub fn read_quorum(&self) -> u8 { read_quorum(self.total(), self.parity) }
     pub fn write_quorum(&self) -> u8 { write_quorum(self.data, self.parity) }
 }
 ```
 
-> 测试里的 `set_with_disks(n, p)` 是 M4 测试模块内共用的辅助函数：内部建一个 `TempDir`，
-> 挂 `n` 块 `FaultyDisk`，返回持有该临时目录的 `ErasureSet`（目录随 set drop 清理）。
-> **写作 `set_with_disks(6, 2)` 表示「6 块盘、parity=2、data=4」**。整个 M4 的测试都遵循这个约定。
-> 把它写在 `crates/store/src/testutil.rs`（`#[cfg(test)]`），供各测试文件共用。
-
-**集合路由的 MVP 形态：** `Pool` 持 `Vec<Arc<ErasureSet>>`。MVP 下 `set_count == 1`
-（所有盘同属一个 set），因此路由是恒等映射。保留该维度并在 `Pool::pick_set` 处留注释：
+**测试夹具放在 `crates/store/src/testutil.rs`：**
 
 ```rust
-// MVP: set_count == 1，路由恒等。多 set 时的 SipHash 路由见 DESIGN §9.2（Phase 3）。
+//! M4 测试共用的夹具。`#![cfg(test)]` 门控，不进发布产物。
+
+/// 一个已挂好 `FaultyDisk` 的 erasure set。
+///
+/// **为什么需要这层包装**：`ErasureSet::disks` 存的是 `Arc<dyn DiskAPI>`，
+/// 类型已经擦除，拿不回 `FaultyDisk` 去调 `set_fault`。所以夹具必须自己
+/// 留一份强类型句柄。原计划让 `ErasureSet` 直接提供 `inject_fault_on(i, fault)`，
+/// 那是做不到的——`ErasureSet` 是发布代码，不该认识只在测试里存在的 `FaultyDisk`。
+///
+/// `Deref<Target = ErasureSet>` 让 `set.put_object(..)`、`set.disks()`、
+/// `commit(&set, ..)`（`&TestSet` 自动 deref 成 `&ErasureSet`）都能照常写。
+pub struct TestSet {
+    set: ErasureSet,
+    faulties: Vec<Arc<FaultyDisk>>,
+    /// 持有临时目录，随 `TestSet` drop 一起清理。
+    _dir: TempDir,
+}
+
+impl std::ops::Deref for TestSet {
+    type Target = ErasureSet;
+    fn deref(&self) -> &ErasureSet { &self.set }
+}
+
+impl TestSet {
+    /// 往第 `i` 块盘注入故障。`&self`（`FaultyDisk` 内部用 `Mutex`），
+    /// 所以测试里 `let set = ...` 不必声明 `mut`。
+    pub fn inject_fault_on(&self, i: usize, fault: Fault);
+    /// 撤销第 `i` 块盘的故障，回到正常行为。
+    pub fn clear_fault_on(&self, i: usize);
+
+    /// 在**每一块**盘上写出 `rel_path`（只有 `write_all` 会失败才跳过，正常情况全成功）。
+    ///
+    /// 给 `commit` 造出 staging 目录用的：`commit` 做的是 rename，
+    /// **源路径不存在时 rename 会以 `NotFound` 失败**。少了这一步，Task 4.4 里
+    /// 每块盘的 rename 都会失败、`achieved` 恒为 0——「绝不在低于 quorum 时报告成功」
+    /// 那条最重要的不变量测试就会**空洞地通过**（`Ok` 分支一次都进不去）。
+    pub async fn write_probe(&self, rel_path: &str, data: &[u8]);
+}
+
+/// 建 `total` 块盘、`parity` 为 `parity` 的 set（`data = total - parity`）。
+/// **`set_with_disks(6, 2)` 读作「6 块盘、parity=2、data=4」**——整个 M4 的测试都用这个约定。
+pub async fn set_with_disks(total: u8, parity: u8) -> TestSet;
 ```
+
+> **原计划这里有个签名打架**：Task 4.3 写的是 `set_with_disks(6, 2)`（盘数, parity），
+> Task 4.4 却写成了 `set_with_disks(6, |_| None).await` / `set_with_disks(n, fault)`
+> （盘数, 故障闭包）。同名不同签名，两者不可能同时成立。
+> **以 `(total, parity)` 为准**——它更简单，且「先建好再逐块注入故障」的表达力不比闭包差
+> （还能中途 `clear_fault_on` 再改）。Task 4.4 的测试相应改成先 `set_with_disks(6, 2)`，
+> 再按需 `set.inject_fault_on(i, ...)`。别再加第二个同名函数。
+
+**集合路由的 MVP 形态：** `Pool` 持 `Vec<Arc<ErasureSet>>`。MVP 下 `set_count == 1`
+（所有盘同属一个 set），因此路由是恒等映射。
+
+```rust
+pub struct Pool {
+    sets: Vec<Arc<ErasureSet>>,
+}
+
+impl Pool {
+    /// `sets` 不得为空：一个没有 set 的池子任何操作都做不了，
+    /// 让它在构造期就失败，胜过让每个调用点各自处理 `Vec` 为空。
+    pub fn new(sets: Vec<Arc<ErasureSet>>) -> Result<Self, StoreError>;
+    pub fn sets(&self) -> &[Arc<ErasureSet>];
+
+    /// 按对象键选 set。MVP 下恒等返回第一个。
+    pub fn pick_set(&self, key: &str) -> &ErasureSet {
+        // MVP: set_count == 1，路由恒等（`key` 未使用）。
+        // 多 set 时的 SipHash 路由见 DESIGN §9.2（Phase 3）。
+        let _ = key;
+        &self.sets[0]
+    }
+}
+```
+
+`Pool::new` 的空切片拒绝要有测试（`assert!(Pool::new(vec![]).is_err())`）——
+「恒定映射」的假设靠一个 `sets[0]` 撑着，`sets` 为空就是 panic。`pick_set` 本身
+不需要测试：MVP 下它没有分支。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -3028,8 +3389,10 @@ Run: `cargo test -p rstore-store set`
 Expected: PASS
 
 ```bash
-git add crates/store/src/set.rs crates/store/src/pool.rs
-git commit -m "feat(store): erasure set geometry and quorum rules"
+git add crates/store/ Cargo.lock
+git commit -m "feat(store): erasure set geometry, quorum rules, and test fixture
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3038,6 +3401,7 @@ git commit -m "feat(store): erasure set geometry and quorum rules"
 
 **Files:**
 - Create: `crates/store/src/commit.rs`
+- Modify: `crates/store/src/lib.rs`（加 `pub mod commit;`）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -3046,43 +3410,64 @@ git commit -m "feat(store): erasure set geometry and quorum rules"
 use super::*;
 use rstore_disk::faulty::{Fault, FaultKind};
 
-/// 测试辅助：构造一个 6 盘、`m=4 / n=6` 的 `ErasureSet`。
-/// `fault(i)` 返回第 i 块盘要注入的故障，`None` 表示该盘正常。
-/// **由 Task 4.3 提供**（`ErasureSet` 定型后才有实体）；4.3 若已给出等效辅助就直接复用。
-async fn set_with_disks<F>(n: usize, fault: F) -> ErasureSet
-where
-    F: Fn(usize) -> Option<Fault>,
-;
+use crate::testutil::set_with_disks;
+
+/// 每块盘都失败时用这个：`FailAfter { calls: 0 }` 表示「一次都不成功，第 1 次起就失败」。
+fn always_fail() -> Fault {
+    Fault::FailAfter { calls: 0, kind: FaultKind::Transient }
+}
 
 #[tokio::test]
 async fn commits_when_quorum_reached() {
-    let set = set_with_disks(6, |_| None).await;
+    let set = set_with_disks(6, 2).await;
+    // **必须先造出 staging 目录**：`commit` 做的是 rename，源路径不存在时
+    // rename 会以 `NotFound` 失败。不写这一步的话 achieved 恒为 0，
+    // 所有测试都会以一种「看起来在测、其实什么都没测」的方式失败或通过。
+    set.write_probe("b/o/tx1/meta.xl", b"probe").await;
+
     let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
-    assert!(r.is_ok());
+    let outcome = r.expect("6 块盘全健康，必须达到 quorum=4");
+    assert_eq!(outcome.achieved, 6);
+    assert_eq!(outcome.renamed.len(), 6);
+
+    // 舞台目录确实被搬走了，而不是复制了一份。
+    let d = set.disks()[0].as_ref().unwrap();
+    assert!(matches!(d.stat("b/o/tx1").await, Ok(None) | Err(DiskError::NotFound)));
+    assert!(matches!(d.stat("b/o/0000").await, Ok(Some(_))));
 }
 
 #[tokio::test]
 async fn fails_and_reports_when_below_quorum() {
     // 前 3 块盘 rename 必失败，只剩 3 块能成功；write_quorum = 4。
-    let set = set_with_disks(6, |i| {
-        (i < 3).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Corrupt })
-    })
-    .await;
+    let set = set_with_disks(6, 2).await;
+    set.write_probe("b/o/tx1/meta.xl", b"probe").await;
+    for i in 0..3 {
+        set.inject_fault_on(i, always_fail());
+    }
+
     let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
-    assert!(matches!(r, Err(StoreError::WriteQuorum { achieved: 3, required: 4 })));
+    assert!(
+        matches!(r, Err(StoreError::WriteQuorum { achieved: 3, required: 4 })),
+        "got {r:?}"
+    );
 }
 
 /// 回滚必须真的动手：2 块盘 rename 成功后失败，这 2 个目录不能被留下。
 /// （若删除本身也失败，残留由对账处理——所以只断言"尽力而为"的可见结果。）
 #[tokio::test]
 async fn rollback_removes_already_renamed_dirs() {
-    let set = set_with_disks(6, |i| {
-        // 0/1 正常 → rename 成功；其余全部立即失败
-        (i >= 2).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Transient })
-    })
-    .await;
+    let set = set_with_disks(6, 2).await;
+    set.write_probe("b/o/tx1/meta.xl", b"probe").await;
+    // 0/1 正常 → rename 成功；其余全部立即失败
+    for i in 2..6 {
+        set.inject_fault_on(i, always_fail());
+    }
+
     let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
-    assert!(matches!(r, Err(StoreError::WriteQuorum { achieved: 2, .. })));
+    assert!(
+        matches!(r, Err(StoreError::WriteQuorum { achieved: 2, .. })),
+        "got {r:?}"
+    );
 
     for i in [0usize, 1] {
         let d = set.disks()[i].as_ref().expect("这两块盘应当存在");
@@ -3096,15 +3481,27 @@ async fn rollback_removes_already_renamed_dirs() {
 /// **硬承诺（DESIGN §12.2）**：只要返回 Ok，成功盘数就不可能低于 write_quorum。
 /// 这是全项目最重要的一条不变量。
 /// 6 块盘、每块"成功 / 失败"两种状态 → 用位掩码穷举全部 64 种组合，不做抽样。
+///
+/// 注意这条测试有两个容易写成「空洞通过」的地方，两个都要盯住：
+/// 一是忘了 `write_probe`，于是每块盘的 rename 都因源路径不存在而失败、
+/// `Ok` 分支一次都进不去；二是只断言 `Ok` 时的 `achieved`，
+/// 就没人发现「其实一次都没成功过」。所以下面同时统计 `ok_count`。
 #[tokio::test]
 async fn never_reports_success_below_quorum() {
     const QUORUM: u8 = 4;
+    let mut ok_count = 0usize;
+
     for mask in 0u32..64 {
-        let set = set_with_disks(6, |i| {
-            (mask & (1 << i) != 0).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Corrupt })
-        })
-        .await;
+        let set = set_with_disks(6, 2).await;
+        set.write_probe("b/o/tx1/meta.xl", b"probe").await;
+        for i in 0..6 {
+            if mask & (1 << i) != 0 {
+                set.inject_fault_on(i, always_fail());
+            }
+        }
+
         if let Ok(outcome) = commit(&set, "b/o/tx1", "b/o/0000", QUORUM).await {
+            ok_count += 1;
             assert!(
                 outcome.achieved >= QUORUM,
                 "mask={mask:#07b}: 报了成功，但只达成 {} < {QUORUM}",
@@ -3112,6 +3509,10 @@ async fn never_reports_success_below_quorum() {
             );
         }
     }
+
+    // mask=0（全健康）与 mask 中失败盘数 ≤ 2 的那些都必须成功。
+    // 若这里变成 0，说明「Ok 分支」根本没被走到，上面的断言全是空转。
+    assert!(ok_count > 0, "没有任何一轮达成 quorum，这条测试没有测到东西");
 }
 ```
 
@@ -3191,8 +3592,10 @@ Run: `cargo test -p rstore-store commit`
 Expected: PASS
 
 ```bash
-git add crates/store/src/commit.rs
-git commit -m "feat(store): rename commit protocol with best-effort rollback"
+git add crates/store/
+git commit -m "feat(store): rename commit protocol with best-effort rollback
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3268,7 +3671,9 @@ Expected: PASS
 
 ```bash
 git add crates/store/src/put.rs
-git commit -m "feat(store): PUT path with erasure encoding and inline fast path"
+git commit -m "feat(store): PUT path with erasure encoding and inline fast path
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3356,7 +3761,9 @@ Expected: PASS
 
 ```bash
 git add crates/store/src/quorum.rs
-git commit -m "feat(store): metadata quorum with identity-hash voting"
+git commit -m "feat(store): metadata quorum with identity-hash voting
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3434,7 +3841,9 @@ Expected: PASS
 
 ```bash
 git add crates/store/src/get.rs
-git commit -m "feat(store): GET path with inline fast path and fail-closed quorum"
+git commit -m "feat(store): GET path with inline fast path and fail-closed quorum
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3486,7 +3895,9 @@ Expected: PASS
 
 ```bash
 git add crates/store/src/delete.rs
-git commit -m "feat(store): overwrite and delete with outvote-based GC"
+git commit -m "feat(store): overwrite and delete with outvote-based GC
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3547,7 +3958,9 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/store/tests/quorum_boundaries.rs crates/store/Cargo.toml
-git commit -m "test(store): quorum boundary matrix across failure modes"
+git commit -m "test(store): quorum boundary matrix across failure modes
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3620,7 +4033,9 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/store/tests/commit_crash.rs crates/store/src/pool.rs
-git commit -m "test(store): commit protocol crash-point invariant tests"
+git commit -m "test(store): commit protocol crash-point invariant tests
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3676,7 +4091,9 @@ async fn accepts_valid_sigv4() {
 
 ```bash
 git add crates/api/ crates/s3/
-git commit -m "feat(s3): s3s service skeleton with single root credential auth"
+git commit -m "feat(s3): s3s service skeleton with single root credential auth
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3770,7 +4187,9 @@ Expected: PASS
 
 ```bash
 git add crates/s3/src/validate.rs crates/meta/src/keys.rs crates/s3/src/impl_s3.rs
-git commit -m "feat(s3): bucket and object key validation with reserved prefix rule"
+git commit -m "feat(s3): bucket and object key validation with reserved prefix rule
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3801,7 +4220,9 @@ fn maps_store_errors_to_s3_codes() {
 
 ```bash
 git add crates/s3/src/errors.rs
-git commit -m "feat(s3): domain error to S3 error code mapping"
+git commit -m "feat(s3): domain error to S3 error code mapping
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3856,7 +4277,9 @@ Expected: 首次运行**允许失败**——失败项就是 compat 层的需求�
 
 ```bash
 git add crates/s3-compat/ tests/compat/
-git commit -m "feat(s3-compat): client ecosystem compatibility layers driven by smoke tests"
+git commit -m "feat(s3-compat): client ecosystem compatibility layers driven by smoke tests
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3900,7 +4323,9 @@ pub enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
 
 ```bash
 git add crates/server/src/readiness.rs
-git commit -m "feat(server): staged readiness with health/ready endpoints"
+git commit -m "feat(server): staged readiness with health/ready endpoints
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3932,7 +4357,9 @@ async fn exposes_prometheus_text_format() {
 
 ```bash
 git add crates/server/src/metrics.rs
-git commit -m "feat(server): prometheus metrics endpoint"
+git commit -m "feat(server): prometheus metrics endpoint
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -3967,7 +4394,9 @@ async fn shutdown_cleanly_stops_accepting_then_drains() { }
 
 ```bash
 git add crates/server/src/startup.rs crates/server/src/config_load.rs crates/server/src/main.rs
-git commit -m "feat(server): startup/shutdown orchestration with format validation"
+git commit -m "feat(server): startup/shutdown orchestration with format validation
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -4009,7 +4438,9 @@ Expected: 输出 `ACCEPTANCE: OK`
 
 ```bash
 git add tests/acceptance.sh
-git commit -m "test: end-to-end acceptance script"
+git commit -m "test: end-to-end acceptance script
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
