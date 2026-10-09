@@ -7924,7 +7924,19 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 6.1: Readiness 与健康端点
 
-**Files:** Create `crates/server/src/readiness.rs`
+**Files:**
+- Create `crates/server/src/readiness.rs`
+- Modify `crates/server/src/lib.rs`（加 `pub mod readiness;`）
+- Modify `crates/server/Cargo.toml`（`[dependencies]` 加 `http`、`bytes`）
+
+> **`crates/server/src/lib.rs` 现在整个文件只有一行文档注释。** 不往里加
+> `pub mod readiness;` 的话，这个新文件**根本不会被编译**——测试一个都不会跑，
+> 而 `cargo test` 会显示全绿（只是少了几条）。`git add` 里也必须有它。
+>
+> **6.1 不建 HTTP 服务器，也不做路由。** 路由与监听在 6.3（那才是唯一知道
+> 端口与 s3s 的地方）。本任务只提供**构造响应**的纯函数，测试直接调用它们并断言
+> 状态码与响应头——这样 `#[tokio::test]` 里不需要 tower、不需要 socket，
+> 也不需要给 `crates/server` 加 `tower` / `http-body-util` 这两个依赖。
 
 > **这三个端点与 S3 API 共用同一个端口。** 6.4 的验收脚本轮询的是
 > `$ENDPOINT/ready`，而 `$ENDPOINT` 就是 `http://127.0.0.1:9000`——S3 的端口。
@@ -7935,28 +7947,39 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[tokio::test]
-async fn returns_503_before_storage_ready() {
-    // 进程已监听但尚未完成存储初始化 → /ready 返回 503 且带 Retry-After: 5
+// 这四个都是 `#[test]` 而不是 `#[tokio::test]`：本任务只有同步的响应构造，
+// 没有 IO。用 async 测试只会让编译变慢、并让人误以为这里在起服务器。
+
+#[test]
+fn ready_is_503_with_retry_after_while_booting() {
+    let r = Readiness::new();
+    let resp = r.ready_response();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()["retry-after"], "5");
 }
 
-#[tokio::test]
-async fn returns_200_after_storage_ready() {
-    // `mark_stage(SystemStage::StorageReady)` 之后再请求 /ready → **200**
-    // 且**没有** Retry-After 头（在 Booting 阶段它是 503 + Retry-After: 5，
-    // 那条断言由上一个测试负责；这里断言的是「状态翻转了」，两次都读一次状态码）
+#[test]
+fn ready_is_200_after_storage_ready() {
+    let r = Readiness::new();
+    r.mark_stage(SystemStage::StorageReady);
+    let resp = r.ready_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp.headers().contains_key("retry-after")); // 就绪后不能再劝客户端重试
 }
 
-#[tokio::test]
-async fn stage_is_monotonic() {
-    // mark_stage 不允许回退：先到 FullReady，再 mark_stage(StorageReady)
-    // → 返回值表明被拒，且**重新读 stage 仍是 FullReady**。
-    // 只调用了事等于没测（原计划这里连注释都没有）
+#[test]
+fn stage_is_monotonic() {
+    let r = Readiness::new();
+    assert!(r.mark_stage(SystemStage::FullReady));
+    assert!(!r.mark_stage(SystemStage::StorageReady)); // 被拒
+    assert_eq!(r.stage(), SystemStage::FullReady);     // **重新读一次**，不能只调用了事
 }
 
-#[tokio::test]
-async fn health_is_independent_of_readiness() {
-    // /health 在 Booting 阶段也返回 200（存活探针不依赖存储）
+#[test]
+fn health_is_independent_of_readiness() {
+    let r = Readiness::new(); // 仍是 Booting
+    assert_eq!(r.stage(), SystemStage::Booting);
+    assert_eq!(Readiness::health_response().status(), StatusCode::OK);
 }
 ```
 
@@ -7964,13 +7987,29 @@ async fn health_is_independent_of_readiness() {
 
 ```rust
 pub enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
+
+pub struct Readiness { stage: AtomicU8 }
+
+impl Readiness {
+    pub fn new() -> Self;                                  // 初始 Booting
+    pub fn stage(&self) -> SystemStage;
+    /// **单向**：只允许升，返回 `false` 表示这次调用被拒且 stage 未变。
+    pub fn mark_stage(&self, s: SystemStage) -> bool;
+    /// 就绪（≥ StorageReady）→ 200 空体；否则 503 + `Retry-After: 5`。
+    pub fn ready_response(&self) -> http::Response<bytes::Bytes>;
+    /// 存活探针：**不看 stage**，永远 200。
+    pub fn health_response() -> http::Response<bytes::Bytes>;
+}
 ```
+
+`mark_stage` 的实现要点：用 `fetch_max` 而不是 `store`——比较与写入必须是**一步**原子操作，
+「先 `load` 再比较再 `store`」在并发下会让两个请求双双通过，而这条规则恰恰是给并发路径用的。
 
 `/health` 为存活探针（进程活着即 200）；`/ready` 受 stage 控制，未就绪返回
 `503` + `Retry-After: 5`。
 
 ```bash
-git add crates/server/src/readiness.rs
+git add crates/server/src/readiness.rs crates/server/src/lib.rs crates/server/Cargo.toml
 git commit -m "feat(server): staged readiness with health/ready endpoints
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -7980,34 +8019,75 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 6.2: Prometheus 指标
 
-**Files:** Create `crates/server/src/metrics.rs`
+**Files:**
+- Create `crates/server/src/metrics.rs`
+- Modify `crates/server/src/lib.rs`（加 `pub mod metrics;`）
+- Modify `crates/server/Cargo.toml`
+
+> 与 6.1 同一条：不加 `pub mod metrics;` 这个文件不会被编译进去；`git add` 要带上 `lib.rs`。
+> **不引入 `prometheus` crate**：MVP 只需要原子计数 + 一段文本渲染，
+> 而 `prometheus` 会带来一个全局注册表（测试之间互相污染）和一堆我们用不到的
+> Gauge/Histogram 类型。`render()` 返回 `String` 是纯函数，测起来也干净。
+> 因此 `crates/server/Cargo.toml` 这一处**只需确认 `bytes` / `http` 已在 6.1 加过**，
+> 若 6.1 已加则本任务不动它（`Files` 里列出来是为了提醒你核对，不是要求空改动）。
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
+// 同 6.1：本任务全是同步代码，用 `#[test]`。
+
 #[test]
 fn metrics_disabled_is_noop() {
-    // 开关关闭时 record_* 不改变任何计数。
-    // **读两次再比对**：只写「record_* 之后没 panic」是不碰计数的空断言。
-    // 做法：关掉开关，读一次计数快照 → 调几个 record_* → 再读一次 → 两次相等。
+    let m = Metrics::new(false);
+    let before = m.render();          // 读一次快照
+    m.record_put(Duration::from_millis(3));
+    m.record_get(Duration::from_millis(3));
+    m.record_quorum_failure("put");
+    m.record_bitrot_mismatch();
+    m.record_disk_error("transient");
+    assert_eq!(m.render(), before);   // **再读一次比对**：只写「没 panic」是空断言
 }
 
-#[tokio::test]
-async fn exposes_prometheus_text_format() {
-    // GET /metrics → 响应体里**真的包含**这几个指标名（用 contains 断言字符串，
-    // 不是断言 `is_ok()`）：put_duration_seconds、get_duration_seconds、
-    // erasure_quorum_failures_total、bitrot_mismatch_total、disk_errors_total。
-    // 藏在正文里的那种「返回了 200 但正文是空表」的 bug，只有 contains 能抓到。
+#[test]
+fn exposes_prometheus_text_format() {
+    let m = Metrics::new(true);
+    m.record_put(Duration::from_millis(3));
+    m.record_quorum_failure("put");
+    m.record_bitrot_mismatch();
+    m.record_disk_error("transient");
+    let text = m.render();
+    // 断言字符串包含，不是断言 `is_ok()`——「返回 200 但正文是空表」只有 contains 抓得到。
+    for name in [
+        "put_duration_seconds",
+        "get_duration_seconds",
+        "erasure_quorum_failures_total",
+        "bitrot_mismatch_total",
+        "disk_errors_total",
+    ] {
+        assert!(text.contains(name), "指标 {name} 不在输出里:\n{text}");
+    }
 }
 ```
 
+> 注意 `metrics_disabled_is_noop` 里**开了开关的那份也有断言**（`exposes_*` 必须先
+> 调 `record_*` 再断言名字出现）——只断言「输出里有这个名字」的话，
+> 一个把计数全写死成 0、永远不更新的实现也能通过。
+
 > `/metrics` 与 `/health` `/ready` 一样**挂在 S3 那个端口上**（见 Task 6.1 的说明）。
+> 与 6.1 同理，本任务只提供 `pub fn metrics_response(&self) -> http::Response<bytes::Bytes>`，
+> 路由在 6.3。
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
-按 DESIGN §18.2，指标名常量集中定义，热路径用 `LazyLock` 缓存 handle。
+按 DESIGN §18.2，指标名常量集中定义成 `const`，计数用 `AtomicU64`。
 至少暴露：`put_duration_seconds{stage}`、`get_duration_seconds{stage}`、
 `erasure_quorum_failures_total{op}`、`bitrot_mismatch_total`、`disk_errors_total{kind}`。
+
+时长类指标的**累计值只用 `AtomicU64` 存「纳秒总和」**，不做桶（Histogram 要的是一组
+边界，而 MVP 没有分位数消费方，加了只会得到一份没人看的输出）。`render()` 里除以
+`1e9` 输出秒。`{label}` 是用 `HashMap<&'static str, AtomicU64>` 还是固定几个计数器
+由实现者定，但 `render()` 的输出**必须逐行是合法的 Prometheus 文本**：
+`name{label="v"} value`，指标名与标签之间不许有空格。
 
 > **去掉原计划里的 `buffer_pool_acquire_total{class}`。** DESIGN §13.3 的四级缓冲池
 > 在 MVP 里**没有任何任务实现它**（M1~M5 全篇没有缓冲池），照抄这个指标名只会得到一个
@@ -8017,7 +8097,7 @@ async fn exposes_prometheus_text_format() {
 > **不为不存在的代码注册指标/错误码。**
 
 ```bash
-git add crates/server/src/metrics.rs
+git add crates/server/src/metrics.rs crates/server/src/lib.rs
 git commit -m "feat(server): prometheus metrics endpoint
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -8027,10 +8107,26 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 6.3: 启动与关闭编排
 
-**Files:** Create `crates/server/src/startup.rs`、`crates/server/src/config.rs`、`crates/server/src/main.rs`
+**Files:**
+- Create `crates/server/src/wiring.rs`（**见下面「组合根」一节——原计划漏了这个文件**）
+- Create `crates/server/src/config.rs`
+- Create `crates/server/src/startup.rs`
+- Create `crates/server/src/main.rs`
+- Modify `crates/server/src/lib.rs`（加 `pub mod config; pub mod startup; pub mod wiring;`；
+  **注意 `main.rs` 不是 lib 的一部分**，它是独立的 crate root，要用
+  `use rstore_server::...` 而不是 `use crate::...`）
+- Modify `crates/server/Cargo.toml`（加 `clap`、`tokio-util`）
+- Modify `crates/store/src/get.rs`（加 `HeadOut` 与 `ErasureSet::head_object`；`GetOut` 加 `mod_time`）
+- Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`）
 
 > 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
 > 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
+>
+> **两个依赖必须显式加，工作区里现在都没有**：`clap`（`derive` + `cargo` feature）
+> 用来解析下面那张启动契约表里的七个参数——`--volumes` 是 `nargs(1..)`，
+> 手写解析要为它实现「吃到下一个 `--xxx` 为止」的扫描，而这条规则错了的后果是
+> 验收脚本以「unrecognized option」失败；`tokio-util`（`rt` feature）提供
+> 「启动顺序」一节里要求的 `CancellationToken`。
 
 #### 启动契约（原计划完全没有这一段）
 
@@ -8101,6 +8197,116 @@ cargo run -p rstore-server -- \
 
 这两个函数在 Task 2.x 就写好了并有测试，6.3 只是调用者。
 
+#### 组合根：`crates/server/src/wiring.rs`
+
+**原计划里没有任何任务创建这个文件**，但它是整个 MVP 唯一能把引擎接上 S3 的地方。
+`rstore-api` 定义 `ObjectStore` trait，`rstore-store` 在 `ErasureSet` 上实现的是
+**固有方法**（返回 `StoreError`），两者是兄弟：`rstore-api` 的 allowlist 只有
+`{common}`，而 `rstore-api -> rstore-store` 是 `scripts/tests/test_check_layer_deps.py`
+里钉死的 **FORBIDDEN EDGE**。**只有 `rstore-server` 同时看得见这两边**，所以适配器
+只能落在这里，`crates/api/src/lib.rs` 的文档注释里也早已指名了这个路径。
+
+```rust
+pub struct Wiring { set: Arc<ErasureSet> }
+
+impl Wiring {
+    pub fn new(set: Arc<ErasureSet>) -> Self { Self { set } }
+}
+
+fn map_object_err(e: StoreError) -> ApiError { /* 表见下 */ }
+fn map_bucket_err(e: StoreError) -> ApiError { /* 表见下 */ }
+
+#[async_trait]
+impl ObjectStore for Wiring { /* 九个方法逐一转调 */ }
+```
+
+**`StoreError -> ApiError` 映射表。** 分**对象**与**桶**两个入口：store 层对「不存在」
+只给一个 `StoreError::NotFound`（对象）或 `Disk(NotFound)`（桶目录不在），而 S3 侧
+`GetObject` 要 `NoSuchKey`、`HeadBucket` 要 `NoSuchBucket`——**合成一个变体之后 5.8
+还得反推「这次是哪个操作」**：
+
+| `StoreError` | 对象操作 → | 桶操作 → |
+|---|---|---|
+| `NotFound` | `NoSuchKey` | `NoSuchBucket` |
+| `Disk(DiskError::NotFound)` | `NoSuchKey` | `NoSuchBucket` |
+| `Disk(DiskError::Transient(_))` | `Unavailable` | `Unavailable` |
+| `Disk(DiskError::Corrupt(_))` / `Disk(DiskError::Fatal(_))` | `Internal(msg)` | `Internal(msg)` |
+| `WriteQuorum{..}` / `ReadQuorum{..}` | `Unavailable` | `Unavailable` |
+| `BucketNotEmpty` | —（对象路径上不会出现） | `BucketNotEmpty` |
+| `ShardLayout(_)` / `Internal(_)` | `Internal(msg)` | `Internal(msg)` |
+
+> **`DiskError` 是 `#[non_exhaustive]`，`match` 必须有 `_ =>` 兜底**（映射成 `Internal`）。
+> 两个「不存在」行**不能合并**成「凡 `NotFound` 都映射成 `NoSuchKey`」：桶操作拿到
+> `NoSuchKey` 会让 `HeadBucket` 返回一个客户端不认识的码。
+>
+> **`Transient` 映射成 `Unavailable`（503）而不是 `Internal`（500）**：它意味着
+> 「稍后会好」（超时、忙），回 500 会让客户端**放弃重试**，而它恰恰应该重试。
+> **`Corrupt` / `Fatal` 映射成 `Internal`**：数据或盘坏了，重试没有意义。
+> 这与 DESIGN §17「heal 由观测到 `Corrupt` 触发」不冲突——`Corrupt` 仍然要能在读路径上
+> 冒出来被分类、记录、参与 quorum，只是 MVP 没有自动修复流程，所以它有义务变成一个明确的 500。
+
+**同时要在 store 侧补两样东西，否则适配器填不出 API 层的字段：**
+
+1. **`GetOut` 缺 `mod_time`**，而 `rstore_api::ObjectData` 有。给 `GetOut` 加一个字段
+   （两个构造点：内联分支与分片分支，都取 `header.mod_time.unwrap_or(0)`——
+   `header` 在那两处都已经在手上了）比在适配器里再 `head_object` 一次便宜得多。
+
+2. **`head_object` 没有便宜的实现。** `ErasureSet` 的公开读路径只有 `get_object`，
+   而它会把**所有分片读一遍**。可 Task 5.4 起 `impl_s3::get_object` 就是
+   「先 `head_object` 再 `get_object`」，`mc stat` / `rclone check` 也以 HEAD 为主——
+   拿 `get_object` 顶替 HEAD 等于让每次 HEAD 都付一次全量读。在
+   `crates/store/src/get.rs` 里补一个只走元数据、**一个分片都不碰**的方法：
+
+```rust
+pub struct HeadOut { pub size: u64, pub etag: String, pub mod_time: u64 }
+
+impl ErasureSet {
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadOut, StoreError> {
+        let resolved = resolve_version(self, bucket, key).await?;
+        let Some((_dir, meta)) = resolved.live() else {
+            return Err(StoreError::NotFound); // 不存在，或最新版本是删除标记
+        };
+        let latest = latest_version(meta).ok_or_else(|| {
+            StoreError::Internal(format!("{bucket}/{key} has no versions"))
+        })?;
+        Ok(HeadOut {
+            size: latest.header.size,
+            etag: etag_of_meta(meta)?,
+            mod_time: latest.header.mod_time.unwrap_or(0),
+        })
+    }
+}
+```
+
+> `resolve_version` / `Resolved::live` / `latest_version` / `etag_of_meta` **全在同一个
+> 文件里，且都是本 crate 可见的**；这一节只是把它们串起来，**没有任何新算法**。
+> `etag_of_meta` 必须复用——否则 HEAD 与 LIST 的 ETag 会分叉，
+> 而 `rclone check` 恰恰是比对这两处的 ETag。
+
+#### `FormatError` **不带盘路径**，路径得由 6.3 自己加
+
+`refuses_to_start_on_inconsistent_formats` 要求错误信息里含**出问题的那块盘的路径**，
+但 `select_authoritative` 返回的 `FormatError` 只有 `Inconsistent(String)` /
+`NoQuorum { total, best }`——**里面一个路径都没有**。**不要去改 `rstore-meta`**
+（`FormatError` 是 Task 2.1 就有测试钉住的公共类型）：**在 6.3 的调用处补**。
+
+6.3 本来就逐盘读 `format.json`，所以手上有 `(路径, FormatV1)` 的列表。把它按
+`shared_identity()` 分组，**每条错误信息都带上「盘路径 → 组号」的清单**：
+
+```rust
+// 失败时打印每一块盘的路径与它所属的 identity 组号：「哪块盘是异类」才一眼可见。
+// 只打印 FormatError 的话运维只知道「拓扑不一致」，不知道去修哪块盘。
+Err(e) => return Err(anyhow!(
+    "format.json 协商失败: {e}；各盘分组: {}",
+    groups.iter()
+        .map(|(path, g)| format!("{} -> 组{}", path.display(), g))
+        .collect::<Vec<_>>()
+        .join(", ")
+)),
+```
+
+于是那条 `contains(<出问题那块盘的路径>)` 断言是**可满足的**。
+
 - [ ] **Step 1: 写失败测试**
 
 ```rust
@@ -8118,20 +8324,59 @@ async fn refuses_to_reformat_reachable_disks() {
 }
 
 #[tokio::test]
-async fn shutdown_cleanly_stops_accepting_then_drains() {
+async fn shutdown_stops_accepting_then_drains() {
     // 可观察的两件事，缺一不可：
-    // (a) 关闭发起后，**新**连接被拒（不是 503，是不再 accept）；
-    // (b) 关闭发起**之前**已经接住的在飞请求，跑完并返回 200。
-    // 做法：起一个会 sleep 200ms 的 handler，先发一个请求、不 await，
-    // 再调 shutdown()，最后断言那个请求拿到 200，且随后新请求失败。
-    // **只断言「shutdown() 返回 Ok」等于没测**——那不碰请求生命周期。
+    //
+    // (a) 关闭发起后**新连接被拒**——不是回 503，而是根本连不上：
+    //     断言 `TcpStream::connect(addr).await` 返回 `Err`（监听套接字已释放）。
+    //     回 503 与「不再 accept」是两回事，只有这一条能区分。
+    //
+    // (b) 关闭发起**之前**已经接住的在飞工作**跑完了才返回**：
+    //     用 `CancellationToken` 代替真实慢 handler，起一个任务先 `sleep(200ms)`
+    //     再置 `DONE`——**这个任务完全不看 token**（真实请求也不会因为关闭信号
+    //     自己中止，那正是 drain 的含义），然后在它 sleep 完之前调 `shutdown()`。
+    //     断言 `shutdown().await` 返回时 `DONE` 已经是 true。
+    //     `shutdown` 的实现是「先 cancel 让 accept 循环退出，再 await 各任务的
+    //     JoinHandle」，这条断言正好钉住后半句。
+    //
+    // **只断言「shutdown() 返回 Ok」等于没测**——那不碰任何连接或任务的生命周期。
+    // 这个写法不依赖真实的慢 HTTP handler，因此不会因机器快慢而偶发失败。
 }
 ```
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
+`startup.rs` 要暴露的**最小** API 面（测试与 `main.rs` 都只通过它说话）：
+
+```rust
+pub struct Running { /* 监听地址 */ }
+impl Running {
+    /// 在 `addr` 上监听，把 `/health` `/ready` `/metrics` 三条路径截下来，
+    /// 其余交给 s3s。返回后服务已在跑。
+    pub async fn bind(cfg: &Config, ready: Arc<Readiness>, m: Arc<Metrics>) -> anyhow::Result<Self>;
+    pub fn local_addr(&self) -> SocketAddr;
+    /// 先停止 accept，再等在飞请求跑完（要有上限，别无限等）。
+    pub async fn shutdown(self);
+}
+
+/// 打开各盘、校验 `format.json`、构造 `ErasureSet`，返回 `None` 表示
+/// 「所有盘都没有 format.json」——此时按新盘初始化（`should_initialize`）。
+pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome>;
+pub async fn serve(cfg: &Config) -> anyhow::Result<()>;  // main.rs 调它
+```
+
+> **`bind` 里三条路径的匹配必须发生在进 s3s 之前**，且只认**精确路径**
+> （`/health`、`/ready`、`/metrics`）。用「前缀匹配」的话，一个名叫 `metrics` 的桶
+> 的请求 `GET /metrics/` 会被吞掉；而 `GET /health` 与 S3 的任何合法操作都不冲突。
+> 6.4 的脚本轮询的就是 `$ENDPOINT/ready`——**它们在 S3 那个端口上**（见 Task 6.1）。
+>
+> `shutdown` 的上限：等在飞请求 `join` 时给个几秒超时，超时就放弃并记录。
+> 不设上限的话，一个卡住的请求会让进程永远退不出去，`kill` 也只能靠 SIGKILL。
+
 ```bash
-git add crates/server/src/startup.rs crates/server/src/config.rs crates/server/src/main.rs
+git add crates/server/src/wiring.rs crates/server/src/config.rs crates/server/src/startup.rs \
+        crates/server/src/main.rs crates/server/src/lib.rs crates/server/Cargo.toml \
+        crates/store/src/get.rs Cargo.toml
 git commit -m "feat(server): startup/shutdown orchestration with format validation
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -8168,6 +8413,10 @@ AWS="aws --endpoint-url $ENDPOINT"
 # 给 2 之后 read_quorum = 6-2 = 4，掉 2 块恰好**只剩 4 块**——一步不多、一步不少，
 # 这是纠删码最有价值的那个用例；而下面引用的「4+2」注释也才对得上。
 mkdir -p $ROOT/{d1,d2,d3,d4,d5,d6}
+# **先单独构建，再起进程。** `cargo run` 会把冷构建时间算进下面那段轮询窗口里：
+# 干净的 CI 上全工作区冷编译远超 30 秒，脚本会以「server did not become ready」
+# 失败——而这跟服务端毫无关系。构建放在启动之前，轮询窗口就只覆盖真正的启动。
+cargo build -p rstore-server
 cargo run -p rstore-server -- --volumes $ROOT/d{1,2,3,4,5,6} --parity 2 --port 9000 &
 SERVER_PID=$!
 # 无论从哪一条 `set -e` 退出，都别把服务留在后台占着 9000：
@@ -8175,7 +8424,9 @@ trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
 # 不要 `sleep 3`：慢机器上会假失败，快机器上白等。轮询 /ready 直到 200。
 # (`curl … && break` 里 curl 不是 `&&` 列表中的最后一条，所以失败不会触发 errexit。)
-for _ in $(seq 1 60); do
+# 120 次 × 0.5s = 60s：启动本身只是开 6 个目录 + 读 6 份 format.json，
+# 60s 只有在文件系统卡死时才用得上。
+for _ in $(seq 1 120); do
     curl -fsS -o /dev/null $ENDPOINT/ready && break
     sleep 0.5
 done
@@ -8208,6 +8459,25 @@ mv $ROOT/d6 $ROOT/d6.off
 #    分片读错、解码错位、返回截断的数据，这条注释全都发现不了。
 $AWS s3 cp s3://accept/big.bin $WORK/degraded.bin
 cmp $WORK/payload.bin $WORK/degraded.bin
+
+# 3b. 掉 2 块时**写**也必须成功：write_quorum(data=4, parity=2) = 4，
+#     而此刻恰好剩 4 块——同样一步不多、一步不少。
+#     （「掉 2 盘可写」是完成检查清单里的一条，原先这份脚本根本没有覆盖它。）
+$AWS s3 cp $WORK/payload.bin s3://accept/write-while-degraded.bin
+$AWS s3 cp s3://accept/write-while-degraded.bin $WORK/write-back.bin
+cmp $WORK/payload.bin $WORK/write-back.bin
+
+# 3c. 再掉一块（剩 3 < read_quorum 4）→ 读**必须失败**，而**绝不能**返回
+#     残缺或错误的数据（P1：宁可报错，绝不返回错数据）。
+#     用 `if cmd; then 失败; fi` 而不是 `cmd || true`：后者会把「本该失败却成功」
+#     和「正常报错」一起吞掉，这条就等于没测。注意放在 `if` 条件里的命令
+#     不会触发 `set -e`。
+mv $ROOT/d4 $ROOT/d4.off
+if $AWS s3 cp s3://accept/big.bin $WORK/too-far.bin 2>/dev/null; then
+    echo "低于 read_quorum 时读竟然成功了" >&2
+    exit 1
+fi
+mv $ROOT/d4.off $ROOT/d4
 
 # 4. 恢复，再读一次确认恢复没把数据改坏（同一条比对，但走的是另一条盘路径）。
 mv $ROOT/d5.off $ROOT/d5
@@ -8312,6 +8582,8 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **Task 5.9 的冒烟脚本依赖 Task 6.3 的启动编排** | 本计划里唯一一处 M5 依赖 M6。5.9 的 Step 2 只有在 6.3 落地后才能跑；这不是可以「先欠着」的排序，别在 5.9 里临时写一次性 main 绕过 |
 | **`--base-domain` 一旦有非空默认值，四个 shell 脚本全红** | Task 5.11 的能力由 `--base-domain` 门控，默认「不给」= 纯 path-style。**失败机制是 `SingleDomain` 的 CNAME 回退，不是域名校验失败**（端口会被 `strip_port_suffix` 剥掉，`is_valid_domain` 也接受带端口的 host）：给了 `--base-domain example.com` 之后，脚本发来的 `Host: 127.0.0.1:9000` 既不等于是 base、也不是它的子域，于是走 CNAME 回退，**桶名变成 `127.0.0.1`**，全部请求 404 `NoSuchBucket`——而报错里不会出现「base-domain」这个词。改这个默认值 = 同时改四个脚本的寻址模式 |
 | **`validate_object_key` 的两条规则必须同时生效**（Task 5.7） | 规则 1（保留前缀）漏了 → 用户在 `.rstore*` 里写数据；规则 2（空段 / `.` / `..`）漏了 → 两个不同的 S3 key 落到同一个文件上**静默互相覆盖**。规则 2 还必须接在**读路径**上：只接写路径的话 `GET /b/../x` 会从盘层的 `Fatal(PathEscape)` 变成 500，而不是 400 |
+| **M6 的三个 task 各自都要改 `crates/server/src/lib.rs`** | 该文件在 M0 建骨架时只写了一行文档注释，**没有任何 `pub mod` 声明**。漏掉的话新文件根本不参与编译：`cargo test` 会显示全绿（只是少了几条用例），而 `readiness.rs` / `metrics.rs` 里的代码一行都没跑过。三个 task 的 `Files` 与 `git add` 里都已经列出它 |
+| **组合根 `wiring.rs` 原计划没有任何任务** | `rstore-api` 的 `ObjectStore` trait 与 `rstore-store` 的 `ErasureSet` 固有方法是两套类型，而 `api -> store` 是 FORBIDDEN EDGE——**只有 `rstore-server` 同时看得见两边**。没有这个适配器，6.3 的「构造 `ErasureSet`」之后没有任何东西能交给 `build_service`。已作为 Task 6.3 的第一个文件写进计划 |
 | **条件请求的求值顺序不能重排**（Task 5.10） | RFC 9110 §13.2.2 的两处「缺席时才看」（`If-Match` 挡住 `If-Unmodified-Since`、`If-None-Match` 挡住 `If-Modified-Since`）漏掉任何一处，表现都是「两个头都发的客户端偶尔拿到 200 而它期望 304」——这种 bug 在单头测试里完全看不见，所以 5.10 的矩阵里专门有两条「两个都发、结论不同」的用例 |
 
 ---
