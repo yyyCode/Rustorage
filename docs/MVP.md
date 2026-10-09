@@ -6844,10 +6844,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ## M6 — 运维面与验收
 
-> **本里程碑里 6.1 / 6.2 / 6.3 的 `#[tokio::test]` 函数体目前是空的**（里面只有一行
-> 描述要测什么的注释）。那不是测试，是待办列表——**实现时必须把断言写出来**，
-> 而且要先让它们红起来（TDD）。之所以没在这里替它们把代码写死：这三节的 API 面
-> 由 M5 的 `rstore-server` 骨架决定，此刻写出来的签名很可能是错的。
+> **本里程碑里 6.1 / 6.2 / 6.3 的 `#[tokio::test]` 函数体原本是空的**（里面只有一行
+> 描述要测什么的注释）——那不是测试，是待办列表。**已经补上了每条要断言什么**，
+> 实现时要先让它们红起来（TDD），再写实现。之所以补的是「断言什么」而不是完整代码：
+> 这三节的 API 面由 M5 的 `rstore-server` 骨架决定，此刻写死的签名很可能是错的。
 > 每一条至少要断言一件**可观察**的事：
 >
 > - 6.1：`/ready` 的状态码与 `Retry-After` 头；`/health` 在 `Booting` 阶段也是 200；
@@ -6864,6 +6864,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:** Create `crates/server/src/readiness.rs`
 
+> **这三个端点与 S3 API 共用同一个端口。** 6.4 的验收脚本轮询的是
+> `$ENDPOINT/ready`，而 `$ENDPOINT` 就是 `http://127.0.0.1:9000`——S3 的端口。
+> 原计划没说这一条，实现者很可能另起一个管理端口（比如 9001），
+> 于是验收脚本会一直轮询到超时。**不要另起端口**：MVP 只需在路由表里
+> 在给 s3s 之前先匹配 `/health`、`/ready`、`/metrics` 三个路径。
+
 - [ ] **Step 1: 写失败测试**
 
 ```rust
@@ -6873,16 +6879,22 @@ async fn returns_503_before_storage_ready() {
 }
 
 #[tokio::test]
-async fn returns_200_after_storage_ready() { }
+async fn returns_200_after_storage_ready() {
+    // `mark_stage(SystemStage::StorageReady)` 之后再请求 /ready → **200**
+    // 且**没有** Retry-After 头（在 Booting 阶段它是 503 + Retry-After: 5，
+    // 那条断言由上一个测试负责；这里断言的是「状态翻转了」，两次都读一次状态码）
+}
 
 #[tokio::test]
 async fn stage_is_monotonic() {
-    // mark_stage 不允许回退
+    // mark_stage 不允许回退：先到 FullReady，再 mark_stage(StorageReady)
+    // → 返回值表明被拒，且**重新读 stage 仍是 FullReady**。
+    // 只调用了事等于没测（原计划这里连注释都没有）
 }
 
 #[tokio::test]
 async fn health_is_independent_of_readiness() {
-    // /health 在 Booting 阶段也返回 200
+    // /health 在 Booting 阶段也返回 200（存活探针不依赖存储）
 }
 ```
 
@@ -6913,14 +6925,21 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```rust
 #[test]
 fn metrics_disabled_is_noop() {
-    // 开关关闭时 record_* 不改变任何计数
+    // 开关关闭时 record_* 不改变任何计数。
+    // **读两次再比对**：只写「record_* 之后没 panic」是不碰计数的空断言。
+    // 做法：关掉开关，读一次计数快照 → 调几个 record_* → 再读一次 → 两次相等。
 }
 
 #[tokio::test]
 async fn exposes_prometheus_text_format() {
-    // GET /metrics → 包含 put_duration_seconds / erasure_quorum_failures_total
+    // GET /metrics → 响应体里**真的包含**这几个指标名（用 contains 断言字符串，
+    // 不是断言 `is_ok()`）：put_duration_seconds、get_duration_seconds、
+    // erasure_quorum_failures_total、bitrot_mismatch_total、disk_errors_total。
+    // 藏在正文里的那种「返回了 200 但正文是空表」的 bug，只有 contains 能抓到。
 }
 ```
+
+> `/metrics` 与 `/health` `/ready` 一样**挂在 S3 那个端口上**（见 Task 6.1 的说明）。
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
