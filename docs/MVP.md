@@ -5547,7 +5547,25 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/store/src/error.rs`（加 `BucketNotEmpty`）
 - Modify: `crates/store/src/get.rs`（把「取一个权威版本的 etag」抽成 `pub(crate)` 复用）
 - Modify: `crates/store/src/reconcile.rs`（`entries_under` 改 `pub(crate)`，见「对象列举怎么走」）
+- Modify: `crates/common/src/consts.rs`（加 `RESERVED_PREFIX`，见下）
 - Modify: `crates/store/src/lib.rs`（加 `pub mod bucket;`、`pub mod list;`）
+
+> **`RESERVED_PREFIX` 在本任务定义，不在 5.7。** 遍历要跳过 `.rstore*` 开头的条目，
+> 而这个常量是**本任务**第一个需要它的地方（`rstore-store` 的 allowlist 里有
+> `rstore-common`，能看见）。原计划把它排在 Task 5.7，那是顺序倒挂：
+> `list.rs` 会用到一个还没被定义的常量，实现者只能内联字面量 `".rstore"`，
+> 于是同一个前缀在 store 与 s3 两处各写一份——正是这个常量存在的意义所要防的事。
+>
+> ```rust
+> // crates/common/src/consts.rs
+> /// 用户可见命名空间里的保留前缀（DESIGN §6.3）：对象 key 的首段、
+> /// 以及盘根 / 桶根下的系统目录都不得以它开头。
+> /// **store 的目录遍历与 s3 的 key 校验都引用这一个常量，不得内联字面量。**
+> pub const RESERVED_PREFIX: &str = ".rstore";
+> ```
+>
+> 谁先需要谁定义：`rstore-common` 是唯一同时被 `rstore-store` 与 `rstore-s3`
+> 看见的 crate，放这里两边都能用，也不会给 allowlist 添新边。
 
 > **为什么会有这一节。** M5 的 5.2（`CreateBucket` / `DeleteBucket` / `HeadBucket` /
 > `ListBuckets`）与 5.5（`ListObjectsV2`）都假定存储层已经有桶操作与对象列举——
@@ -6574,7 +6592,8 @@ async fn all_six_multipart_ops_are_501_not_implemented() {
 
 ### Task 5.7: 命名校验（保留名规则）
 
-**Files:** Create `crates/s3/src/validate.rs`；Modify `crates/common/src/consts.rs`、`crates/s3/src/impl_s3.rs`
+**Files:** Create `crates/s3/src/validate.rs`；Modify `crates/s3/src/impl_s3.rs`
+（`RESERVED_PREFIX` 已由 Task 4.11 定义，本任务只引用）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -6611,8 +6630,10 @@ Expected: 编译失败
 pub fn validate_object_key(key: &str) -> Result<(), ApiError>;
 ```
 
-在 **`crates/common/src/consts.rs`** 中定义 `pub const RESERVED_PREFIX: &str = ".rstore";`，
-校验引用它，**不得内联字面量**。
+**`RESERVED_PREFIX` 已经在 Task 4.11 定义好了**（在 `crates/common/src/consts.rs`，
+`rstore-store` 的目录遍历要用同一个常量）。本任务**直接引用**，不要再定义一遍——
+重复定义是编译错误，而更糟的做法是「5.7 另起一个常量名」，那样两个前缀就开始各自演化了。
+本任务的文件清单里因此**没有** `crates/common/src/consts.rs`。
 
 > **不要写 `validate_bucket_name`。** 原计划里有一个，连同它的四条断言
 > （`.hidden` / `OK-Bucket` / `-leading` 拒绝，`ok-bucket` / `ok.bucket.123` 通过）——
@@ -6649,10 +6670,11 @@ Run: `cargo test -p rstore-s3 validate`
 Expected: PASS
 
 ```bash
-# 注意是 `crates/common/src/consts.rs`（常量落在 rstore-common），**不是**
-# `crates/meta/src/keys.rs`——那是原计划修掉之前的位置，本任务一行都不用动它。
-git add crates/s3/src/validate.rs crates/common/src/consts.rs crates/s3/src/impl_s3.rs
-git commit -m "feat(s3): bucket and object key validation with reserved prefix rule
+# 注意**没有** `crates/common/src/consts.rs`：`RESERVED_PREFIX` 是 Task 4.11
+# 定义的，本任务只引用它。也**不是** `crates/meta/src/keys.rs`——那是原计划
+# 修掉之前的位置，本任务一行都不用动它。
+git add crates/s3/src/validate.rs crates/s3/src/impl_s3.rs
+git commit -m "feat(s3): object key validation with reserved prefix rule
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
