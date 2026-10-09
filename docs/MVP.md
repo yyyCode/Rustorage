@@ -411,13 +411,31 @@ def main():
             print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    # 明确按 UTF-8 解码，不用 sys.stdin。JSON 规范即要求 UTF-8，cargo 也按 UTF-8
+    # 输出；而 sys.stdin 用的是**区域编码**（Windows 上是 GBK）。依赖它意味着
+    # 解码行为随环境漂移，两种结果都是坏的：
+    #   - 解不开：checkout 路径里出现「一」(U+4E00) 这类常见汉字，GBK 就会在
+    #     E4 B8 80 的尾字节 0x80 上抛 UnicodeDecodeError；
+    #   - 解得开：字节碰巧凑成合法 GBK 对，于是静默乱码。当前 check() 只读
+    #     name/dependencies（纯 ASCII），乱码落在 manifest_path 之类字段上时
+    #     没有可见症状——但「护栏读到的输入随本机区域设置漂移」本身就是缺陷，
+    #     哪天多读一个字段就会变成误报或漏报。
+    # 前者以退出码 1 结束，正是最容易被误读成「发现违规」的那种失败。
+    # CI 在 Linux 上永远是 UTF-8，这类问题只在本机出现，最难发现。
     try:
-        meta = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
+        meta = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
         print(f"ERROR: 无法解析 cargo metadata 输出：{e}", file=sys.stderr)
         return 2
 
-    violations = check(meta)
+    # 合法 JSON 不等于预期的结构。cargo 若改了输出格式，这里必须落回 2
+    # （护栏故障），而不是让 KeyError/TypeError 冒出去变成 1。
+    try:
+        violations = check(meta)
+    except (KeyError, TypeError) as e:
+        print(f"ERROR: cargo metadata 结构不符合预期：{e!r}", file=sys.stderr)
+        return 2
+
     for v in violations:
         print(v)
     return 1 if violations else 0
@@ -452,10 +470,13 @@ Expected: 退出码 0，无输出
 
 运行：python3 scripts/tests/test_check_layer_deps.py
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
@@ -497,8 +518,6 @@ CASES = [
         pkg("rstore-scratch"),
         pkg("rstore-api", "rstore-store"),
     ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
-
-    ("输入不是合法 JSON", None, 2, None),
 ]
 
 
@@ -518,6 +537,68 @@ def run_checker(payload):
         input=stdin, capture_output=True, text=True,
         encoding="utf-8", env=env,
     )
+
+
+def run_fixture_cases():
+    """执行全部 fixture 用例，返回失败描述列表。供 main() 与 pytest 共用。"""
+    failures = []
+    for label, payload, want_code, want_substr in CASES:
+        proc = run_checker(payload)
+        problems = []
+        if proc.returncode != want_code:
+            problems.append(f"退出码 {proc.returncode}，期望 {want_code}")
+        if want_substr is not None and want_substr not in (proc.stdout or ""):
+            problems.append(f"stdout 缺少 {want_substr!r}（实际 {proc.stdout!r}）")
+        if want_substr is None and want_code == 0 and (proc.stdout or "").strip():
+            problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
+        # 每个用例**至多**记一条：main() 的通过计数按「用例数 - 失败数」算，
+        # 一个用例记多条会让计数变成负数或虚高。
+        if problems:
+            failures.append(f"{label}: {'；'.join(problems)}")
+    return failures
+
+
+def test_fixture_cases():
+    """pytest 入口。
+
+    这 6 个 fixture 用例原本直接写在 main() 里，那样 `pytest` 只会收集到
+    几个 test_* 函数，子进程用例一条都不跑——测试看着全绿，实测只覆盖了
+    一小部分。整进一个 test_* 函数后，两种跑法覆盖同一批用例。
+    """
+    failures = run_fixture_cases()
+    assert not failures, "\n".join(failures)
+
+
+def test_invalid_json_reports_on_stderr_only():
+    """退出码 2 的路径必须只写 stderr。
+
+    诊断若混进 stdout，CI 里会被当成违规清单。
+    """
+    proc = run_checker(None)
+    assert proc.returncode == 2, f"期望退出码 2，实际 {proc.returncode}"
+    assert (proc.stdout or "").strip() == "", f"stdout 必须为空，实际 {proc.stdout!r}"
+    assert "无法解析" in (proc.stderr or ""), f"stderr 缺少诊断：{proc.stderr!r}"
+
+
+def test_non_closed_table_makes_main_exit_2():
+    """白名单不自洽时 main 必须以 2 退出（护栏故障），而不是 1（发现违规）。
+
+    这条分支在 table_errors 之后、读 stdin 之前，所以 stdin 内容无关紧要。
+
+    stderr 必须捕获：main 会往那里打诊断，不拦的话自测跑绿也会在终端上
+    印出一行 `ERROR: 白名单引用了未登记的 crate`，看着像失败。
+    """
+    original_table, original_stdin = chk.ALLOWED, sys.stdin
+    chk.ALLOWED = {"rstore-api": {"rstore-typo"}}
+    sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(b""))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = chk.main()
+    finally:
+        chk.ALLOWED = original_table
+        sys.stdin = original_stdin
+    assert code == 2, f"期望退出码 2，实际 {code}"
+    assert "rstore-typo" in err.getvalue(), f"stderr 应指出违规项：{err.getvalue()!r}"
 
 
 def test_real_table_is_closed():
@@ -554,20 +635,13 @@ def test_dangling_reference_is_a_table_error():
 
 
 def main():
-    failures = []
+    failures = run_fixture_cases()
 
-    for label, payload, want_code, want_substr in CASES:
-        proc = run_checker(payload)
-        problems = []
-        if proc.returncode != want_code:
-            problems.append(f"退出码 {proc.returncode}，期望 {want_code}")
-        if want_substr is not None and want_substr not in proc.stdout:
-            problems.append(f"stdout 缺少 {want_substr!r}（实际 {proc.stdout!r}）")
-        if want_substr is None and want_code == 0 and proc.stdout.strip():
-            problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
-        failures += [f"{label}: {p}" for p in problems]
-
+    # 刻意不含 test_fixture_cases——它只是 run_fixture_cases 的 pytest 包装，
+    # 放进来会把同一批 fixture 用例跑两遍、并重复计数。
     unit_tests = (
+        test_invalid_json_reports_on_stderr_only,
+        test_non_closed_table_makes_main_exit_2,
         test_real_table_is_closed,
         test_closure_check_catches_non_closed_table,
         test_dangling_reference_is_a_table_error,
@@ -589,7 +663,7 @@ if __name__ == "__main__":
 ```
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: 全部通过（`10 项通过，0 项失败`），退出码 0
+Expected: 全部通过（`11 项通过，0 项失败`），退出码 0
 
 - [ ] **Step 3b: 端到端确认——真仓库上护栏仍能抓到违规**
 
@@ -720,7 +794,7 @@ Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: `10 项通过，0 项失败`，退出码 0
+Expected: `11 项通过，0 项失败`，退出码 0
 
 - [ ] **Step 7: 提交**
 
@@ -749,8 +823,10 @@ DESIGN §5 和 §19.5 都写着护栏"由 CI 强制"。在接线之前那句话�
 name: CI
 
 on:
+  # 所有分支的 push 都跑：PR 触发只覆盖"开/更新 PR"这条路径，
+  # 而"推上去先看看红不红"是更早、更常用的一环。限定 branches: [main]
+  # 会让功能分支在开 PR 之前完全没有反馈。
   push:
-    branches: [main]
   pull_request:
 
 env:
@@ -778,13 +854,27 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # 护栏排在最前：架构违规要第一条报出来，不要等 build 跑完。
-      # 注意本任务假定 CI 镜像里有 python3。ubuntu-latest 自带；
-      # 若日后换成 slim 镜像，这一步会以退出码 2 硬失败。
+      # 解释器探测在 check-layer-deps.sh 里自己做，找不到会以退出码 2 硬失败。
       - name: 架构护栏（依赖方向）
         run: bash scripts/check-layer-deps.sh
 
+      # 这里刻意不复用上面那个 shell 包装器：它跑的是护栏本身，不是自测。
+      # 所以探测逻辑必须在这里重来一遍——直接写 `python3` 会把 Windows 上
+      # 那套 Store 别名问题原样搬进 CI（该假设偶然成立一次，不代表成立）。
       - name: 护栏自测
-        run: python3 scripts/tests/test_check_layer_deps.py
+        run: |
+          PYTHON=""
+          for cand in python3 python; do
+              if command -v "$cand" >/dev/null 2>&1 \
+                 && [ "$("$cand" -c 'print(1)' 2>/dev/null)" = "1" ]; then
+                  PYTHON="$cand"; break
+              fi
+          done
+          if [ -z "$PYTHON" ]; then
+              echo "ERROR: 找不到可用的 Python 解释器" >&2
+              exit 2
+          fi
+          "$PYTHON" scripts/tests/test_check_layer_deps.py
 
       - name: 格式
         run: cargo fmt --all -- --check
