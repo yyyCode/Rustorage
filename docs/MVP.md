@@ -6025,7 +6025,8 @@ pub enum ApiError {
 两边同时成立是不可能的——要么改 4.5 的 PUT 设计支持多 part 组装，要么推迟 multipart。
 **明确推迟 multipart**，`assert_code(ApiError::NotImplemented, "NotImplemented", 501)` 是它的门。
 代价写在 Task 5.9：aws-cli 的 `s3 cp` 超过 8 MiB 会自动改走 multipart，因此兼容冒烟脚本
-的载荷固定 < 8 MiB；真实用户传大文件会拿到 501。这是 MVP 的已知限制，不是 bug。
+的载荷固定 < 8 MiB；真实用户传大文件会拿到 501。这是 MVP 的已知限制，不是 bug
+（与本文件的「**MVP 的已知限制**」表里的前两行是同一条，那里还列了补它要先改什么）。
 
 M5 的 `Task 5.8: 错误映射` 就是把 `ApiError` 映到 S3 错误码；`StoreError → ApiError`
 的转换写在组合根（`rstore-server`），它是唯一同时看得见两边的 crate。
@@ -6519,7 +6520,9 @@ async fn range_suffix_form() {
 
 #[tokio::test]
 async fn range_beyond_size_is_416() {
-    // bytes=100-200  → 416，error_code == "InvalidRange"
+    // bytes=100-200  → 416，error_code == "InvalidRange"，
+    // 且响应头 Content-Range == "bytes */26"（RFC 9110 §15.5.17 的 SHOULD；
+    // 断言它，否则这条头会被当成可选的装饰品在重构里掉掉）
 }
 ```
 
@@ -6551,6 +6554,47 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 `content_range` 字符串：`format!("bytes {}-{}/{}", br.start, br.end, out.size)`——
 注意分母是**整个对象长度**，不是请求范围的。写错这一处，`rclone` 会认为数据被截断。
 
+> **`Content-Length` 必须改成切片长度，这一处最容易漏。** Task 5.3 写的
+> `content_length: Some(out.size as i64)` 在**无 Range 时是对的**（那时 `out.size`
+> 恰好等于 body 长度），但带 Range 时它是**整个对象**的长度。s3s 会把这个字段
+> 原样写进 `Content-Length` 头，于是客户端会**对着一个 4 字节的 body 等 26 字节**——
+> 表现是下载卡住/超时，而不是报错，极难定位。带 Range 的分支要写：
+>
+> ```rust
+> content_length: Some(out.data.len() as i64),   // = br.end - br.start + 1
+> ```
+>
+> `ObjectData` 的分工就是为此设计的：`data` 是**切片**、`size` 是**整份**——
+> 一个给 `Content-Length`，另一个给 `Content-Range` 的分母。两者互换都会坏，
+> 但只有前者会**挂住**客户端。
+
+> **416 要带 `Content-Range: bytes */<size>`。** RFC 9110 §15.5.17 对 416 是一条
+> SHOULD，AWS S3 也照做。`s3s::S3Error` 支持带响应头（`set_headers(HeaderMap)`），
+> 而 `hyper::HeaderMap` 就是 `http::HeaderMap`——`http` 已经在 `[dependencies]` 里：
+>
+> ```rust
+> // resolve_range 保持纯函数（返回 Result<ByteRange, ApiError>），
+> // 由调用点补头——只有调用点手里有 info.size。
+> let br = match resolve_range(range, info.size) {
+>     Ok(br) => br,
+>     Err(ApiError::InvalidRange) => {
+>         let mut err = s3s::s3_error!(InvalidRange);
+>         let mut headers = http::HeaderMap::new();
+>         headers.insert(
+>             "content-range",
+>             format!("bytes */{}", info.size).parse().expect("ascii"),
+>         );
+>         err.set_headers(headers);
+>         return Err(err);
+>     }
+>     Err(e) => return Err(to_s3_error(e)),
+> };
+> ```
+>
+> 补一条断言 `Content-Range == "bytes */26"` 的测试。**别把 `resolve_range` 改成
+> 返回带头的错误**——那会让一个纯区间计算函数去知道 HTTP 头，也让它没法脱离
+> `info.size` 单独测。
+
 - [ ] **Step 3: 三道门禁 + 提交**
 
 ---
@@ -6572,6 +6616,19 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
     // delimiter="/" → contents 是 ["a.txt", "z.txt"]，
     // common_prefixes 是 ["dir/"]（**只一条**，不是 dir/x、dir/y、dir/sub 三条）
 }
+#[tokio::test] async fn prefix_and_delimiter_together_keep_the_prefix() {
+    // prefix="dir/" + delimiter="/" → contents 是 ["dir/x", "dir/y"]，
+    // common_prefixes 是 ["dir/sub/"]——**前缀在 cp 里保留**。
+    // 这条单独存在，是因为它盯的那个 bug 只有「前缀 + 分隔符同时用」时才出现：
+    // 若 cp 从 `key[prefix.len()..]` 上直接切（而不是切完再拼回 prefix），
+    // 得到的是 "sub/"，于是客户端按 "sub/" 去列举会一条都拿不到。
+    // 上一组测试里 prefix 是空串，两种写法结果相同，抓不到这个错。
+}
+#[tokio::test] async fn max_keys_zero_returns_empty_and_truncated() {
+    // max-keys=0 → contents 空、key_count == 0、**is_truncated == true**
+    // （桶里还有对象）。这条盯的是「计数检查放在 push 之后」的写法：
+    // 那样 0 永远等不到相等，会把全部 5 条都返回出去。
+}
 #[tokio::test] async fn max_keys_truncates_and_sets_is_truncated() {
     // max-keys=2 → key_count == 2，is_truncated == true，
     // next_continuation_token 非空
@@ -6581,13 +6638,14 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 }
 ```
 
-> 最后一条是这组的核心断言。**「翻页不漏不重」**正是客户端 `rclone sync` 会依赖的性质：
+> 倒数第二条是这组的核心断言。**「翻页不漏不重」**正是客户端 `rclone sync` 会依赖的性质：
 > 漏一条 = 远端文件被当成不存在而**删除**。别只断言「第二页有 N 条」。
 
 - [ ] **Step 2: 实现**
 
 ```rust
 let entries = self.store.list_objects(&req.input.bucket, req.input.prefix.as_deref()).await?;
+let prefix = req.input.prefix.as_deref().unwrap_or("");
 let delimiter = req.input.delimiter.as_deref().filter(|d| !d.is_empty());
 let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
 // 续传起点：**不解析 token 的内容，就当它是「上一个 key」**——见下方注记。
@@ -6595,23 +6653,53 @@ let start_after = req.input.continuation_token.clone().or(req.input.start_after.
 ```
 
 遍历 `entries`（已排序），维护 `contents: Vec<Object>` 与
-`common_prefixes: BTreeSet<String>`：
+`common_prefixes: BTreeSet<String>`（`BTreeSet` 顺带保证输出有序，且天然去重）：
 
 1. `if let Some(s) = &start_after { if entry.key <= *s { continue; } }`（**字符串比较，不是下标**）
-2. 有 delimiter 且 `key[prefix.len()..]` 里含有 delimiter → 截到第一个 delimiter **含**它，
-   得到 `cp`；`common_prefixes.insert(cp)`；
-3. 否则 `contents.push(Object { key: Some(key), size: Some(size as i64),
-   e_tag: Some(ETag::Strong(etag)), last_modified: Some(ts), ..Default::default() })`
-   （注意 `Object` 的字段都是 `Option`，且 `ETag` 是枚举——见上面那张表）；
-4. **每推进一条就检查 `contents.len() + common_prefixes.len() == max_keys`**——到了就停，
-   并记下 `is_truncated = true`、`next_continuation_token = 这一条的 key`。
+   ——**这一步必须在第 2 步之前**：被游标跳过的条目不该占 `max_keys` 的额度。
+   顺序写反的表现是「第二页比第一页短」，而它只在 `start_after` 落在前缀内部时才出现。
+2. **先判容量，再处理这一条**（见下面的注记）：
+   `if contents.len() + common_prefixes.len() >= max_keys { truncated = true; break; }`
+3. 有 delimiter 且 `key[prefix.len()..]` 里含有 delimiter →
+   `let cp = key[..prefix.len() + rel_idx + 1].to_string();`
+   `common_prefixes.insert(cp);`（**下标是相对 `key` 全串的**：相对切片的 `rel_idx`
+   必须加回 `prefix.len()`，否则前缀被吃掉——见上面那条测试）
+4. 否则 `contents.push(Object { key: Some(key), size: Some(size as i64),
+   e_tag: Some(ETag::Strong(etag)), last_modified: Some(ts),
+   storage_class: Some(ObjectStorageClass::from_static("STANDARD")),
+   ..Default::default() })`
 
 `key_count = contents.len() + common_prefixes.len()`（S3 的定义就是两者之和）。
+
+> **计数检查必须在每一条之前做，不能在 push 之后。** 写成「push 完检查相等」时，
+> `max_keys = 0` 永远等不到 `0 == 0`（那一刻已经 push 过一条，或者根本没进循环体），
+> 于是整个桶被返回出去——而调用方明确说了「我只要 0 条」。
+> 「先判容量」还有一个好处：`is_truncated` 就是「循环因容量而 `break`」，
+> 不需要另外推「后面还有没有东西」。
+>
+> **`is_truncated` 的语义是「还有没返回完的条目」，不是「结果页是满的」。**
+> 恰好整除时它必须是 `false`——写成「满了就是截断」会让客户端多翻一页空页；
+> 更糟的是 `rclone sync` 之类的循环实现可能因此不收敛。
+
+> **`next_continuation_token` 是「最后一条**返回过的**条目的 key」，不是
+> 「下一条的 key」。** 配 `start_after` 的 `key <= s → skip` 语义，两者必须自洽：
+> 取成「下一条」会让下一条被跳掉（漏数据），取成「第一条」则第二页原地重来（死循环）。
+> 共同前缀**也能当游标**：`cp = "dir/"` 是 `"dir/x"` 的前缀，所以
+> `key <= "dir/"` 恰好跳过整个 `dir/` 下的所有 key，不需要特殊处理。
+
+> **输出的列表字段是 `Option`，一律填 `Some(...)`，哪怕是空的。**
+> `contents: Option<ObjectList>`、`common_prefixes: Option<CommonPrefixList>`——
+> 空桶时 `Some(vec![])` 会渲染成空的 `<Contents/>`，合法且比省略更容易预测。
+> 同时把 `name`（桶名）、`prefix`、`delimiter`、`max_keys`、
+> `continuation_token`（**回显输入的那个 token**）都填上——AWS 会回显它们，
+> 而有些客户端会拿回显值做校验。
 
 > **continuation token 就用裸 key，不做 base64。** S3 没有规定 token 的内容，只要
 > 「传回来能接着走」即可。用 base64 只是让 token 看起来不透明，代价是多一个依赖和一个
 > 编解码来回。**这是有意的简化**，写进注释；要改成不透明 token 时，唯一要保证的是
 > 「解码出来的 key 仍然是全序里的位置」，而现在是同一个东西，反而不会错。
+> （注意：裸 key 会把对象名暴露给客户端——但在一个**已经**要给它看对象名的 API 里，
+> 这不算信息泄露。）
 
 > 留下挂钩注释：`// PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引`
 > ——MVP 是**全盘遍历**（4.11），不是终态设计。
@@ -7096,9 +7184,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 >
 > **范围刻意只到 GET / HEAD。** PUT 的 `If-None-Match: *`（条件创建）会引入
 > 「检查与写入之间的竞态」——`ObjectStore` 上没有原子的 conditional-put，
-> 在 S3 层先查再写是 TOCTOU。DESIGN 没要求 PUT，**不做**，并在
-> `docs/MVP.md` 的已知限制里留一句。同理不做 `If-Range`（那要和 5.4 的
-> Range 联动，收益远小于复杂度）。
+> 在 S3 层先查再写是 TOCTOU。DESIGN 没要求 PUT，**不做**——并已记入本文件末尾的
+> 「**MVP 的已知限制**」表（那一行同时说明日后要补时得先给 `ObjectStore` 加什么）。
+> 同理不做 `If-Range`（那要和 5.4 的 Range 联动，收益远小于复杂度）。
 >
 > **s3s 不会替我们做这件事。** 它把这四个头**解析**成了 `GetObjectInput` /
 > `HeadObjectInput` 上的字段（已核实四个字段都在），但没有任何默认实现去**求值**。
@@ -8041,6 +8129,30 @@ MVP 交付时必须全部为真：
       （Task 4.11）
 - [ ] `ListObjectsV2` 不列出删除标记、不列出未提交的 `.staging-*` 目录，
       且掉盘低于 quorum 时报错而不是返回残缺列表（Task 4.11 / 5.5）
+
+---
+
+## MVP 的已知限制
+
+**这里是「刻意不做」的清单，不是待办列表。** 每一条都是范围决策，都指明了它由哪个
+Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这份清单逐条核对：里面的每一条
+都应该**在代码里有对应的拒绝/报错路径**，而不是「看起来忘了做」。
+
+| 限制 | 表现 | 所属 Task | 日后要补时 |
+|---|---|---|---|
+| **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
+| **载荷上限约 8 MiB** | 同上一条的推论：交付给客户端的大对象只能靠 < 8 MiB 的单次 PUT | 5.6 / 5.9 | 同 5.6 |
+| **条件请求只覆盖 GET / HEAD** | `PUT` 带 `If-None-Match: *`（条件创建）**不求值**，会被当成普通 PUT。`If-Range` 也不支持 | 5.10 | 需要先给 `ObjectStore` 加原子的 conditional-put——在 S3 层「先查再写」是 TOCTOU，不能这么补 |
+| **含空段 / `.` / `..` 的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b` 与 `a/b` 当两个 key，我们直接 400 `InvalidObjectName` | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
+| **虚拟主机寻址默认关闭** | 默认纯 path-style；要按 `Host: bucket.example.com` 寻址必须显式传 `--base-domain` | 5.11 | 无。这是刻意的门控，见 Task 6.3 的启动契约表 |
+| **LIST 是全盘遍历** | 大数据集上很慢；没有索引、没有分页下推（分页只在 S3 层做） | 4.11 / 5.5 | Phase 2 的索引；接口已留挂钩位 |
+| **无并发锁** | DESIGN §16.1 的按 `(bucket, key)` 分片 `RwLock` **在 M1~M5 全篇没有任何任务实现它**（`crates/store/src/` 下 `grep -rn "RwLock\|Mutex"` 只命中 `testutil.rs` 的一句注释）。PUT/GET 并发目前由文件系统语义兜底：`.staging-*` + rename 提交保证了「看不到半成品」，但**不保证同一 key 上两个并发 PUT 的先后** | — | Phase 2。连同「heal 与写共用同一把锁」那条约束一起推迟——那条约束在 heal 存在之前没有意义 |
+| **无背压** | DESIGN §16.3 的信号量 + 有界降级通道 + `{Primary, Degraded, Unbounded, Rejected}` 准入**同样在计划里没有任何任务**（`背压` / `Semaphore` 在 M1~M5 零命中）。表现是突发大并发下内存与磁盘队列无界增长 | — | Phase 2。**这一条是计划对 DESIGN 的静默遗漏**，不是本节新增的范围决策——之所以写在这里，是为了让最终复审看得见它 |
+| **单节点** | 无多节点、无 heal 的调度者。DESIGN §17 说 heal 由「观测到 `Corrupt`」触发：目前 `Corrupt` 会被分类、记录、参与 quorum 判定，但**没有自动修复流程** | — | Phase 3 |
+
+> **加新限制时，必须同时确认代码里有对应的拒绝路径。** 比如「不支持 multipart」
+> 之所以能写进这张表，是因为 Task 5.6 有一个测试断言六个操作各自返回 501；
+> 而如果某条限制只是「文档里说了但代码里没拦」，那就是漏实现，不是限制。
 
 ---
 
