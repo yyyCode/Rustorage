@@ -109,9 +109,11 @@ crates/s3/
   src/lib.rs                        # s3s S3Service 装配（构造时接收 Arc<dyn ObjectStore>，见 DESIGN §5 R4）
   src/impl_s3.rs                    # impl S3 for RstoreFs —— 只持有 api trait，不依赖 rstore-store
   src/errors.rs                     # ApiError → S3 错误码
-  src/validate.rs                   # 对象 key 保留前缀校验（Task 5.7）
+  src/validate.rs                   # 对象 key 校验：保留前缀 + 盘上会碰撞的 key 形状（Task 5.7）
+  src/conditional.rs                # HTTP 条件请求求值（Task 5.10）
   src/mock.rs                       # 内存版 ObjectStore，仅供测试（#[cfg(test)]，Task 5.2）
   # 没有 auth.rs：凭证走 s3s::auth::SimpleAuth::from_single，见 Task 5.1
+  # 没有 host.rs：虚拟主机寻址用 s3s 的 SingleDomain，见 Task 5.11
 
 crates/s3-compat/
   src/lib.rs                        # compat 中间件栈（按 §DESIGN 15.3 准入）
@@ -5922,6 +5924,28 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ## M5 — S3 接入
 
+**任务清单与执行顺序：**
+
+| Task | 内容 | 依赖 |
+|---|---|---|
+| 5.1 | s3s 骨架与认证 | — |
+| 5.2 | 桶操作 | 5.1 |
+| 5.3 | 对象读写 | 5.2 |
+| 5.4 | Range | 5.3 |
+| 5.5 | ListObjectsV2 | 5.3 |
+| 5.6 | Multipart 一律 501 | 5.1 |
+| 5.7 | 命名校验（保留前缀 + 盘上碰撞的 key 形状） | 5.3 |
+| 5.8 | 错误映射 | 5.2 |
+| 5.9 | 兼容层与客户端冒烟测试 | **6.3**（本计划唯一一处 M5 依赖 M6） |
+| 5.10 | 条件请求（GET / HEAD 子集） | 5.4 |
+| 5.11 | 虚拟主机风格寻址 | 5.1 |
+
+> 5.9~5.11 在文档里排在 5.2~5.8 之后**只因为它们是后来补的**，不是执行顺序：
+> **5.7 / 5.8 / 5.10 / 5.11 应该在 5.9 之前跑完**——它们的测试都是
+> `oneshot` 级别的，不依赖真实进程；而 5.9 要等到 6.3 才有服务可起。
+> 反过来，**不要把 5.9 排到最后才做**：它是「客户端真的能用」的唯一证据，
+> 而 5.6 的 501、5.7 的 key 规则、5.10 的条件请求都可能被它推翻。
+
 ### Task 5.1: s3s 骨架与认证
 
 **Files:**
@@ -6631,7 +6655,7 @@ async fn all_six_multipart_ops_are_501_not_implemented() {
 
 ---
 
-### Task 5.7: 命名校验（保留名规则）
+### Task 5.7: 命名校验（保留名规则 + 盘上会碰撞的 key 形状）
 
 **Files:** Create `crates/s3/src/validate.rs`；Modify `crates/s3/src/impl_s3.rs`
 （`RESERVED_PREFIX` 已由 Task 4.11 定义，本任务只引用）
@@ -6652,6 +6676,40 @@ fn rejects_object_key_with_reserved_first_segment() {
 }
 
 #[test]
+fn rejects_keys_that_would_alias_on_disk() {
+    // DESIGN §15.4 把「路径中的双斜杠」列为必须覆盖的行为。这条测试钉住
+    // **为什么它必须是一条拒绝规则，而不是「读的时候归一化一下就好」**：
+    // `crates/disk/src/fsx.rs` 的 `resolve()` 是逐 `Component` 拼接的，
+    // `Component::CurDir` 被丢弃、空段被折叠。于是
+    //
+    //     a//b   a/./b   a/   /a     都会落到与 a/b 或 a 相同的文件上
+    //
+    // 而 S3 把 `a//b` 与 `a/b` 当成**两个不同的 key**。放行的话，
+    // 后写的一个会静默覆盖前一个，LIST 又只列出一个 key——两个 key 各写一次、
+    // 读回来一样，中间没有任何报错。P1 是「宁可报错，绝不返回错数据」，
+    // 所以这里必须 400，而不是归一化。
+    //
+    // 归一化在 MVP 里不成立：归一化之后 PUT `a//b` 会写进 `a/b`，
+    // 那么 GET `a//b` 会读到别人写在 `a/b` 的东西——仍然是同一个静默别名，
+    // 只是换了个方向。真正的修法是**在盘上编码 key**（Phase 2），
+    // 那是 `fsx` 的活儿，不是这一层能补的。
+    // **s3s 自带的 `normalize_forward_slash_path` 开关也不能替代这条规则**，
+    // 理由见 Step 3 后面那段——它只处理空段。
+    assert!(validate_object_key("a//b").is_err(), "空段会折成 a/b");
+    assert!(validate_object_key("a/./b").is_err(), "`.` 段会被丢弃");
+    assert!(validate_object_key("a/").is_err(), "尾随斜杠会折成 a");
+    assert!(validate_object_key("/a").is_err(), "前导斜杠会折成 a");
+    // `..` 在盘层是 `Fatal(FatalKind::PathEscape)`——不在这里挡，它到 S3 层
+    // 就是 500（Fatal 归入 Internal），而客户端拿到的应该是 400。
+    assert!(validate_object_key("a/../b").is_err(), "禁止上溯段");
+    assert!(validate_object_key("..").is_err());
+    // 干净的多段 key 照常通过。
+    assert!(validate_object_key("a/b/c").is_ok());
+    assert!(validate_object_key("a/..b").is_ok(), "`..b` 只是普通名字");
+    assert!(validate_object_key("a/b.").is_ok(), "`b.` 只是普通名字");
+}
+
+#[test]
 fn reserved_prefix_constant_is_not_empty() {
     // 防止有人在重构中把常量改成空串，让校验静默失效
     assert!(!rstore_common::consts::RESERVED_PREFIX.is_empty());
@@ -6666,10 +6724,59 @@ Expected: 编译失败
 - [ ] **Step 3: 实现**
 
 ```rust
-/// 对象 key 校验。返回 `ApiError::InvalidObjectName`。
-/// 只检查第一段；深层段允许出现 `.rstore`（DESIGN §6.3）。
-pub fn validate_object_key(key: &str) -> Result<(), ApiError>;
+/// 对象 key 校验。返回 `ApiError::InvalidObjectName`（→ 400）。
+///
+/// 两条独立规则，都由安全/数据正确性而来，不是因为「顺手多校验一下」：
+///
+/// 1. 第一段不得以 [`RESERVED_PREFIX`] 开头 —— DESIGN §6.3，否则用户能在
+///    保留命名空间里创建对象。只限第一段，深层允许出现 `.rstore`。
+/// 2. **逐段**不得为空串、`.` 或 `..` —— 见 `rejects_keys_that_would_alias_on_disk`
+///    的说明：这三个形状会被 `fsx::resolve` 折叠，让两个不同的 S3 key 落到同一个文件上。
+pub fn validate_object_key(key: &str) -> Result<(), ApiError> {
+    let mut segments = key.split('/');
+    // `key` 为空时 `split` 产出单个空段，被下面的循环拒掉——不必先判空。
+    if segments
+        .next()
+        .is_some_and(|first| first.starts_with(rstore_common::consts::RESERVED_PREFIX))
+    {
+        return Err(ApiError::InvalidObjectName);
+    }
+    // 规则 2。**注意这同时覆盖了空 key**（`"".split('/')` 得到一个空段）。
+    // `..b` / `b.` 这类只是普通名字，不能误伤——所以是逐段**相等**比较，
+    // 不是 `starts_with(".")`。
+    if key.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return Err(ApiError::InvalidObjectName);
+    }
+    Ok(())
+}
 ```
+
+> **为什么要拒绝，而不是归一化。** 归一化（把 `a//b` 改写成 `a/b` 后放行）是把
+> 「两个 key」偷偷变成一个 key：PUT `a//b` 写进 `a/b`，之后 GET `a/b` 会读到它，
+> 而 PUT `a/b` 又会覆盖它。客户端拿到的每一次响应都是 200，丢的数据却对不上任何一次
+> 请求。拒绝会立刻暴露在客户端面前（400 + `InvalidObjectName`），这是可诊断的失败。
+> 真正的修法是**在盘上编码 key**（MinIO 就是这么做的：键名进盘前编码），
+> 那是 Phase 2 改 `fsx` 的事。
+>
+> **s3s 其实提供一个归一化开关，我们刻意不开。** `S3Config` 上有一个
+> `normalize_forward_slash_path`（默认 `false`，可经
+> `S3ServiceBuilder::set_config` 传入），它在建 key 之前调
+> `crate::path::normalize_forward_slash`：`//key` → `key`、`a//b` → `a/b`。
+> 两点让它**不能**替代本节的规则：
+>
+> 1. 那个函数只 `filter(|s| !s.is_empty())`——它**只处理空段**，`.`
+>    与 `..` 原样留下，所以 `a/./b` 与 `a/../b` 仍然会落到 `fsx::resolve` 上，
+>    别名与 500 两个问题一个都没解决；
+> 2. 它**保留尾随斜杠**（`a/` → `a/`），而尾随斜杠恰恰也会折成 `a`。
+>
+> 所以本节的规则无论开关怎么设都必须存在；开着它只是额外把 `//` 也变成静默别名。
+> **默认关着**，让这些 key 400 出来。若 Task 5.9 的冒烟脚本真的撞上某个客户端
+> 在发 `//`，那时的正确动作是回来看这一条、确认它想表达的 key 到底是什么，
+> **而不是先打开这个开关**——打开它只会把「客户端发错了什么」这个信息抹掉。
+
+> **不要重复实现 key 长度上限**：s3s 的 `parse_path_style*` 已经调了
+> `crate::path::check_key`（≤ 1024 字节，超出返回 `KeyTooLong`）。
+> 本节只补它**没有**的两条规则。
 
 **`RESERVED_PREFIX` 已经在 Task 4.11 定义好了**（在 `crates/common/src/consts.rs`，
 `rstore-store` 的目录遍历要用同一个常量）。本任务**直接引用**，不要再定义一遍——
@@ -6697,13 +6804,30 @@ pub fn validate_object_key(key: &str) -> Result<(), ApiError>;
 
 - [ ] **Step 4: 在请求入口接入**
 
-只在 `impl_s3.rs` 的 **`put_object`** 入口调 `validate_object_key`——
-**建桶不调**（桶名交给 s3s 的 `AwsNameValidation`，见 Step 3 的说明）。
-`get` / `head` / `delete` 对不合法的 key 同样是 400，但那是「先校验再查」还是
-「查到 404」都可以，S3 客户端两种都接受；只在**写入**入口强制。
+在 `impl_s3.rs` 的 **`put_object` / `get_object` / `head_object` / `delete_object`**
+四个入口**都**调 `validate_object_key`，**建桶不调**（桶名交给 s3s 的
+`AwsNameValidation`，见 Step 3 的说明）。
 
-补一个 HTTP 层测试：对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidObjectName`。
-（用 5.1 那套 `tower::ServiceExt::oneshot`，别绑端口。）
+> 原计划说「只在**写入**入口强制，读路径先校验还是查到 404 都可以」。规则 1
+> （保留前缀）时这话成立——两种答案客户端都接受。**但规则 2 加进来之后就不成立了**：
+> `..` 在盘层是 `Fatal(FatalKind::PathEscape)`，读路径不拦的话它一路变成
+> `ApiError::Internal` → **500**。对 `GET /b/../x` 回 500 是在说「服务端坏了」，
+> 而事实是这个 key 不合法（400）。两条规则在同一次调用里检查，别拆开——
+> 拆开就会出现「写路径按一套规则、读路径按另一套」的分叉。
+
+> **LIST 的 `prefix` 不加这条校验。** DESIGN §15.4 那行写的是「某些客户端/**list**
+> 操作会发出 `//`」，而 `ListObjectsV2` 的前缀走的是**查询参数**
+> （`?list-type=2&prefix=…`），不是路径段。前缀是过滤器，不落盘，因此没有别名风险；
+> 对它做校验只会让「想看 `a//b` 下有什么」这类合法列举变成 400。
+> 本节的规则**只作用于对象 key 的四个入口**。
+
+补两个 HTTP 层测试（用 5.1 那套 `tower::ServiceExt::oneshot`，别绑端口）：
+
+- 对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidObjectName`（规则 1）；
+- 对 `a//b` 发 PUT，同样期望 `400` + `InvalidObjectName`（规则 2）。
+
+第二条不能省：规则 1 的测试对规则 2 完全无感，而规则 2 才是那条会导致**数据静默
+互相覆盖**的规则。
 
 - [ ] **Step 5: 提交**
 
@@ -6950,6 +7074,610 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ---
 
+### Task 5.10: 条件请求（GET / HEAD 子集）
+
+**Files:**
+- Create `crates/s3/src/conditional.rs`
+- Modify `crates/s3/src/lib.rs`（加 `pub(crate) mod conditional;`）
+- Modify `crates/s3/src/impl_s3.rs`（`get_object` / `head_object` 各插一段）
+- Modify `crates/s3/src/mock.rs`（`fake_etag` 与 `MOCK_MOD_TIME_NANOS` 改成 `pub(crate)`）
+- Modify `crates/s3/Cargo.toml`（**顺便清掉三个依赖**，见 Step 1 末尾）
+
+> **为什么有这一节。** DESIGN §15.4 的「必须覆盖的行为」一共 7 条，MVP 只覆盖了 4 条。
+> 这一节补第 5 条：`If-Match` / `If-None-Match` / `If-Modified-Since` /
+> `If-Unmodified-Since`。剩下两条是 Task 5.11（虚拟主机寻址）与 Task 5.7 的
+> Step 1 第二条测试（双斜杠）。
+>
+> **DESIGN 只点名了前三个，我们做四个。** RFC 9110 §13.2.2 的求值顺序是定义在
+> 四个头之上的，其中 `If-Unmodified-Since` 是第 2 步、且被明确写成
+> 「**仅在 `If-Match` 缺席时**求值」。少实现一个的后果不是「少一个功能」，
+> 而是让那条「缺席时才看」的规则**没有对应的代码，因而没有对应的测试**——
+> 日后有人重排顺序时，没有任何东西会失败。多写 6 行的代价换一条能钉住顺序的断言。
+>
+> **范围刻意只到 GET / HEAD。** PUT 的 `If-None-Match: *`（条件创建）会引入
+> 「检查与写入之间的竞态」——`ObjectStore` 上没有原子的 conditional-put，
+> 在 S3 层先查再写是 TOCTOU。DESIGN 没要求 PUT，**不做**，并在
+> `docs/MVP.md` 的已知限制里留一句。同理不做 `If-Range`（那要和 5.4 的
+> Range 联动，收益远小于复杂度）。
+>
+> **s3s 不会替我们做这件事。** 它把这四个头**解析**成了 `GetObjectInput` /
+> `HeadObjectInput` 上的字段（已核实四个字段都在），但没有任何默认实现去**求值**。
+> 不写这一节，它们就是四个被静静忽略的字段——客户端拿到 200 和全量内容，
+> 而它明确要求了「只在没变的时候给我 304」。
+
+- [ ] **Step 1: 写失败测试**
+
+先改 `crates/s3/src/mock.rs` 两处可见性（一行一处）：
+
+```rust
+// 5.10 的断言要引用这两个**确切值**，而不是在测试里再抄一遍魔数：
+// 抄一遍的结果是「以后改了 mock 的时间戳，条件请求的测试悄悄测的是别的东西」。
+pub(crate) const MOCK_MOD_TIME_NANOS: u64 = 1_700_000_000_000_000_000;
+pub(crate) fn fake_etag(data: &[u8]) -> String { /* 原样，只改可见性 */ }
+```
+
+> **顺手清依赖（本任务做，别再往后拖）。** `crates/s3/Cargo.toml` 的
+> `[dependencies]` 里现在有三个**一处都没用到**的项，是 Task 5.1 的遗留：
+>
+> - `serde_json` —— 5.1 的 Files 里已经写明「不要加」（错误 XML 由 s3s 自己生成）；
+> - `thiserror` —— `crates/s3/src/` 下 `grep -rn thiserror` 无命中；
+> - `tokio` —— 只被 `#[tokio::test]` 用到（`grep -rn tokio crates/s3/src/` 的命中
+>   全在 `mod tests` 里），**应该挪到 `[dev-dependencies]`**。
+>
+> 留着它们不会让门禁变红（`cargo clippy` 不检查未用依赖），所以会一直漂下去；
+> 而 `cargo machete` / 审阅者看到「依赖了 tokio 的库」会以为这是个异步 runtime 库。
+> 一行 `git mv` 级别的改动，趁这一节一起做。
+
+`crates/s3/src/conditional.rs` 的单元测试——**这一节的主要覆盖面在这里**，
+因为条件求值是纯函数，不需要经过 HTTP：
+
+```rust
+#[cfg(test)]
+mod tests {
+    // **逐项列出，不写 `use super::*`**：本模块顶部有
+    // `use std::time::{Duration, SystemTime, UNIX_EPOCH};` 与
+    // `use s3s::dto::{ETag, ETagCondition, Timestamp};`，glob 会不会把父模块的
+    // 私有 `use` 也带进来是容易记混的一条规则。测试要让读的人不必推这一层。
+    use rstore_api::ObjectInfo;
+    use s3s::dto::{ETag, ETagCondition, Timestamp};
+
+    use super::{evaluate, Conditions, Verdict};
+
+    /// 与 `mock.rs` 的 `MOCK_MOD_TIME_NANOS` 对齐：1_700_000_000s = 2023-11-14T22:13:20Z
+    fn info(etag: &str, mod_time: u64) -> ObjectInfo {
+        ObjectInfo { size: 10, etag: etag.to_string(), mod_time }
+    }
+    const T: u64 = crate::mock::MOCK_MOD_TIME_NANOS;
+    const T_ETAG: &str = "00ff00ff00ff00ff";
+
+    fn cond<'a>(
+        if_match: Option<&'a ETagCondition>,
+        if_none_match: Option<&'a ETagCondition>,
+        if_modified_since: Option<&'a Timestamp>,
+        if_unmodified_since: Option<&'a Timestamp>,
+    ) -> Conditions<'a> { Conditions { if_match, if_none_match, if_modified_since, if_unmodified_since } }
+
+    fn etag(s: &str) -> ETagCondition { ETagCondition::ETag(ETag::Strong(s.to_string())) }
+
+    /// 一个 HTTP-date 会用到的时刻。参数是 **Unix 纳秒**，与 mock 的 `mod_time` 同一单位，
+    /// 便于写 `ts(T - 1_000_000_000)`（= 早一秒）。
+    fn ts(nanos: u64) -> Timestamp {
+        Timestamp::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos))
+    }
+
+    #[test]
+    fn no_conditions_proceeds() {
+        assert!(matches!(evaluate(cond(None, None, None, None), &info(T_ETAG, T)), Verdict::Proceed));
+    }
+
+    #[test]
+    fn if_match_uses_strong_comparison() {
+        let i = info(T_ETAG, T);
+        // 值相同 → 通过
+        assert!(matches!(evaluate(cond(Some(&etag(T_ETAG)), None, None, None), &i), Verdict::Proceed));
+        // 值不同 → 412
+        assert!(matches!(
+            evaluate(cond(Some(&etag("deadbeef")), None, None, None), &i),
+            Verdict::PreconditionFailed
+        ));
+        // 弱 ETag 参与 If-Match **永远不匹配**（RFC 9110 §8.8.3 的强比较）
+        let weak = ETagCondition::ETag(ETag::Weak(T_ETAG.to_string()));
+        assert!(matches!(
+            evaluate(cond(Some(&weak), None, None, None), &i),
+            Verdict::PreconditionFailed
+        ));
+        // `*` 表示「只要存在」，走到这里对象一定存在
+        assert!(matches!(
+            evaluate(cond(Some(&ETagCondition::Any), None, None, None), &i),
+            Verdict::Proceed
+        ));
+    }
+
+    #[test]
+    fn if_none_match_matches_on_value_ignoring_weakness() {
+        let i = info(T_ETAG, T);
+        // 值相同 → 304
+        assert!(matches!(
+            evaluate(cond(None, Some(&etag(T_ETAG)), None, None), &i),
+            Verdict::NotModified
+        ));
+        // 弱 ETag 在 If-None-Match 里**照样匹配**（弱比较）
+        let weak = ETagCondition::ETag(ETag::Weak(T_ETAG.to_string()));
+        assert!(matches!(
+            evaluate(cond(None, Some(&weak), None, None), &i),
+            Verdict::NotModified
+        ));
+        // 值不同 → 继续
+        assert!(matches!(
+            evaluate(cond(None, Some(&etag("deadbeef")), None, None), &i),
+            Verdict::Proceed
+        ));
+    }
+
+    #[test]
+    fn if_none_match_any_means_only_if_absent() {
+        // `*` 在 If-None-Match 里是「只要不存在」——对象存在，所以恒 304。
+        // 这是 `aws s3 sync` 之类客户端「跳过已存在对象」的写法。
+        assert!(matches!(
+            evaluate(cond(None, Some(&ETagCondition::Any), None, None), &info(T_ETAG, T)),
+            Verdict::NotModified
+        ));
+    }
+
+    #[test]
+    fn modified_since_compares_at_second_granularity() {
+        let i = info(T_ETAG, T);
+        let t = ts(T);
+        // 与 Last-Modified **同一秒** → 不可再早 → 304（`<=`，不是 `<`）。
+        // 这里用 `<` 的话，「取回之后立刻再带 If-Modified-Since 重发」会永远拿 200，
+        // 缓存的语义就废了。
+        assert!(matches!(
+            evaluate(cond(None, None, Some(&t), None), &i),
+            Verdict::NotModified
+        ));
+        // 客户端手里的副本更旧（早一秒）→ 已经变了 → 200
+        assert!(matches!(
+            evaluate(cond(None, None, Some(&ts(T - 1_000_000_000)), None), &i),
+            Verdict::Proceed
+        ));
+        // 亚秒差不能翻转结论：对象在 T 之后 0.9 秒修改，HTTP-date 只能表达整秒，
+        // 所以它仍算「同一秒」→ 304。**这条钉住的是「比较前先截断到秒」**，
+        // 不截断的话这里会返回 200，而客户端会把没变的对象当成变了。
+        assert!(matches!(
+            evaluate(cond(None, None, Some(&t), None), &info(T_ETAG, T + 900_000_000)),
+            Verdict::NotModified
+        ));
+    }
+
+    #[test]
+    fn unmodified_since_is_412_when_modified_later() {
+        let i = info(T_ETAG, T);
+        // 对象在该时刻之后被改过 → 412（这是「乐观锁」：我读到的是旧的，别覆盖）
+        assert!(matches!(
+            evaluate(cond(None, None, None, Some(&ts(T - 1_000_000_000))), &i),
+            Verdict::PreconditionFailed
+        ));
+        // 没改过 → 通过
+        assert!(matches!(
+            evaluate(cond(None, None, None, Some(&ts(T))), &i),
+            Verdict::Proceed
+        ));
+    }
+
+    #[test]
+    fn if_match_takes_precedence_over_unmodified_since() {
+        // RFC 9110 §13.2.2 第 2 步：**只有 If-Match 缺席时**才看 If-Unmodified-Since。
+        // 两者都发且互相矛盾时，应报告更早那一步的失败（412），而不是让
+        // If-Unmodified-Since 把 If-Match 已经判过的结论再翻一遍。
+        let i = info(T_ETAG, T);
+        let old = ts(T - 1_000_000_000);
+        let ok_tag = etag(T_ETAG);
+        assert!(
+            matches!(
+                evaluate(cond(Some(&ok_tag), None, None, Some(&old)), &i),
+                Verdict::Proceed
+            ),
+            "If-Match 命中时应短路，不再看 If-Unmodified-Since"
+        );
+    }
+
+    #[test]
+    fn if_none_match_takes_precedence_over_modified_since() {
+        // 第 4 步同理：**只有 If-None-Match 缺席时**才看 If-Modified-Since。
+        // 这条测试的形状是「两个都发、结论不同、断言取前者」——
+        // 顺序写反的实现在这里会返回 `Proceed`（200）而不是 `NotModified`（304）。
+        //
+        // **`If-Modified-Since` 必须取一个比 `mod_time` 更早的时刻**，这样它单独求值
+        // 才给 `Proceed`。取「未来」的时刻是这条测试最容易踩的坑：那时刻也满足
+        // `mod_time <= it`，于是两种顺序**都**返回 304，断言恒真、什么都没测到。
+        let i = info(T_ETAG, T);
+        let earlier = ts(T - 1_000_000_000);
+        assert!(
+            matches!(
+                evaluate(cond(None, Some(&etag(T_ETAG)), Some(&earlier), None), &i),
+                Verdict::NotModified
+            ),
+            "If-None-Match 命中时应短路，不再看 If-Modified-Since"
+        );
+    }
+}
+```
+
+`impl_s3.rs` 的 HTTP 层测试——**只补两条**，证明「四个头真的被 s3s 解析进了
+`input`，而且真的接到了 `evaluate` 上」，不在这里重复上面的矩阵：
+
+```rust
+#[tokio::test]
+async fn get_with_if_none_match_hit_is_304_and_has_no_body() {
+    // PUT /b/k → 记下响应头里的 ETag
+    // 再 GET /b/k 带 `If-None-Match: <那个 ETag>` → **304**，且响应体为空
+    // （额外断言响应头里仍有 ETag —— RFC 9110 §15.4.5 要求 304 带验证器，
+    //  少了它客户端的缓存条目会失效）
+}
+
+#[tokio::test]
+async fn get_with_if_match_mismatch_is_412() {
+    // GET /b/k 带 `If-Match: "deadbeef"` → **412**，error_code == "PreconditionFailed"
+}
+
+#[tokio::test]
+async fn conditional_header_does_not_turn_404_into_412() {
+    // GET /b/missing 带 `If-Match: *` → **404 NoSuchKey**，**不是** 412。
+    // 这一条钉住「先取对象，取不到就直接 404」。**先求条件再取对象**的实现
+    // 在这里会给出 412，而 `If-Match: *` 的意思是「只要存在就给我」——
+    // 「不存在」这件事本身就该走 404，客户端正是靠 404 来区分「没有」和「被别人改过」。
+}
+```
+
+给 `impl_s3.rs` 的测试模块加一个能带自定义头的请求构造器（现有的 `request()`
+只设 `host`）：
+
+```rust
+/// 与 `request` 同形，但接受额外请求头——条件请求的测试需要它们。
+fn request_with(
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> http::Request<TestBody> {
+    let mut b = http::Request::builder().method(method).uri(path).header("host", HOST);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    b.body(Full::new(Bytes::new())).expect("build request")
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-s3 conditional`
+Expected: 编译失败（`conditional` 模块不存在）
+
+- [ ] **Step 3: 实现**
+
+`crates/s3/src/conditional.rs` ——**整个模块就这些**：
+
+```rust
+//! HTTP 条件请求（DESIGN §15.4）。**只做 GET / HEAD 的子集**。
+//!
+//! 求值顺序照 RFC 9110 §13.2.2，不是随便排的：先 `If-Match`（不满足 → 412），
+//! 再 `If-Unmodified-Since`（**仅在 `If-Match` 缺席时**），再 `If-None-Match`
+//! （命中 → GET/HEAD 是 304），最后 `If-Modified-Since`（**仅在 `If-None-Match`
+//! 缺席时**）。两处「缺席时才看」是这一节最容易写漏的地方，漏掉的表现是
+//! 「两个头都发的客户端偶尔拿到 200 而它期望 304」。
+//!
+//! **本模块不处理「对象不存在」**：调用方先 `head_object`，拿到 `NoSuchKey`
+//! 就直接 404，根本不进这里。`If-Match: *` 的语义是「只要存在」，而「不存在」
+//! 由 404 表达——把它变成 412 会让客户端分不清「没有」与「被别人改过」。
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rstore_api::ObjectInfo;
+use s3s::dto::{ETag, ETagCondition, Timestamp};
+
+/// 求值结果。三个阶段与 RFC 的三种响应一一对应。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// 条件全部满足（或缺席），按正常流程返回 200 / 206。
+    Proceed,
+    /// 412 PreconditionFailed。
+    PreconditionFailed,
+    /// 304 NotModified，**无 body**。
+    NotModified,
+}
+
+/// 四个条件头的求值输入。拿走引用即可——`evaluate` 只读。
+pub(crate) struct Conditions<'a> {
+    pub if_match: Option<&'a ETagCondition>,
+    pub if_none_match: Option<&'a ETagCondition>,
+    pub if_modified_since: Option<&'a Timestamp>,
+    pub if_unmodified_since: Option<&'a Timestamp>,
+}
+
+pub(crate) fn evaluate(c: Conditions<'_>, info: &ObjectInfo) -> Verdict {
+    // 我们存的 etag 是**裸**十六进制串（`fake_etag` / 引擎的 md5 都不带引号），
+    // `ETag::Strong` 里装的也是裸值——`ETag::parse_http_header` 已经把
+    // `"x"` 和 `W/"x"` 的引号与 `W/` 剥掉了。所以直接比，**不要在这里手工剥引号**。
+    let current = ETag::Strong(info.etag.clone());
+
+    // 第 1 步：If-Match，**强比较**。
+    if let Some(cond) = c.if_match {
+        let ok = match cond {
+            // 走到这里对象一定存在（不存在在调用点就 404 了），所以 `*` 恒真。
+            ETagCondition::Any => true,
+            ETagCondition::ETag(e) => e.strong_cmp(&current),
+        };
+        if !ok {
+            return Verdict::PreconditionFailed;
+        }
+    }
+
+    // 第 2 步：If-Unmodified-Since，**只有 If-Match 缺席时**才求值。
+    if c.if_match.is_none() {
+        if let Some(limit) = c.if_unmodified_since {
+            if truncated(info.mod_time) > *limit {
+                return Verdict::PreconditionFailed;
+            }
+        }
+    }
+
+    // 第 3 步：If-None-Match，**弱比较**（值相等即命中，不管强弱标记）。
+    if let Some(cond) = c.if_none_match {
+        let matched = match cond {
+            // `If-None-Match: *` = 「只要不存在」→ 对象存在 ⇒ 命中 ⇒ 304。
+            ETagCondition::Any => true,
+            ETagCondition::ETag(e) => e.weak_cmp(&current),
+        };
+        if matched {
+            return Verdict::NotModified;
+        }
+    }
+
+    // 第 4 步：If-Modified-Since，**只有 If-None-Match 缺席时**才求值。
+    if c.if_none_match.is_none() {
+        if let Some(since) = c.if_modified_since {
+            // `<=`：与 Last-Modified 同一秒也算「没变」。用 `<` 的话，
+            // 「取回后立刻带 If-Modified-Since 重发」永远拿 200，缓存语义就废了。
+            if truncated(info.mod_time) <= *since {
+                return Verdict::NotModified;
+            }
+        }
+    }
+
+    Verdict::Proceed
+}
+
+/// 把 Unix 纳秒截断到**秒**。
+///
+/// HTTP-date 只精确到秒，所以亚秒差**不能**参与比较：对象在 `Last-Modified`
+/// 之后 0.9 秒被改过时，客户端手里的 HTTP-date 与新的 Last-Modified 是同一天同一秒，
+/// 它无从表达这个差异。不截断的实现会把 `If-Modified-Since` 判成「变了」，
+/// 于是同一个客户端每隔一秒重试都拿 200——而这些其实没变。
+///
+/// 用 `Timestamp::from(SystemTime)` 构造而不是依赖 `time::OffsetDateTime`：
+/// `s3s` 没有 re-export `time`，为一次比较往依赖里加一个 crate 不值得。
+fn truncated(mod_time_nanos: u64) -> Timestamp {
+    Timestamp::from(UNIX_EPOCH + Duration::from_secs(mod_time_nanos / 1_000_000_000))
+}
+
+/// 对象的 `Last-Modified`，**秒粒度**。304 响应要带上它（RFC 9110 §15.4.5）。
+pub(crate) fn last_modified(info: &ObjectInfo) -> Timestamp {
+    truncated(info.mod_time)
+}
+```
+
+`impl_s3.rs` 里 `head_object` / `get_object` 的接入。**顺序是关键**
+（这是 Task 5.4 已经定好的「先 head 拿 size 再 get」那条流，条件请求正好
+复用同一个 `head_object` 调用，不额外多一次往返）：
+
+```rust
+// ---- get_object ----
+// 文件顶部加：use crate::conditional::{self, Verdict};
+let input = req.input;
+// 1. 先取元数据（5.4 为了 resolve_range 本来就要这一步）。
+let info = self.store.head_object(&input.bucket, &input.key).await?;  // Err → 404
+// 2. 条件请求。放在 range 之前：304 不该去解析 Range，
+//    412 更不该——那两份工作都是白做的。
+match conditional::evaluate(conditional::Conditions {
+    if_match: input.if_match.as_ref(),
+    if_none_match: input.if_none_match.as_ref(),
+    if_modified_since: input.if_modified_since.as_ref(),
+    if_unmodified_since: input.if_unmodified_since.as_ref(),
+}, &info) {
+    Verdict::PreconditionFailed => return Err(s3s::s3_error!(PreconditionFailed)),
+    Verdict::NotModified => {
+        // 304 **不带 body**。`content_length` 也留 None：s3s 会把
+        // `content_length` 无条件写进响应头，而带 Content-Length 却没有 body
+        // 容易被客户端当成截断。ETag 与 Last-Modified 必须带
+        // （RFC 9110 §15.4.5：304 要携带能更新缓存条目的验证器）。
+        return Ok(S3Response::with_status(
+            GetObjectOutput {
+                e_tag: Some(ETag::Strong(info.etag.clone())),
+                last_modified: Some(conditional::last_modified(&info)),
+                ..Default::default()
+            },
+            StatusCode::NOT_MODIFIED,
+        ));
+    }
+    Verdict::Proceed => {}
+}
+// 3. 以下照 5.4 的流程走：resolve_range(&input.range, info.size)，再 get_object。
+
+// ---- head_object ----
+// 同形，只是没有 Range 那一步；304 分支构造 `HeadObjectOutput
+// { e_tag, last_modified, ..Default::default() }` 后同样 `with_status(NOT_MODIFIED)`。
+```
+
+> **不要试图把条件求值塞进 `ObjectStore::get_object`。** 那要给它加一个
+> 「条件」参数，于是 `rstore-api` 就得知道 `ETagCondition`（s3s 的类型），
+> 而 `rstore-api` 的依赖集只有 `{rstore-common}`——这是分层被破坏的第一道口子。
+> 条件请求是**协议层**的语义（RFC 9110），不是存储语义，它属于 `rstore-s3`。
+
+- [ ] **Step 4: 三道门禁 + 提交**
+
+Run: `cargo test -p rstore-s3` 与 `bash scripts/check-layer-deps.sh`
+Expected: 全绿；护栏退出 0（本节没有引入任何跨 crate 依赖）
+
+```bash
+git add crates/s3/
+git commit -m "feat(s3): conditional requests for GET and HEAD
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5.11: 虚拟主机风格寻址
+
+**Files:**
+- Modify `crates/s3/src/lib.rs`（加 `build_service`，把 5.1 只在测试里写过的装配提取成公开函数）
+- Modify `crates/s3/src/impl_s3.rs`（测试：多加一个 `set_host` 的用例）
+
+> **为什么有这一节。** DESIGN §15.4 的第 6 条：客户端会用
+> `Host: bucket.example.com` 而不是 `Host: example.com` + `Path: /bucket/key` 来寻址。
+> 不做的话，`aws --endpoint-url https://s3.example.com` 这类配置下一个桶都访问不到
+> （它会拿 `bucket.example.com` 当桶名发出去，而我们按 path-style 解析，
+> 桶名成了 `bucket.example.com`，于是 404）。
+>
+> **默认关闭。** `--base-domain` 不给时**保持现在的纯 path-style 行为**——
+> 这是向后兼容的默认值，也是 `tests/compat/*.sh` 与 `tests/acceptance.sh` 用的模式
+> （它们全部走 path-style：`mc` 配 `FORCE_PATH_STYLE=true`、rclone 配
+> `RCLONE_CONFIG_RS_FORCE_PATH_STYLE=true`）。所以**打开这个开关不能改变
+> 现有四个脚本的任何行为**，这也是为什么它必须由参数门控而不是无条件开启。
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn virtual_host_style_host_header_selects_bucket() {
+    // 用 `build_service(store, KEY, SECRET, Some("example.com"))` 建 service。
+    // 请求 `Host: test-bucket.example.com`、路径 `/obj`：
+    //   PUT  → 200，且 store 里落在 **"test-bucket"** 桶下（不是 "test-bucket.example.com"）
+    //   GET  → 200，内容与 PUT 的一致
+    // **不需要 DNS、不需要端口**：s3s 只看 `Host` 头，`oneshot` 直接打进去。
+}
+
+#[tokio::test]
+async fn path_style_still_works_when_base_domain_is_set() {
+    // 同一个 service（base_domain = Some("example.com")），
+    // 但请求 `Host: example.com` + 路径 `/test-bucket/obj` → 仍然 200。
+    // `parse_host_header` 对 `host_part == base_part` 返回**不带 bucket** 的
+    // `VirtualHost`，于是回落到 path-style；这条钉住「开了虚拟主机没有把
+    // path-style 关掉」。
+}
+
+#[tokio::test]
+async fn host_outside_base_domain_falls_back_to_cname_style() {
+    // **这条记录的是一个反直觉的行为，不是我们想要的功能。**
+    // base_domain = Some("example.com") 时，`Host: 127.0.0.1:9000` 既不等于
+    // base、也不是它的子域 → `SingleDomain` 的 CNAME 回退把**整个 host**
+    // 当成桶名（`127.0.0.1`）→ 404 NoSuchBucket。
+    // 断言的就是这个 404 + `NoSuchBucket`——把它钉成「已知行为」而不是意外。
+    // 它正是 Task 6.3 里 `--base-domain` 默认值必须留空的原因（见那里的说明）。
+    // 若哪天 CNAME 回退被关掉，这条会失败，那时应当**同时**回来核对
+    // `--base-domain` 的默认值论证是否还成立。
+}
+
+#[tokio::test]
+async fn no_base_domain_means_path_style_only() {
+    // `build_service(.., None)` 的 service 收到 `Host: test-bucket.example.com`
+    // **完全不看 Host 头**——s3s 侧是 `if let (Some(host_header), Some(s3_host))`，
+    // `s3_host` 为 `None` 时整段跳过，Host 头被丢弃（`ops/mod.rs` 的
+    // `parse_request_host`）。
+    // 断言 `GET /`（path-style 的 ListBuckets）→ 200 **且正文含
+    // `ListAllMyBucketsResult`**：只断言 200 区分不出「当成了 ListBuckets」
+    // 与「当成了名为 test-bucket 的桶上的一次列举」——后者会是 404。
+    // 这条是「默认行为没变」的回归测试（见本节的「默认关闭」说明）。
+}
+
+#[test]
+fn invalid_base_domain_is_rejected_at_construction() {
+    // `build_service(.., Some("not a domain"))` → **Err**，且错误信息里含该字符串。
+    // 启动期就失败，不要拖到第一个请求：那时错误会变成一个 400/500，
+    // 而运维看到的是「服务起来了但客户端全挂」，没有任何线索指向 --base-domain。
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-s3 host`
+Expected: 编译失败（`build_service` 不存在）
+
+- [ ] **Step 3: 实现**
+
+`crates/s3/src/lib.rs`——把 5.1 只写在测试里的装配提取成一个公开函数。
+**`build_service` 是本 crate 唯一的装配入口**，6.3 的启动流程调它：
+
+```rust
+use std::sync::Arc;
+
+use rstore_api::ObjectStore;
+use s3s::auth::SimpleAuth;
+use s3s::host::SingleDomain;
+use s3s::service::{S3Service, S3ServiceBuilder};
+
+pub use impl_s3::RstoreFs;
+
+/// 装配 S3 service。
+///
+/// `base_domain` 为 `None` 时**只支持 path-style**（s3s 的默认 host 解析）；
+/// 为 `Some(d)` 时开启虚拟主机风格：`Host: <bucket>.<d>` 会被解析成
+/// `bucket = <bucket>`。
+///
+/// **返回 `Result` 是因为 `d` 可能不是合法域名**，那属于启动期配置错误——
+/// 应该在进程启动时明确报错退出，而不是等到第一个请求变成一个费解的 400。
+/// 所以这里用一个简单的 `String` 承载配置错误，不复用 `ApiError`
+/// （它是**请求期**的错误类型；用它会让「启动失败」和「请求失败」在同一处混起来）。
+pub fn build_service(
+    store: Arc<dyn ObjectStore>,
+    access_key: &str,
+    secret_key: &str,
+    base_domain: Option<&str>,
+) -> Result<S3Service, String> {
+    let mut builder = S3ServiceBuilder::new(RstoreFs { store });
+    builder.set_auth(SimpleAuth::from_single(access_key, secret_key));
+    if let Some(domain) = base_domain {
+        // `SingleDomain` 默认带 CNAME 回退（域外的 host 被当成桶名）。
+        // **保留默认**：关掉它（`with_cname_fallback(false)`）会让「用别的域名
+        // 指进来」的部署方式失效，而我们没有理由禁止它。
+        let host = SingleDomain::new(domain)
+            .map_err(|e| format!("invalid --base-domain {domain:?}: {e}"))?;
+        builder.set_host(host);
+    }
+    // 不设 host 时走 s3s 的默认（纯 path-style）——**不要**显式设 PathStyle，
+    // 那会把 s3s 换默认实现时的新行为挡在外面，而我们的默认行为就是它的默认行为。
+    Ok(builder.build())
+}
+
+#[cfg(test)]
+mod mock;
+
+pub(crate) mod conditional;
+pub(crate) mod errors;
+pub mod impl_s3;
+```
+
+> **`RstoreFs { store }` 的字段是 `pub`**（5.1 就是这么定的），所以测试里
+> 直接用它构造也行；但生产路径必须走 `build_service`，否则 `set_host`
+> 这一行在 6.3 里会被漏掉——而漏掉的表现是「虚拟主机模式静默不生效」，
+> 没有任何报错。
+
+- [ ] **Step 4: 三道门禁 + 提交**
+
+```bash
+git add crates/s3/
+git commit -m "feat(s3): optional virtual-host style addressing via base domain
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+> **6.3 的启动流程要跟着改**：`--base-domain` 参数（见 Task 6.3 的启动契约表）
+> 传进 `build_service(.., config.base_domain.as_deref())`，
+> 返回的 `Err` 直接让进程以非零码退出并打印那条信息。
+> 这一处**在 6.3 落地之前，虚拟主机模式是「实现好了但没人打开」**——
+> 那没关系，本节的四个测试覆盖的是能力本身。
+
+---
+
 ## M6 — 运维面与验收
 
 > **本里程碑里 6.1 / 6.2 / 6.3 的 `#[tokio::test]` 函数体原本是空的**（里面只有一行
@@ -7090,7 +7818,22 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 | `--parity <u8>` | 否 | `default_parity(volumes.len())`（4.3） | 6 块盘时默认是 **3**（3+3），而验收脚本要 4+2 → 必须显式传 `--parity 2` |
 | `--access-key <str>` | 否 | **`rustorage`** | 加进 `SimpleAuth::from_single`（5.1） |
 | `--secret-key <str>` | 否 | **`rustorage-secret`** | 同上 |
+| `--base-domain <str>` | 否 | **不给（= 纯 path-style）** | 传给 `build_service(.., base_domain)`（Task 5.11）开启虚拟主机寻址 |
 | `--metrics` | 否 | 关闭 | 打开 `/metrics`（6.2） |
+
+> **`--base-domain` 的默认值是「不给」，这条必须保持。** `tests/compat/*.sh` 与
+> `tests/acceptance.sh` 全部走 path-style（`mc` 与 `rclone` 都显式配了
+> `FORCE_PATH_STYLE=true`）。给它一个非空默认值之后，客户端发来的
+> `Host: 127.0.0.1:9000` 既不等于是 base domain、也不是它的子域，于是走
+> `SingleDomain` 的 **CNAME 回退**——**桶名变成 `127.0.0.1`**，四个脚本里
+> 每一个请求都 404 `NoSuchBucket`，而错误信息里不会出现「base-domain」这个词。
+> （注意机制不是「域名校验失败」：`strip_port_suffix` 会把端口剥掉，
+> `is_valid_domain` 也接受 `127.0.0.1:9000`。所以别想着靠
+> `with_cname_fallback(false)` 去救一个错误的默认值——那只是把另一个行为改掉。）
+>
+> `build_service` 返回的 `Err`（域名不合法）**必须让进程以非零码退出并打印那条信息**，
+> 不要 `unwrap()`：Task 5.11 的 `invalid_base_domain_is_rejected_at_construction`
+> 就是为了让这个错误在启动期可见。
 
 > **那两个默认凭据是 5.9 三个冒烟脚本硬编码的同一对值。** 两边不一致的表现是三个脚本
 > 齐刷刷 `403 SignatureDoesNotMatch`，而错误信息不会告诉你是配置对不上。
@@ -7110,8 +7853,15 @@ cargo run -p rstore-server -- \
 
 解析参数 → 打开各盘（`LocalDisk::open`）→ 逐盘读 `format.json` →
 `rstore_meta::format::select_authoritative` → 构造 `ErasureSet` →
+**`rstore_s3::build_service(store, key, secret, base_domain)`**（Task 5.11，
+组合根在这里才是唯一同时看得见 `rstore-s3` 与 `rstore-store` 的地方）→
 `mark_stage(StorageReady)` → 起 HTTP 服务 → `mark_stage(FullReady)`。
 所有长生命周期任务绑定 `CancellationToken`。
+
+> `build_service` 返回 `Err` 时直接打印并 `exit(1)`，别 `unwrap()`——
+> 那条 `Err` 是「`--base-domain` 不是合法域名」，是**运维输入错误**，
+> 需要那句信息才修得了。`unwrap()` 只会打印一个 panic backtrace，
+> 而 backtrace 里不会出现那个参数名。
 
 **格式校验必须复用 `crates/meta/src/format.rs` 里已有的两个函数，不要重写一份**：
 
@@ -7306,6 +8056,9 @@ MVP 交付时必须全部为真：
 | **默认凭据三处不一致**（Task 6.3 的 `--access-key`/`--secret-key` 默认值、`tests/compat/*.sh`、`tests/acceptance.sh`） | 三处写的是同一个 `rustorage` / `rustorage-secret`，但**没有任何东西能强制它们一致**——编译器看不见 shell 脚本。不一致的表现是三个脚本齐刷刷 403 `SignatureDoesNotMatch`。改动任一处时三处同改；6.4 的验收脚本是全链路唯一会同时用到它们的地方 |
 | **`--parity` 默认值与验收脚本的期望不一致** | `default_parity(6) = 3`（有测试钉住），而 6.4 要的是 4+2。所以 6.4 的脚本**必须显式**传 `--parity 2`；漏掉的话「掉 2 块」离边界还很远，那条最关键的容错验收会退化成一次普通读 |
 | **Task 5.9 的冒烟脚本依赖 Task 6.3 的启动编排** | 本计划里唯一一处 M5 依赖 M6。5.9 的 Step 2 只有在 6.3 落地后才能跑；这不是可以「先欠着」的排序，别在 5.9 里临时写一次性 main 绕过 |
+| **`--base-domain` 一旦有非空默认值，四个 shell 脚本全红** | Task 5.11 的能力由 `--base-domain` 门控，默认「不给」= 纯 path-style。**失败机制是 `SingleDomain` 的 CNAME 回退，不是域名校验失败**（端口会被 `strip_port_suffix` 剥掉，`is_valid_domain` 也接受带端口的 host）：给了 `--base-domain example.com` 之后，脚本发来的 `Host: 127.0.0.1:9000` 既不等于是 base、也不是它的子域，于是走 CNAME 回退，**桶名变成 `127.0.0.1`**，全部请求 404 `NoSuchBucket`——而报错里不会出现「base-domain」这个词。改这个默认值 = 同时改四个脚本的寻址模式 |
+| **`validate_object_key` 的两条规则必须同时生效**（Task 5.7） | 规则 1（保留前缀）漏了 → 用户在 `.rstore*` 里写数据；规则 2（空段 / `.` / `..`）漏了 → 两个不同的 S3 key 落到同一个文件上**静默互相覆盖**。规则 2 还必须接在**读路径**上：只接写路径的话 `GET /b/../x` 会从盘层的 `Fatal(PathEscape)` 变成 500，而不是 400 |
+| **条件请求的求值顺序不能重排**（Task 5.10） | RFC 9110 §13.2.2 的两处「缺席时才看」（`If-Match` 挡住 `If-Unmodified-Since`、`If-None-Match` 挡住 `If-Modified-Since`）漏掉任何一处，表现都是「两个头都发的客户端偶尔拿到 200 而它期望 304」——这种 bug 在单头测试里完全看不见，所以 5.10 的矩阵里专门有两条「两个都发、结论不同」的用例 |
 
 ---
 
