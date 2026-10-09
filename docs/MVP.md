@@ -4019,6 +4019,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Create: `crates/store/src/quorum.rs`
 - Modify: `crates/store/src/lib.rs`（加 `pub mod quorum;`）
+- Modify: `crates/store/Cargo.toml`（`[dependencies]` 加 `tracing.workspace = true`——
+  某一票因编码失败作废时要记一笔；`tracing` 已在 `[workspace.dependencies]` 里，
+  M6 的 server 也要用，这里只是让 store 也能用）
 - Test: 同文件 `#[cfg(test)]`
 
 > **不需要给 store 加 `rmp-serde` 依赖**（原计划的 Files 清单里有这条）。
