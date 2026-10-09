@@ -230,7 +230,7 @@ rstore-server        二进制入口，唯一的装配点
 ### 6.3 保留名规则
 
 1. **桶名**必须以小写字母或数字开头（S3 规则），故永不与 `.` 开头的系统目录冲突。
-2. **对象 key** 的第一段不得以 `.rstore` 开头。该校验在请求入口执行，违反返回 `InvalidObjectName`。
+2. **对象 key** 的第一段不得以 `.rstore` 开头。该校验在请求入口执行，违反返回 `400 InvalidArgument`（内部错误变体仍叫 `InvalidObjectName`；s3s 的 S3 码表里没有 `InvalidObjectName`，见 MVP Task 5.8）。
 
 > 这条规则把「系统目录」与「用户命名空间」用可检查的语法隔开，避免 MinIO 那种保留名散落各处的问题。
 

@@ -6770,8 +6770,18 @@ async fn all_six_multipart_ops_are_501_not_implemented() {
 
 ### Task 5.7: 命名校验（保留名规则 + 盘上会碰撞的 key 形状）
 
-**Files:** Create `crates/s3/src/validate.rs`；Modify `crates/s3/src/impl_s3.rs`
+**Files:** Create `crates/s3/src/validate.rs`；Modify `crates/s3/src/lib.rs`（加 `pub(crate) mod validate;`）；Modify `crates/s3/src/impl_s3.rs`；Modify `crates/s3/src/errors.rs`
 （`RESERVED_PREFIX` 已由 Task 4.11 定义，本任务只引用）
+
+> `lib.rs` 里现在只有 `errors` / `impl_s3` / `mock` 三个模块声明，**没有** `validate`——
+> 不声明的话新文件根本不会被编译（也就不会有「测试先失败」，而是「测试不存在」）。
+> 用 `pub(crate)` 即可：`validate_object_key` 只被同 crate 的 `impl_s3.rs` 调用，
+> 不需要对外（`errors` 就是这样声明的）。
+
+> `errors.rs` 在列表里，理由与 Task 5.4 相同：`ApiError::InvalidObjectName` 目前**没有**
+> 映射行（5.2 只建了桶错误，5.3 加了 `NoSuchKey`），不加会掉进 `_` 兜底变成
+> **500 InternalError**，于是本节两个 HTTP 测试红在一个跟 key 校验无关的地方。
+> 要加的行是 `ApiError::InvalidObjectName => s3s::s3_error!(InvalidArgument)`。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -6867,7 +6877,7 @@ pub fn validate_object_key(key: &str) -> Result<(), ApiError> {
 > **为什么要拒绝，而不是归一化。** 归一化（把 `a//b` 改写成 `a/b` 后放行）是把
 > 「两个 key」偷偷变成一个 key：PUT `a//b` 写进 `a/b`，之后 GET `a/b` 会读到它，
 > 而 PUT `a/b` 又会覆盖它。客户端拿到的每一次响应都是 200，丢的数据却对不上任何一次
-> 请求。拒绝会立刻暴露在客户端面前（400 + `InvalidObjectName`），这是可诊断的失败。
+> 请求。拒绝会立刻暴露在客户端面前（400 + `InvalidArgument`），这是可诊断的失败。
 > 真正的修法是**在盘上编码 key**（MinIO 就是这么做的：键名进盘前编码），
 > 那是 Phase 2 改 `fsx` 的事。
 >
@@ -6945,8 +6955,14 @@ pub fn validate_object_key(key: &str) -> Result<(), ApiError> {
 
 补两个 HTTP 层测试（用 5.1 那套 `tower::ServiceExt::oneshot`，别绑端口）：
 
-- 对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidObjectName`（规则 1）；
-- 对 `a//b` 发 PUT，同样期望 `400` + `InvalidObjectName`（规则 2）。
+- 对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidArgument`（规则 1）；
+- 对 `a//b` 发 PUT，同样期望 `400` + `InvalidArgument`（规则 2）。
+
+> **对外码是 `InvalidArgument`，不是 `InvalidObjectName`。** 后者是 DESIGN §6.3 的
+> 用词，但 s3s 的码表里没有它（`s3_error!(InvalidObjectName)` 编译不过——它展开成
+> `S3ErrorCode::$code` 这条路径）。`ApiError::InvalidObjectName` 这个**内部**变体名
+> 照 DESIGN 保留，`errors.rs` 里把它映射到 `InvalidArgument`（400）。
+> 完整理由见 Task 5.8 的那段说明。**这条测试断言的是对外码**，所以写 `InvalidArgument`。
 
 第二条不能省：规则 1 的测试对规则 2 完全无感，而规则 2 才是那条会导致**数据静默
 互相覆盖**的规则。
@@ -6960,7 +6976,8 @@ Expected: PASS
 # 注意**没有** `crates/common/src/consts.rs`：`RESERVED_PREFIX` 是 Task 4.11
 # 定义的，本任务只引用它。也**不是** `crates/meta/src/keys.rs`——那是原计划
 # 修掉之前的位置，本任务一行都不用动它。
-git add crates/s3/src/validate.rs crates/s3/src/impl_s3.rs
+# `errors.rs`（映射行）与 `lib.rs`（模块声明）都在列表里，见 Files 后面的说明。
+git add crates/s3/src/validate.rs crates/s3/src/lib.rs crates/s3/src/impl_s3.rs crates/s3/src/errors.rs
 git commit -m "feat(s3): object key validation with reserved prefix rule
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -6987,13 +7004,35 @@ fn maps_api_errors_to_s3_codes() {
     assert_code(ApiError::NoSuchBucket, "NoSuchBucket", 404);
     assert_code(ApiError::BucketNotEmpty, "BucketNotEmpty", 409);
     assert_code(ApiError::InvalidBucketName, "InvalidBucketName", 400);
-    assert_code(ApiError::InvalidObjectName, "InvalidObjectName", 400);
+    assert_code(ApiError::InvalidObjectName, "InvalidArgument", 400);
     assert_code(ApiError::InvalidRange, "InvalidRange", 416);
     assert_code(ApiError::NotImplemented, "NotImplemented", 501);
-    assert_code(ApiError::Unavailable, "InternalError", 503);
+    assert_code(ApiError::Unavailable, "ServiceUnavailable", 503);
     assert_code(ApiError::Internal("boom".into()), "InternalError", 500);
 }
 ```
+
+> **`InvalidObjectName` 与 `Unavailable` 这两行原本是错的，都已在实现前查过 s3s 的码表。**
+>
+> - **s3s 没有 `InvalidObjectName` 这个码。** `src/error/generated.rs` 里
+>   `S3ErrorCode` 的变体名就是可用的码名（`s3_error!($code:ident)` 展开成
+>   `S3ErrorCode::$code`，是一条路径，不是字符串）。`Invalid*` 系列里没有
+>   `InvalidObjectName`——它其实是 **MinIO 自造**的（`XMinioInvalidObjectName`）。
+>   用 `S3ErrorCode::Custom("InvalidObjectName".into())` 能编译，但
+>   `Custom(_)` 的 `status_code()` 返回 **`None`**，得再手工
+>   `set_status_code(400)`，而且那个码字符串没有任何客户端认识它。
+>   **采用客户端的语言，而不是我们内部枚举的名字**：映射成 AWS 标准的
+>   `InvalidArgument`（400 Bad Request，s3s 中有，消息 "Invalid Argument"）。
+>   注意 `ApiError::InvalidObjectName` 这个**内部**变体名保持不变——它描述的是
+>   「哪一类错误」，与「对外报什么码」是两件事，这正是本文件存在的意义。
+> - **`Unavailable` 报 `InternalError` + 503 是自相矛盾的**：`InternalError`
+>   在 s3s 里固定映射到 **500**，`assert_code` 第三个参数写 503 会直接红。
+>   而且 500 在说「服务端有 bug」，对端会停止重试；quorum 不足是**暂时**的，
+>   客户端应当退避重试。映射成 `ServiceUnavailable`（503，消息
+>   "Service is unable to handle request."），**并挂一个 `Retry-After` 头**
+>   （复用 416 那条用过的 `S3Error::set_headers`），否则客户端只能自己猜退避时长。
+>   DESIGN §15.4 与 §16.4 的 `ReadinessGate` 用的是同一个码（`503 + Retry-After`），
+>   两边保持一致。
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
@@ -8177,7 +8216,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
 | **载荷上限约 8 MiB** | 同上一条的推论：交付给客户端的大对象只能靠 < 8 MiB 的单次 PUT | 5.6 / 5.9 | 同 5.6 |
 | **条件请求只覆盖 GET / HEAD** | `PUT` 带 `If-None-Match: *`（条件创建）**不求值**，会被当成普通 PUT。`If-Range` 也不支持 | 5.10 | 需要先给 `ObjectStore` 加原子的 conditional-put——在 S3 层「先查再写」是 TOCTOU，不能这么补 |
-| **含空段 / `.` / `..` / 首尾斜杠的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b`、`a/`、`/a` 都当成与 `a/b`、`a` 不同的独立 key，我们一律 400 `InvalidObjectName`。**客户端真能构造出这些 key**，不是理论边角：s3s 在 `ops/mod.rs:696` 对 URI path 做 `urlencoding::decode`，所以 `--key 'a%2F%2Fb'` 解码后到达校验的就是 `a//b`。实际会撞上的场景是**目录占位对象**（`aws s3api put-object --bucket b --key dir/` —— 只为了建一个「文件夹」），以及任何以 `/` 结尾的 key | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
+| **含空段 / `.` / `..` / 首尾斜杠的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b`、`a/`、`/a` 都当成与 `a/b`、`a` 不同的独立 key，我们一律 400 `InvalidArgument`。**客户端真能构造出这些 key**，不是理论边角：s3s 在 `ops/mod.rs:696` 对 URI path 做 `urlencoding::decode`，所以 `--key 'a%2F%2Fb'` 解码后到达校验的就是 `a//b`。实际会撞上的场景是**目录占位对象**（`aws s3api put-object --bucket b --key dir/` —— 只为了建一个「文件夹」），以及任何以 `/` 结尾的 key | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
 | **虚拟主机寻址默认关闭** | 默认纯 path-style；要按 `Host: bucket.example.com` 寻址必须显式传 `--base-domain` | 5.11 | 无。这是刻意的门控，见 Task 6.3 的启动契约表 |
 | **LIST 是全盘遍历** | 大数据集上很慢；没有索引、没有分页下推（分页只在 S3 层做） | 4.11 / 5.5 | Phase 2 的索引；接口已留挂钩位 |
 | **无并发锁** | DESIGN §16.1 的按 `(bucket, key)` 分片 `RwLock` **在 M1~M5 全篇没有任何任务实现它**（`crates/store/src/` 下 `grep -rn "RwLock\|Mutex"` 只命中 `testutil.rs` 的一句注释）。PUT/GET 并发目前由文件系统语义兜底：`.staging-*` + rename 提交保证了「看不到半成品」，但**不保证同一 key 上两个并发 PUT 的先后** | — | Phase 2。连同「heal 与写共用同一把锁」那条约束一起推迟——那条约束在 heal 存在之前没有意义 |
