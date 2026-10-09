@@ -5321,16 +5321,42 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 /// 两者只能各定一份，再由 `rstore-server` 映射。
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    #[error("not found")]
-    NotFound,
-    #[error("read quorum not reached")]
+    #[error("no such key")]
+    NoSuchKey,
+    #[error("no such bucket")]
+    NoSuchBucket,
+    #[error("bucket not empty")]
+    BucketNotEmpty,
+    #[error("invalid bucket name")]
+    InvalidBucketName,
+    #[error("invalid object name")]
+    InvalidObjectName,
+    #[error("invalid range")]
+    InvalidRange,
+    #[error("not implemented")]
+    NotImplemented,
+    #[error("unavailable")]
     Unavailable,
-    #[error("invalid argument: {0}")]
-    InvalidArgument(String),
     #[error("internal: {0}")]
     Internal(String),
 }
 ```
+
+变体是按 **S3 错误码**挑的，不是照抄 `StoreError`：每个变体在 Task 5.8 的映射表里
+都有唯一的 `(Code, HTTP status)`，不出现「两个变体映到同一个码」这种要调用方去猜的歧义。
+`NoSuchKey` / `NoSuchBucket` 分开而不是合并成 `NotFound`，是因为 S3 的 `HeadBucket`
+要的是 `404 NoSuchBucket`、`GetObject` 要的是 `404 NoSuchKey`——合并之后 5.8 还得反推
+「这次是哪个操作」，那是把调用点的信息丢在半路。
+
+**Multipart 系列在 MVP 里不实现**（`ObjectStore` trait 不定义 multipart 方法，
+`s3s` 侧的 `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
+`AbortMultipartUpload` / `ListParts` / `ListMultipartUploads` 一律返回
+`501` + `ApiError::NotImplemented`）。理由：DESIGN 把 multipart 划在 Phase 3，
+而 Task 4.5 的存储层只写单个 `part.1`（`PutArgs` 里根本没有 part 列表），
+两边同时成立是不可能的——要么改 4.5 的 PUT 设计支持多 part 组装，要么推迟 multipart。
+**明确推迟 multipart**，`assert_code(ApiError::NotImplemented, "NotImplemented", 501)` 是它的门。
+代价写在 Task 5.9：aws-cli 的 `s3 cp` 超过 8 MiB 会自动改走 multipart，因此兼容冒烟脚本
+的载荷固定 < 8 MiB；真实用户传大文件会拿到 501。这是 MVP 的已知限制，不是 bug。
 
 M5 的 `Task 5.8: 错误映射` 就是把 `ApiError` 映到 S3 错误码；`StoreError → ApiError`
 的转换写在组合根（`rstore-server`），它是唯一同时看得见两边的 crate。
@@ -5406,7 +5432,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 | 5.3 | `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` | 往返一致、ETag 正确、HEAD 无 body 但有 Content-Length |
 | 5.4 | `GetObject` 的 Range | `bytes=a-b` / `bytes=a-` / `bytes=-n` 三种形式；206 与 `Content-Range` |
 | 5.5 | `ListObjectsV2` | 前缀、分隔符、`max-keys` 分页、`CommonPrefixes`、`continuation-token` 往返 |
-| 5.6 | Multipart 全流程 | 分片上传后 Complete 的 ETag 格式为 `<md5>-<n>`；Abort 后目录被清理；不存在的 part 号返回 `InvalidPart` |
+| 5.6 | Multipart 系列 | **MVP 不实现**：见下方注记。测试只验证「六个 multipart 操作各自返回 `501` + 合法 S3 错误响应体」 |
 | 5.7 | 命名校验 | 见下（单独展开） |
 
 **每个 Task 的提交信息格式：** `feat(s3): implement <operation group>`
@@ -5414,6 +5440,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 > **实现提示（5.5 尤其注意）**：LIST 在 MVP 是**全盘遍历**。必须在注释中写明这一点，
 > 并留下 `// PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引` 的挂钩注释，
 > 避免后续读者误以为这是终态设计。
+
+> **为什么 5.6 是「返回 501」而不是「实现 multipart」**：Task 4.5 冻结的存储层
+> 每个版本只写一个 `part.1`，`PutArgs { bucket, key, data }` 里没有 part 列表，
+> `PartInfo` 的 `number` 恒为 1。要让 `CompleteMultipartUpload` 能把 N 个分片拼成一个对象，
+> 必须先改 4.5 与 4.7 的设计（多 part 目录、part 索引、ETag 的 `-n` 格式、`ListParts` 状态）。
+> DESIGN 把 multipart 划在 Phase 3，本计划跟它一致：**推迟**。
+> 这是有意识的范围决策，不是遗漏——所以 5.6 必须**留一个可执行的测试**把 501 钉住，
+> 免得日后有人以为 multipart「已经默默支持了」。
 
 ---
 
@@ -5448,7 +5482,7 @@ fn rejects_bucket_names_violating_s3_rules() {
 #[test]
 fn reserved_prefix_constant_is_not_empty() {
     // 防止有人在重构中把常量改成空串，让校验静默失效
-    assert!(!rstore_meta::keys::RESERVED_PREFIX.is_empty());
+    assert!(!rstore_common::consts::RESERVED_PREFIX.is_empty());
 }
 ```
 
@@ -5460,23 +5494,33 @@ Expected: 编译失败
 - [ ] **Step 3: 实现**
 
 ```rust
-/// 对象 key 校验。返回 `StoreError::InvalidObjectName`。
+/// 对象 key 校验。返回 `ApiError::InvalidObjectName`。
 /// 只检查第一段；深层段允许出现 `.rstore`（DESIGN §6.3）。
-pub fn validate_object_key(key: &str) -> Result<(), StoreError>;
+pub fn validate_object_key(key: &str) -> Result<(), ApiError>;
 
 /// 桶名校验。S3 规则：3–63 字符、小写字母或数字开头、仅含 `a-z0-9.-`。
-/// 返回 `StoreError::InvalidBucketName`。
-pub fn validate_bucket_name(name: &str) -> Result<(), StoreError>;
+/// 返回 `ApiError::InvalidBucketName`。
+pub fn validate_bucket_name(name: &str) -> Result<(), ApiError>;
 ```
 
-在 `crates/meta/src/keys.rs` 中定义 `pub const RESERVED_PREFIX: &str = ".rstore";`，
+在 **`crates/common/src/consts.rs`** 中定义 `pub const RESERVED_PREFIX: &str = ".rstore";`，
 两处校验都引用它，**不得内联字面量**。
+
+> **常量必须落在 `rstore-common`，不能落在 `rstore-meta`。** 原计划写的是
+> `crates/meta/src/keys.rs`，而校验代码在 `crates/s3` 里——但护栏 allowlist
+> （`scripts/check_layer_deps.py`）给 `rstore-s3` 的允许集只有
+> `{rstore-common, rstore-api}`，`rstore-meta` 是被禁的边。常量放 meta 的话，
+> 这行校验一写出来 `scripts/check-layer-deps.sh` 就退出 1。
+> `rstore-common` 是唯一同时被 meta 与 s3 看见的 crate，往那里放两边都能用。
+> （`crates/meta/src/keys.rs` 里那几个 `RUSTORAGE_KEY_PREFIX` / `INLINE_DATA` 是**线格式**
+> 的 header 名，只有 meta 层用，留在原地。）
 
 - [ ] **Step 4: 在请求入口接入**
 
-在 `impl_s3.rs` 的 `put_object` / `get_object` / `head_object` / `delete_object` /
-`list_objects_v2` 入口调用校验。补一个 HTTP 层测试：对 `.rstore.sys/x` 发 PUT，
-期望 `400` + `InvalidObjectName`。
+在 `impl_s3.rs` 的 `put_object` 与 `create_bucket` 入口调用校验
+（`get` / `head` / `delete` 对不合法的名字同样是 400，但那是**先校验再查**还是
+**查到 404** 都可以，S3 客户端两种都接受——只在 PUT 与建桶这两个**写入**入口强制）。
+补一个 HTTP 层测试：对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidObjectName`。
 
 - [ ] **Step 5: 提交**
 
@@ -5500,21 +5544,47 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 #[test]
-fn maps_store_errors_to_s3_codes() {
-    assert_code(StoreError::NotFound, "NoSuchKey");
-    assert_code(StoreError::NoSuchBucket, "NoSuchBucket");
-    assert_code(StoreError::InvalidPart, "InvalidPart");
-    assert_code(StoreError::ReadQuorum { .. }, "InternalError");
-    assert_code(StoreError::WriteQuorum { .. }, "InternalError");
-    assert_code(StoreError::DiskFull, "InsufficientStorage");
-    assert_code(StoreError::SlowDown, "SlowDown");
+fn maps_api_errors_to_s3_codes() {
+    // S3 层只看得见 `ApiError`（见 Task 5.1 的分层说明），**不是** `StoreError`——
+    // 两者之间没有依赖边。原计划这张表写的 `StoreError::{NoSuchBucket, InvalidPart,
+    // DiskFull, SlowDown}` 四个变体**一个都不存在**，照抄编译不过。
+    //
+    // 断言里带上 HTTP 状态码：只断言 `<Code>` 字符串的话，「NoSuchKey 配了 500」
+    // 这种错会漏过去，而 S3 客户端是按状态码分支的。
+    assert_code(ApiError::NoSuchKey, "NoSuchKey", 404);
+    assert_code(ApiError::NoSuchBucket, "NoSuchBucket", 404);
+    assert_code(ApiError::BucketNotEmpty, "BucketNotEmpty", 409);
+    assert_code(ApiError::InvalidBucketName, "InvalidBucketName", 400);
+    assert_code(ApiError::InvalidObjectName, "InvalidObjectName", 400);
+    assert_code(ApiError::InvalidRange, "InvalidRange", 416);
+    assert_code(ApiError::NotImplemented, "NotImplemented", 501);
+    assert_code(ApiError::Unavailable, "InternalError", 503);
+    assert_code(ApiError::Internal("boom".into()), "InternalError", 500);
 }
 ```
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
 要求每个 S3 错误响应包含 `Code` / `Message` / `Resource` / `RequestId` 四要素
-（DESIGN §15.4）。
+（DESIGN §15.4）。`assert_code` 的第三个参数就是这个变体对应的 HTTP 状态码。
+
+**`StoreError → ApiError` 的映射不在这个文件里**，它属于组合根
+（`rstore-server/src/wiring.rs` 的 `EngineAdapter`），因为只有那里同时看得见两边。
+映射表（写在这里，实现时照抄）：
+
+| `StoreError` | `ApiError` | 说明 |
+|---|---|---|
+| `NotFound` | `NoSuchKey` | 4.7 会加这个变体 |
+| `ReadQuorum { .. }` / `WriteQuorum { .. }` | `Unavailable` | 503 + `Retry-After`；这是**暂时**不可用，不是 500 |
+| `ShardLayout(_)` | `Internal` | 布局坏了是本实现自己的 bug，必须显式暴露 |
+| `Internal(_)` | `Internal` | |
+| `Disk(DiskError::NotFound)` | `NoSuchKey` | 单盘缺失通常已被上层吸收成 slot=None，走到这里说明是整体缺失 |
+| `Disk(_)` 其余 | `Internal` | |
+| `_`（`#[non_exhaustive]` 的兜底） | `Internal` | `StoreError` 是 `#[non_exhaustive]`，必须有兜底分支 |
+
+**不引入 `DiskFull` / `SlowDown`**：`StoreError`、`DiskError` 里都没有能区分出它们的变体，
+凭空加两个 S3 错误码只会得到「永远返回不到」的死分支。真需要时先在
+`rstore_common::error::FatalKind` 里加变体，再回来补这一行——那时它才是有依据的。
 
 ```bash
 git add crates/s3/src/errors.rs
@@ -5528,8 +5598,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 5.9: 兼容层与客户端冒烟测试
 
 **Files:**
-- Create: `crates/s3-compat/src/lib.rs`
+- Create: `crates/s3-compat/src/lib.rs`（**可以先是空的**，见 Step 3 的注记）
 - Create: `tests/compat/aws_cli.sh`、`tests/compat/mc.sh`、`tests/compat/rclone.sh`
+
+> **载荷必须 < 8 MiB。** aws-cli 的 `s3 cp` 对超过 8 MiB 的文件会自动改走
+> multipart 上传，而 MVP 对 multipart 返回 501（见 Task 5.6）。脚本里的
+> `head -c 1048576` 是刻意的；**不要**为了「测得更充分」把它调大，
+> 那会让冒烟脚本以「测到 multipart 的 501」的形式失败，而那个失败不是 compat 层能修的。
 
 - [ ] **Step 1: 先跑冒烟脚本，找出真实的不兼容点**
 
@@ -5570,6 +5645,20 @@ Expected: 首次运行**允许失败**——失败项就是 compat 层的需求�
 ```
 
 并且该中间件被移除时，对应的冒烟测试必须失败。**不允许凭猜测添加中间件。**
+
+> **`crates/s3-compat` 的接线缺口，动手前先看这条。** 护栏 allowlist 给它的是
+> `{rstore-common}`，而 `rstore-s3` 的允许集是 `{rstore-common, rstore-api}`——
+> 也就是说 **`rstore-s3` 看不见 `rstore-s3-compat`，没有任何东西会调用这里的中间件**。
+> 这在本任务里是**可以接受的**，因为正确的做法本来就是「先跑脚本、观察到真实失败、
+> 再决定要不要加中间件」。所以：
+>
+> - 如果三个脚本**一次就全过**（很可能是这个结果，因为 5.2~5.8 已经按客户端真实行为写了），
+>   那 `crates/s3-compat/src/lib.rs` 就保持空的、只留一句模块文档，
+>   **不要**为了「让这个 crate 有点内容」去写没人调用的中间件。这是 YAGNI。
+> - 如果确实观察到失败、需要加中间件，**先改 `scripts/check_layer_deps.py` 的 allowlist**
+>   给 `rstore-s3` 加上 `rstore-s3-compat`（并同步 `scripts/tests/test_check_layer_deps.py`
+>   里对表结构的断言），再把中间件接进 `impl_s3.rs`。
+>   `rstore-s3-compat` 只依赖 `rstore-common`，这条边不会引入环，是干净的。
 
 - [ ] **Step 4: 三个脚本全部通过后提交**
 
@@ -5712,16 +5801,31 @@ set -euo pipefail
 mkdir -p /tmp/rs/{d1,d2,d3,d4,d5,d6}
 cargo run -p rstore-server -- --volumes /tmp/rs/d{1,2,3,4,5,6} --port 9000 &
 SERVER_PID=$!
-sleep 3
+# 不要 `sleep 3`：慢机器上会假失败，快机器上白等。轮询 /ready 直到 200。
+for _ in $(seq 1 60); do
+    curl -fsS -o /dev/null http://127.0.0.1:9000/ready && break
+    sleep 0.5
+done
+curl -fsS -o /dev/null http://127.0.0.1:9000/ready || {
+    echo "server did not become ready" >&2; kill $SERVER_PID; exit 1
+}
 
 # 1. 客户端冒烟
 bash tests/compat/aws_cli.sh
 bash tests/compat/mc.sh
 bash tests/compat/rclone.sh
 
-# 2. 容错：停掉两块盘（用 chmod 000 模拟，或直接删除目录权限）
-#    → 读仍成功
-# 3. 恢复后校验数据完整
+# 2. 容错：停掉两块盘 —— **用 `mv` 把盘目录挪走，不要用 `chmod 000`**。
+#    本项目的开发与验收环境是 Windows（Git Bash），`chmod 000` 在那里是空操作：
+#    脚本会一路绿灯，却一块盘都没停掉，于是这条容错验收等于没测。
+#    `mv` 在两个平台都真的让路径消失，`LocalDisk` 会得到 NotFound/IO 错误，
+#    正是「盘掉线」要模拟的东西。
+mv /tmp/rs/d5 /tmp/rs/d5.off
+mv /tmp/rs/d6 /tmp/rs/d6.off
+# → 读仍成功（4+2 掉 2 块，read_quorum = 4）
+# 3. 恢复并校验数据完整
+mv /tmp/rs/d5.off /tmp/rs/d5
+mv /tmp/rs/d6.off /tmp/rs/d6
 
 kill $SERVER_PID
 echo "ACCEPTANCE: OK"
@@ -5749,9 +5853,12 @@ MVP 交付时必须全部为真：
 
 - [ ] `cargo build --workspace` 无 warning
 - [ ] `cargo test --workspace` 全绿
-- [ ] `cargo clippy --all-targets -- -D warnings` 通过
+- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过
 - [ ] `bash scripts/check-layer-deps.sh` 退出码 0
-- [ ] `python3 scripts/tests/test_check_layer_deps.py` 全绿
+- [ ] `python scripts/tests/test_check_layer_deps.py` 全绿
+      （用 `python` 不用 `python3`：本机 Windows 上 `python3` 可能是 Store/MSIX 别名，
+      `python3 --version` 正常但 `python3 -c 'print(1)'` 会 Permission denied(126)。
+      `scripts/check-layer-deps.sh` 已按「跑得出 1」探测，这里是同一件事。）
 - [ ] CI 在 `main` 与 PR 上跑通（护栏、lint、test 三步都不是跳过状态）
 - [ ] `bash tests/acceptance.sh` 输出 `ACCEPTANCE: OK`
 - [ ] 4+2 配置下：掉 2 盘可读、掉 2 盘可写、掉 3 盘读返回 `ReadQuorum` 而非错误数据
@@ -5759,6 +5866,7 @@ MVP 交付时必须全部为真：
 - [ ] 崩溃点测试覆盖 DESIGN §12.3 的全部窗口
 - [ ] `rstore-s3-compat` 中每个中间件都有对应的冒烟测试，且注释指明来源客户端
 - [ ] DESIGN §1.2 的非目标清单中，没有任何一项被意外实现（范围不蔓延）
+- [ ] 六个 multipart 操作各自返回 `501 NotImplemented`（MVP 明确推迟，见 Task 5.6）
 
 ---
 
