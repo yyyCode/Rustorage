@@ -86,6 +86,28 @@ impl S3 for RstoreFs {
         }))
     }
 
+    /// Task 5.9 冒烟发现的真实兼容缺口（非猜测）：`mc alias set` 在探测端点时先发
+    /// `GET /<随机桶>?location=`（`mc --debug` 实测，桶名形如
+    /// `probe-bsign-<随机串>`）。s3s 的默认实现回 `501 NotImplemented`，mc 据此判定
+    /// 「别名不可用」，于是**默认参数的 `mc alias set` 直接失败**——而 Task 5.2 的注记
+    /// 曾以为「`mc` 不依赖 region」。AWS / MinIO 对不存在的桶回 `NoSuchBucket`（404），
+    /// mc 把非签名类错误当作「S3v4 成立」接受，所以这里按同样的语义补上。
+    ///
+    /// MVP 没有 region 概念：`location_constraint` 留 `None`，s3s 会序列化成
+    /// us-east-1 那种**空** `<LocationConstraint xmlns="...">`（见 s3s 的 `xml::mod`）。
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        // 先确认桶存在：不存在的桶必须回 NoSuchBucket，与 head/delete 的语义一致，
+        // 也和 AWS 对齐（`?location` 不是「什么都答 200」的端点）。
+        self.store
+            .head_bucket(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(GetBucketLocationOutput::default()))
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -250,6 +272,38 @@ impl S3 for RstoreFs {
             DeleteObjectOutput::default(),
             StatusCode::NO_CONTENT,
         ))
+    }
+
+    /// Task 5.9 冒烟发现的第二个真实兼容缺口：`mc rm`（**即使只删一个对象**，
+    /// `mc --debug` 实测）走的是批量 `POST /<桶>?delete=`（`DeleteObjects`），
+    /// 不是单对象 `DELETE`。s3s 默认回 `501 NotImplemented`，于是 `mc rm` 永远失败。
+    /// 它不在「六条 multipart 一律 501」的刻意范围里（Task 5.6），是漏实现。
+    /// 这里用已有的单删原语把它拼出来：逐键独立、成功的进 `Deleted`。
+    ///
+    /// 语义按 S3 批量删除：请求整体合法就回 200（不是「成功删除的键数」）；
+    /// MVP 的删除是幂等的，所以合法键一律进 `Deleted`。key 命名非法（Task 5.7）
+    /// 仍是客户端的错，整请求 400——与单对象 `DELETE` 的处理保持一致。
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let bucket = &req.input.bucket;
+        let mut deleted: Vec<DeletedObject> = Vec::with_capacity(req.input.delete.objects.len());
+        for obj in &req.input.delete.objects {
+            validate_object_key(&obj.key).map_err(to_s3_error)?;
+            self.store
+                .delete_object(bucket, &obj.key)
+                .await
+                .map_err(to_s3_error)?;
+            deleted.push(DeletedObject {
+                key: Some(obj.key.clone()),
+                ..Default::default()
+            });
+        }
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: Some(deleted),
+            ..Default::default()
+        }))
     }
 
     async fn list_objects_v2(
@@ -749,6 +803,59 @@ mod tests {
         assert_eq!(error_code(&body), "NoSuchBucket");
     }
 
+    /// Task 5.9：`mc alias set` 的 region 探测（`GET /<桶>?location=`）必须返回
+    /// us-east-1 风格的空 `<LocationConstraint>`，而不是 s3s 默认的 501。
+    /// 去掉 `get_bucket_location` 实现后，这条会退回 501 NotImplemented 而红。
+    #[tokio::test]
+    async fn get_bucket_location_returns_empty_location_constraint() {
+        let store = Arc::new(MockStore::default());
+        store
+            .create_bucket("test-bucket")
+            .await
+            .expect("create bucket");
+
+        let (status, _headers, body) = call_on(
+            mock_service(store),
+            request("GET", "/test-bucket?location=", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = std::str::from_utf8(&body).expect("xml body");
+        assert!(
+            xml.contains("<LocationConstraint"),
+            "缺少 LocationConstraint 元素: {xml}"
+        );
+        // 空内容 = us-east-1。带 region 值时这里会多出字符。
+        assert!(
+            xml.contains("></LocationConstraint>") || xml.contains("/>"),
+            "LocationConstraint 应为空: {xml}"
+        );
+    }
+
+    /// `?location` 不是「什么桶都答 200」的端点：不存在的桶按 AWS 语义回 404。
+    #[tokio::test]
+    async fn get_bucket_location_missing_bucket_is_404() {
+        let store = Arc::new(MockStore::default());
+
+        let (status, _headers, body) = call_on(
+            mock_service(store),
+            request("GET", "/missing-bucket?location=", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "NoSuchBucket");
+    }
+
     // ---- Task 5.3: 对象读写 ----
 
     /// 所有对象读写用例共用的对象体，恰好 15 字节（断言 `Content-Length == 15`）。
@@ -878,6 +985,63 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
             assert!(body.is_empty(), "DELETE 响应体应为空");
+        }
+    }
+
+    // ---- Task 5.9: 客户端冒烟暴露的缺口 ----
+
+    /// `mc rm` 走批量 `DeleteObjects`（`POST /<桶>?delete=`，见 tests/compat/mc.sh）。
+    /// 去掉 `delete_objects` 实现后，这条会退回 s3s 的 501 NotImplemented 而红。
+    #[tokio::test]
+    async fn delete_objects_batch_removes_all_keys() {
+        let store = Arc::new(MockStore::default());
+        store
+            .create_bucket("test-bucket")
+            .await
+            .expect("create bucket");
+        store
+            .put_object("test-bucket", "a", b"1".to_vec())
+            .await
+            .expect("put a");
+        store
+            .put_object("test-bucket", "b", b"2".to_vec())
+            .await
+            .expect("put b");
+
+        let body = b"<Delete>\
+            <Object><Key>a</Key></Object>\
+            <Object><Key>b</Key></Object>\
+            </Delete>";
+        // s3s 的 `DeleteObjects` 解析要求 `Content-Length`（真实客户端都会发）。
+        let mut del_req = request("POST", "/test-bucket?delete=", body);
+        del_req.headers_mut().insert(
+            "content-length",
+            body.len()
+                .to_string()
+                .parse()
+                .expect("valid content-length"),
+        );
+        let (status, _headers, resp) = call_on(mock_service(store.clone()), del_req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let xml = std::str::from_utf8(&resp).expect("xml body");
+        assert!(
+            xml.contains("<Key>a</Key>") && xml.contains("<Key>b</Key>"),
+            "DeleteResult 应回显两个 key: {xml}"
+        );
+
+        // 两个 key 都必须真的没了：删除不能只体现在响应里。
+        for key in ["a", "b"] {
+            let (s, _h, _b) = call_on(
+                mock_service(store.clone()),
+                request("HEAD", &format!("/test-bucket/{key}"), b""),
+            )
+            .await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "key {key} 应已删除");
         }
     }
 
