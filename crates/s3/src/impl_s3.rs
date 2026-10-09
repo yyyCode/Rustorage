@@ -97,7 +97,12 @@ impl S3 for RstoreFs {
             Some(body) => body
                 .try_collect::<Vec<Bytes>>()
                 .await
-                .map_err(|e| s3s::s3_error!(InternalError, "failed to read request body: {e}"))?
+                // 错误构造统一走映射表，本文件不散落 `s3_error!`（见 `errors.rs` 顶部）。
+                .map_err(|e| {
+                    to_s3_error(ApiError::Internal(format!(
+                        "failed to read request body: {e}"
+                    )))
+                })?
                 .concat()
                 .to_vec(),
             // 空对象是合法的 PUT（`touch` 一个 0 字节文件）：body 为 None 就是空。
