@@ -1448,6 +1448,35 @@ mod tests {
         put_key_expect_invalid_argument("a//b").await;
     }
 
+    /// **读路径上的同一道校验**（`get_object` / `head_object` 各自调
+    /// `validate_object_key`）。只测 PUT 侧是不够的：读路径漏拦时，`..` 会一路走到
+    /// 盘层的 `Fatal(FatalKind::PathEscape)` 变成 **500**——把客户端的错报成
+    /// 「服务端坏了」，而这正是 DESIGN 要求区分开的两种失败。
+    #[tokio::test]
+    async fn read_key_that_aliases_on_disk_is_400_not_500() {
+        for key in ["a//b", ".rstore.sys/x"] {
+            for method in ["GET", "HEAD"] {
+                let (status, _headers, body) = call_on(
+                    mock_service(Arc::new(MockStore::default())),
+                    request(method, &format!("/test-bucket/{key}"), b""),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} {key} 应回 400（**不是 500**），body: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidArgument",
+                    "{method} {key} 的 error code，body: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+    }
+
     // ---- Task 5.10: 条件请求（GET / HEAD） ----
 
     /// 构造一个带任意请求头的请求，其余走 `request` 夹具。
@@ -1536,6 +1565,49 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(error_code(&body), "NoSuchKey");
+    }
+
+    /// 条件请求**只覆盖 GET / HEAD**（见「MVP 的已知限制」）：S3 里 `PUT` 带
+    /// `If-None-Match: *` 是「条件创建」，而 MVP 的 `put_object` **完全不求值**条件头
+    /// （这个文件里 `put_object` 没有任何 `conditional::evaluate` 的调用），
+    /// 于是它被当成普通 PUT。
+    ///
+    /// **这是一条负向测试：它钉住「现在就是这样」。** 日后给 `ObjectStore` 加上了
+    /// 原子的 conditional-put，这条会红——**那时才该改它**，而不是现在为了让测试
+    /// 「看起来正确」把它删掉。上面 `get_with_*` 那两条是正向的，两者一起才说明
+    /// 「条件求值只挂在读路径上」。
+    #[tokio::test]
+    async fn put_ignores_if_none_match_instead_of_412() {
+        let store = Arc::new(MockStore::default());
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+
+        // 对象已存在，带 `If-None-Match: *` 再 PUT。S3 语义下该回 412，MVP 下**成功**。
+        let mut req = request("PUT", "/test-bucket/k", b"replaced");
+        req.headers_mut().insert(
+            http::HeaderName::from_static("if-none-match"),
+            http::HeaderValue::from_static("*"),
+        );
+        let (status, _headers, body) = call_on(mock_service(store.clone()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT 不应对 If-None-Match 求值（这是被钉住的已知限制），body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // 「回了 200 但根本没写」也是坏法：必须真的**覆盖**掉了旧内容。
+        let (get_status, _h, got) =
+            call_on(mock_service(store), request("GET", "/test-bucket/k", b"")).await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(
+            &got[..],
+            b"replaced",
+            "第二次 PUT 必须真的覆盖，读回来应是新内容"
+        );
     }
 
     // ---- Task 5.11: 虚拟主机风格寻址 ----
