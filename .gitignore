@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 本地测试产物
+/tmp/

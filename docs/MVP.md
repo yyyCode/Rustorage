@@ -1,0 +1,2464 @@
+# Rustorage MVP 实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: 使用 `superpowers:subagent-driven-development`（推荐）
+> 或 `superpowers:executing-plans` 逐任务执行本计划。步骤采用 `- [ ]` 复选框语法以便跟踪进度。
+
+**目标：** 实现一个单进程、多块本地盘的 S3 兼容对象存储，具备完整的纠删编码/解码、
+读写 quorum、bitrot 校验、同盘元数据容器与 rename 提交协议。
+
+**架构：** 参照 `docs/DESIGN.md`。物理层级为 `Node → Pool → ErasureSet → Disk → Shard`；
+元数据以 `meta.xl` sidecar 与分片同盘存放；一致性由「读写 quorum + 目录 rename 提交」保证。
+
+**技术栈：** Rust 2021、`tokio`、`s3s`（S3 协议）、`hyper`/`tower`、`reed-solomon-simd`（纠删码）、
+`blake3`（bitrot）、`rmp-serde`（元数据编码）、`proptest`（属性测试）、`thiserror`。
+
+**验收标准（MVP 完成的定义）：** `aws-cli` 与 `mc` 能对 **6 盘、`4+2`** 纠删配置的实例完成
+bucket 创建、对象 CRUD、Range 读取、Multipart 上传与列出；拔掉任意 2 块盘后读操作仍成功
+（`6-2 = 4 = read_quorum`），此时写操作也仍成功（`write_quorum = 4`）；
+拔掉 3 块盘后读返回 `ErasureReadQuorum` 而**不是**错误数据；损坏 1 块盘上的字节后
+读取能返回正确数据并记录到修复队列。
+
+> 术语约定：`N+parity` 中的 N 指**数据分片数**，总盘数为 `N + parity`。
+> `4+2` 因此需要 6 块盘——盘数与分片数一一对应，每块盘持有一份分片。
+
+---
+
+## 里程碑总览
+
+| 里程碑 | 内容 | 产出 | 依赖 |
+|---|---|---|---|
+| **M0** | 项目骨架与架构护栏 | 可编译的空 workspace + 依赖检查脚本 | — |
+| **M1** | 基础原语：校验和、分布排列、纠删码 | 三个纯函数 crate，属性测试通过 | M0 |
+| **M2** | 元数据容器 `meta.xl` | 编码/解码 + 损坏防御 | M1 |
+| **M3** | 盘抽象 | `DiskAPI` + `LocalDisk` + `FaultyDisk` | M2 |
+| **M4** | 存储引擎核心 | PUT/GET/DELETE + quorum + 提交协议 | M3 |
+| **M5** | S3 接入 | s3s 的 `S3` trait 实现 + 兼容层 | M4 |
+| **M6** | 运维面与验收 | readiness、metrics、启动编排、端到端 | M5 |
+
+**开发节奏：** 每个 Task 走 TDD 循环（写失败测试 → 跑失败 → 最小实现 → 跑通过 → 提交）。
+每个 Task 结束时仓库必须处于可编译、测试全绿的状态。
+
+---
+
+## 文件结构
+
+在开始写代码前锁定。**后续所有 Task 的路径以此为准。**
+
+```
+Cargo.toml                          # workspace 根
+rust-toolchain.toml                 # 固定工具链版本
+scripts/check-layer-deps.sh         # M0 依赖方向护栏
+
+crates/common/
+  src/lib.rs
+  src/error.rs                      # DiskError / CorruptKind / TransientKind / FatalKind
+  src/id.rs                         # DeploymentId / DiskId / DataDirId（16 字节 UUID 包装）
+  src/config.rs                     # 全局配置模型（唯一定义处）
+  src/consts.rs                     # BLOCK_SIZE / HASH_LEN / MAX_SHARDS 等
+
+crates/checksum/
+  src/lib.rs                        # bitrot_hash / bitrot_size / KAT
+
+crates/erasure/
+  src/lib.rs                        # Codec 门面（encode/decode）
+  src/cache.rs                      # 编解码器 LRU 缓存
+  src/error.rs                      # ErasureConstructionError / ErasureError
+
+crates/meta/
+  src/lib.rs
+  src/distribution.rs               # 分片分布排列
+  src/container.rs                  # meta.xl 编解码
+  src/fileinfo.rs                   # ObjectMeta / ShallowVersion / FileVersionHeader / ObjectBody
+  src/inline.rs                     # 内联数据帧
+  src/format.rs                     # format.json 模型
+  src/keys.rs                       # 元数据键常量（x-rs-*）
+
+crates/disk/
+  src/lib.rs                        # DiskAPI trait
+  src/local.rs                      # LocalDisk
+  src/fsx.rs                        # fsync / rename / walk 原语
+  src/error_map.rs                  # std::io::Error → DiskError
+
+crates/store/
+  src/lib.rs
+  src/pool.rs                       # Pool（持有 Vec<ErasureSet>）
+  src/set.rs                        # ErasureSet（读写路径入口）
+  src/writer.rs                     # BitrotShardWriter / MultiWriter
+  src/reader.rs                     # BitrotShardReader / ParallelReader
+  src/put.rs                        # PUT 路径
+  src/get.rs                        # GET 路径
+  src/delete.rs                     # DELETE 路径
+  src/commit.rs                     # rename 提交协议
+  src/quorum.rs                     # quorum 规则与元数据仲裁
+  src/errs.rs                       # reduce_errs 错误归约
+
+crates/api/
+  src/lib.rs                        # ObjectStore trait、领域错误、boundary 别名
+
+crates/s3/
+  src/lib.rs                        # s3s S3Service 装配
+  src/impl_s3.rs                    # impl S3 for RstoreFs
+  src/auth.rs                       # 静态 root 凭证的 AuthProvider
+  src/errors.rs                     # 领域错误 → S3 错误码
+
+crates/s3-compat/
+  src/lib.rs                        # compat 中间件栈（按 §DESIGN 15.3 准入）
+
+crates/server/
+  src/main.rs                       # 入口
+  src/startup.rs                    # 启动编排
+  src/readiness.rs
+  src/metrics.rs
+  src/config_load.rs
+
+tests/                              # workspace 级集成测试
+  faulty_disk.rs
+  quorum_boundaries.rs
+  commit_crash.rs
+  compat/aws_cli.sh
+  compat/mc.sh
+```
+
+**设计单元边界：** 每个文件单一职责。`store/` 下按**操作**分文件（put/get/delete）而非按层，
+因为这些操作各自改动时天然一起变。`meta/` 下按**关注点**分（容器格式 / 数据模型 / 分布算法），
+因为它们被不同的调用方消费。
+
+---
+
+## M0 — 项目骨架与架构护栏
+
+### Task 0.1: 建立 workspace 与 crate 骨架
+
+**Files:**
+- Create: `Cargo.toml`
+- Create: `rust-toolchain.toml`
+- Create: `crates/common/Cargo.toml`、`crates/common/src/lib.rs`
+- Create: `crates/{checksum,erasure,meta,disk,store,api,s3,s3-compat,server}/Cargo.toml` 与各自的 `src/lib.rs`
+- Test: `cargo build` 通过
+
+- [ ] **Step 1: 写 workspace 根 Cargo.toml**
+
+```toml
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+# 内部
+rstore-common   = { path = "crates/common" }
+rstore-checksum = { path = "crates/checksum" }
+rstore-erasure  = { path = "crates/erasure" }
+rstore-meta     = { path = "crates/meta" }
+rstore-disk     = { path = "crates/disk" }
+rstore-store    = { path = "crates/store" }
+rstore-api      = { path = "crates/api" }
+rstore-s3       = { path = "crates/s3" }
+rstore-s3-compat = { path = "crates/s3-compat" }
+
+# 外部
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+bytes = "1"
+blake3 = "1"
+crc32c = "0.6"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+reed-solomon-simd = "3"
+proptest = "1"
+tempfile = "3"
+```
+
+- [ ] **Step 2: 写 rust-toolchain.toml**
+
+```toml
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+```
+
+- [ ] **Step 3: 为每个 crate 建最小骨架**
+
+每个 crate 的 `Cargo.toml` 形如：
+
+```toml
+[package]
+name = "rstore-common"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+```
+
+每个 `src/lib.rs` 先只放一行注释说明职责：
+
+```rust
+//! 基础类型、错误模型、配置。不得依赖任何其他内部 crate。
+```
+
+`crates/common` 额外加 `serde`、`uuid` 依赖；`crates/store` 加 `tokio`、`futures`；
+`crates/erasure` 加 `reed-solomon-simd`、`lru`；`crates/checksum` 加 `blake3`。
+
+- [ ] **Step 4: 验证编译**
+
+Run: `cargo build --workspace`
+Expected: `Finished` 且无 warning
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add Cargo.toml rust-toolchain.toml crates/ .gitignore
+git commit -m "chore: scaffold workspace with per-domain crates"
+```
+
+---
+
+### Task 0.2: 依赖方向护栏脚本
+
+**Files:**
+- Create: `scripts/check-layer-deps.sh`
+- Create: `tests/layer_deps.rs`
+
+- [ ] **Step 1: 写护栏脚本**
+
+脚本用 `cargo metadata` 取出依赖图，检查以下禁止边（对应 DESIGN §5 的 R1–R4）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+meta=$(cargo metadata --format-version 1 --no-deps)
+
+# 禁止边： from -> to
+FORBIDDEN=(
+  "rstore-api:rstore-store"
+  "rstore-api:rstore-disk"
+  "rstore-api:rstore-s3"
+  "rstore-common:rstore-meta"
+  "rstore-common:rstore-store"
+  "rstore-checksum:rstore-meta"
+  "rstore-checksum:rstore-store"
+  "rstore-erasure:rstore-store"
+  "rstore-disk:rstore-store"
+  "rstore-meta:rstore-store"
+  "rstore-s3:rstore-store"
+)
+
+fail=0
+for edge in "${FORBIDDEN[@]}"; do
+  from="${edge%%:*}"; to="${edge##*:}"
+  if echo "$meta" | python3 -c "
+import json,sys
+m=json.load(sys.stdin)
+name='$from'; dep='$to'
+for p in m['packages']:
+    if p['name']==name:
+        for d in p['dependencies']:
+            if d['name']==dep: sys.exit(0)
+sys.exit(1)
+"; then
+    echo "FORBIDDEN EDGE: $from -> $to"
+    fail=1
+  fi
+done
+
+exit $fail
+```
+
+- [ ] **Step 2: 验证脚本在当前（合规）状态下通过**
+
+Run: `bash scripts/check-layer-deps.sh`
+Expected: 退出码 0，无输出
+
+- [ ] **Step 3: 验证脚本能抓到违规**
+
+临时在 `crates/api/Cargo.toml` 的依赖里加上 `rstore-store.workspace = true`，然后：
+
+Run: `bash scripts/check-layer-deps.sh`
+Expected: 输出 `FORBIDDEN EDGE: rstore-api -> rstore-store`，退出码 1
+
+然后**撤销**这次实验性修改。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add scripts/check-layer-deps.sh
+git commit -m "chore: add layer dependency guard script"
+```
+
+---
+
+## M1 — 基础原语
+
+> 这三个 crate 是纯函数式的，不碰 IO，因此可以完全用属性测试覆盖。
+> 它们是整个系统里唯一能被「数学证明」的部分，值得多花时间。
+
+### Task 1.1: 分片分布排列
+
+**Files:**
+- Create: `crates/meta/src/distribution.rs`
+- Modify: `crates/meta/src/lib.rs`
+- Test: 同文件 `#[cfg(test)]` 模块
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn rejects_out_of_range_n() {
+        assert!(distribution("k", 1).is_err());
+        assert!(distribution("k", 17).is_err());
+    }
+
+    #[test]
+    fn null_ordering_for_known_key() {
+        // N=4 时，任意 key 都应产出 1..=4 的排列，且首元素为 start+1
+        let d = distribution("bucket/object", 4).unwrap();
+        assert!(is_valid_distribution(&d));
+        assert_eq!(d.len(), 4);
+    }
+
+    proptest! {
+        #[test]
+        fn always_a_strict_permutation(key in ".*", n in 2u8..=16) {
+            let d = distribution(&key, n).unwrap();
+            prop_assert_eq!(d.len(), n as usize);
+            prop_assert!(is_valid_distribution(&d));
+            let mut sorted = d.clone();
+            sorted.sort();
+            prop_assert_eq!(sorted, (1..=n).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn deterministic_for_same_input(key in ".*", n in 2u8..=16) {
+            prop_assert_eq!(distribution(&key, n).unwrap(), distribution(&key, n).unwrap());
+        }
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-meta distribution`
+Expected: 编译失败，`distribution` 未定义
+
+- [ ] **Step 3: 实现**
+
+```rust
+//! 分片分布排列：把逻辑块号映射到物理槽位，使同一对象的各分片在盘间错开。
+//!
+//! 对应 DESIGN §9.3。算法固定为 CRC32C 旋转；**不实现多代算法**，
+//! 稳定性由「deployment id 不可变」这一约束保证，而非算法版本兜底。
+
+use rstore_common::error::PipeError;
+
+/// 返回长度为 `n` 的排列，元素取值 `1..=n`。
+/// `dist[k] - 1` 即逻辑块 `k` 的物理槽位下标。
+pub fn distribution(object_key: &str, n: u8) -> Result<Vec<u8>, PipeError> {
+    if !(2..=16).contains(&n) {
+        return Err(PipeError::InvalidShardCount(n));
+    }
+    let n_usize = n as usize;
+    let start = (crc32c::crc32c(object_key.as_bytes()) as usize) % n_usize;
+    let mut d = Vec::with_capacity(n_usize);
+    for k in 1..=n_usize {
+        d.push(((start + k) % n_usize + 1) as u8);
+    }
+    Ok(d)
+}
+
+/// 校验 `d` 是 `1..=d.len()` 的严格排列。
+/// **绝不 panic**：所有访问都经过范围检查（DESIGN §9.3）。
+pub fn is_valid_distribution(d: &[u8]) -> bool {
+    if d.is_empty() || d.len() > 16 {
+        return false;
+    }
+    let mut seen: u32 = 0;
+    for &x in d {
+        if x == 0 || x as usize > d.len() {
+            return false;
+        }
+        let bit = 1u32 << (x - 1);
+        if seen & bit != 0 {
+            return false;
+        }
+        seen |= bit;
+    }
+    seen == (1u32 << d.len()) - 1
+}
+```
+
+在 `crates/common/src/error.rs` 中加上 `PipeError::InvalidShardCount(u8)` 变体。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `cargo test -p rstore-meta distribution`
+Expected: 4 个测试全部 PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add crates/meta/src/distribution.rs crates/meta/src/lib.rs crates/common/src/error.rs
+git commit -m "feat(meta): shard distribution permutation with property tests"
+```
+
+---
+
+### Task 1.2: bitrot 校验和
+
+**Files:**
+- Create: `crates/checksum/src/lib.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// 钉住常量：首次运行时用 `cargo test kat_pin -- --nocapture` 打印实际值，
+    /// 粘贴回 `KAT_EMPTY_V1`。作用是在依赖升级后立刻发现哈希行为变化。
+    const KAT_EMPTY_V1: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn kat_pin() {
+        let got = bitrot_hash(b"");
+        if KAT_EMPTY_V1 == [0u8; 32] {
+            println!("KAT_EMPTY_V1 = {:?}", got);
+            return;
+        }
+        assert_eq!(got, KAT_EMPTY_V1, "bitrot hash behavior changed!");
+    }
+
+    #[test]
+    fn deterministic() {
+        assert_eq!(bitrot_hash(b"hello"), bitrot_hash(b"hello"));
+    }
+
+    #[test]
+    fn detects_single_bit_flip() {
+        let a = bitrot_hash(b"aaaaaaaa");
+        let b = bitrot_hash(b"aaaaaaab");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn size_arithmetic() {
+        assert_eq!(bitrot_size(0, 1024), 0);
+        assert_eq!(bitrot_size(1, 1024), 32 + 1);
+        assert_eq!(bitrot_size(1024, 1024), 32 + 1024);
+        assert_eq!(bitrot_size(1025, 1024), 64 + 1025);
+    }
+
+    proptest! {
+        #[test]
+        fn size_is_monotonic(a in 0u64..1_000_000, b in 0u64..1_000_000) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(bitrot_size(lo, 1024) <= bitrot_size(hi, 1024));
+        }
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-checksum`
+Expected: 编译失败，`bitrot_hash` 未定义
+
+- [ ] **Step 3: 实现**
+
+```rust
+//! bitrot 校验和。对应 DESIGN §11。
+//!
+//! 落盘格式为逐块交错 `[hash(32B)][data]`，由 `disk` 层的 writer/reader 负责，
+//! 本 crate 只提供哈希与尺寸计算。
+
+pub const HASH_LEN: usize = 32;
+
+/// 具名 key 常量。**不得内联到调用点**——改变它会让所有既有数据校验失败。
+pub const BITROT_KEY_V1: [u8; 32] = *b"rustorage.bitrot.key.v1\0\0\0\0\0\0\0\0";
+
+pub fn bitrot_hash(block: &[u8]) -> [u8; HASH_LEN] {
+    let mut h = blake3::Hasher::new_keyed(&BITROT_KEY_V1);
+    h.update(block);
+    *h.finalize().as_bytes()
+}
+
+/// 单个分片落盘后的字节数：每个 block 前加一个摘要。
+pub fn bitrot_size(size: u64, shard_size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    let blocks = size.div_ceil(shard_size);
+    blocks * HASH_LEN as u64 + size
+}
+```
+
+> 注意 `BITROT_KEY_V1` 必须是恰好 32 字节。上面这个字面量：`"rustorage.bitrot.key.v1"` 是 23 字节，
+> 加 9 个 `\0` 共 32。实现时用 `const fn` 或编译期断言校验长度：
+> ```rust
+> const _: () = assert!(BITROT_KEY_V1.len() == 32);
+> ```
+
+- [ ] **Step 4: 跑测试，并钉住 KAT**
+
+Run: `cargo test -p rstore-checksum kat_pin -- --nocapture`
+把打印出的数组粘贴进 `KAT_EMPTY_V1`，再次运行：
+
+Run: `cargo test -p rstore-checksum`
+Expected: 全部 PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add crates/checksum/
+git commit -m "feat(checksum): keyed blake3 bitrot hashing with pinned KAT"
+```
+
+---
+
+### Task 1.3: 纠删码门面
+
+**Files:**
+- Create: `crates/erasure/src/lib.rs`
+- Create: `crates/erasure/src/error.rs`
+- Test: `crates/erasure/src/lib.rs` 的 `#[cfg(test)]`
+
+- [ ] **Step 1: 定义接口（这就是契约，先写下来）**
+
+```rust
+/// 纠删码门面。对应 DESIGN §10。
+/// 上层只见这个接口，不感知底层库（`reed-solomon-simd`）的存在。
+/// 这样库被替换时，只有在 `encode`/`decode` 内部需要改动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Codec {
+    data: usize,
+    parity: usize,
+    shard_size: usize,
+}
+
+impl Codec {
+    /// 校验几何合法性：`2 <= data+parity <= 16`、`parity >= 1`、`shard_size > 0`。
+    pub fn new(data: usize, parity: usize, shard_size: usize) -> Result<Self, ErasureConstructionError>;
+
+    pub fn data_shards(&self) -> usize;
+    pub fn parity_shards(&self) -> usize;
+    pub fn total_shards(&self) -> usize;
+
+    /// 输入 `data` 个等长分片，输出 `parity` 个校验分片。
+    pub fn encode(&self, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, ErasureError>;
+
+    /// 输入长度为 `total_shards` 的槽位数组（`None` 表示该槽位缺失），
+    /// 输出全部 `data` 个数据分片。缺失数 > `parity` 时返回 `ErasureError::TooFewShards`。
+    pub fn decode(&self, slots: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, ErasureError>;
+}
+```
+
+```rust
+// crates/erasure/src/error.rs
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ErasureConstructionError {
+    #[error("invalid geometry: data={data} parity={parity} (need 2<=data+parity<=16, parity>=1)")]
+    InvalidGeometry { data: usize, parity: usize },
+    #[error("shard_size must be > 0")]
+    ZeroShardSize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErasureError {
+    #[error("expected {expected} shards, got {got}")]
+    WrongShardCount { expected: usize, got: usize },
+    #[error("shards are not equal length")]
+    UnequalShardLength,
+    #[error("only {available} shards available, need {needed}")]
+    TooFewShards { available: usize, needed: usize },
+    #[error("codec backend error: {0}")]
+    Backend(String),
+}
+```
+
+- [ ] **Step 2: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn pad_chunks(payload: &[u8], count: usize, shard_size: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let lo = (i * shard_size).min(payload.len());
+            let hi = ((i + 1) * shard_size).min(payload.len());
+            let mut s = vec![0u8; shard_size];
+            s[..hi - lo].copy_from_slice(&payload[lo..hi]);
+            out.push(s);
+        }
+        out
+    }
+
+    #[test]
+    fn rejects_invalid_geometry() {
+        assert!(Codec::new(1, 0, 1024).is_err());
+        assert!(Codec::new(17, 1, 1024).is_err());
+        assert!(Codec::new(4, 0, 1024).is_err());
+        assert!(Codec::new(4, 2, 0).is_err());
+    }
+
+    proptest! {
+        /// 核心不变量：任意数据、任意几何，编码后再用任意 >= data 份分片解码，结果恒等。
+        #[test]
+        fn roundtrip_with_arbitrary_loss(
+            data in 1usize..=8,
+            parity in 1usize..=8,
+            payload in prop::collection::vec(any::<u8>(), 1..2048),
+            drop_mask in any::<u16>(),
+        ) {
+            prop_assume!(data + parity <= 16);
+            let shard_size = 1024;
+            let codec = Codec::new(data, parity, shard_size).unwrap();
+            let originals = pad_chunks(&payload, data, shard_size);
+            let checks = codec.encode(&originals).unwrap();
+            prop_assert_eq!(checks.len(), parity);
+
+            // 拼出全部 N 个槽位
+            let mut slots: Vec<Option<Vec<u8>>> =
+                originals.iter().cloned().map(Some).collect();
+            slots.extend(checks.into_iter().map(Some));
+
+            // 按 drop_mask 丢弃若干槽位
+            let n = data + parity;
+            let mut kept = 0;
+            for i in 0..n {
+                if drop_mask & (1 << i) != 0 {
+                    slots[i] = None;
+                } else {
+                    kept += 1;
+                }
+            }
+            prop_assume!(kept >= data);
+
+            let recovered = codec.decode(&slots).unwrap();
+            prop_assert_eq!(recovered.len(), data);
+            for (a, b) in recovered.iter().zip(originals.iter()) {
+                prop_assert_eq!(a, b);
+            }
+        }
+
+        /// 丢太多必须报错，绝不返回错误数据。
+        #[test]
+        fn too_few_shards_fails_closed(
+            data in 2usize..=6,
+            parity in 1usize..=4,
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+        ) {
+            let shard_size = 512;
+            let codec = Codec::new(data, parity, shard_size).unwrap();
+            let originals = pad_chunks(&payload, data, shard_size);
+            let checks = codec.encode(&originals).unwrap();
+            let mut slots: Vec<Option<Vec<u8>>> =
+                originals.iter().cloned().map(Some).collect();
+            slots.extend(checks.into_iter().map(Some));
+
+            // 只留 data-1 份
+            let mut kept = 0;
+            for s in slots.iter_mut() {
+                if kept < data - 1 { kept += 1; } else { *s = None; }
+            }
+            prop_assert!(matches!(codec.decode(&slots), Err(ErasureError::TooFewShards { .. })));
+        }
+    }
+}
+```
+
+- [ ] **Step 3: 跑测试确认失败**
+
+Run: `cargo test -p rstore-erasure`
+Expected: 编译失败，`Codec` 方法未实现
+
+- [ ] **Step 4: 实现**
+
+实现 `encode`/`decode` 时：**先查 `reed-solomon-simd` v3 的 `encode`/`decode` 函数签名**
+（`encode(original_count, recovery_count, shards)` 与
+`decode(original_count, recovery_count, original_shards, recovery_shards)`，
+以 `HashMap<usize, Vec<u8>>` 传入索引），把库调用完全包在门面内。
+
+关键点：
+- 所有分片长度必须相等，否则返回 `UnequalShardLength`（不要交给库去 panic）；
+- 库返回 `Result`，映射到 `ErasureError::Backend`；
+- `decode` 中统计非 `None` 槽位数，`< data` 时**先返回** `TooFewShards`，不调用库。
+
+- [ ] **Step 5: 跑测试确认通过**
+
+Run: `cargo test -p rstore-erasure`
+Expected: 全部 PASS（属性测试默认 256 次）
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add crates/erasure/
+git commit -m "feat(erasure): codec facade with roundtrip and fail-closed property tests"
+```
+
+---
+
+### Task 1.4: 编解码器缓存
+
+**Files:**
+- Create: `crates/erasure/src/cache.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_same_codec_for_same_key() {
+        let c = CodecCache::new(4);
+        let a = c.get(4, 2, 1024).unwrap();
+        let b = c.get(4, 2, 1024).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn evicts_beyond_capacity() {
+        let c = CodecCache::new(2);
+        c.get(4, 2, 1024).unwrap();
+        c.get(6, 3, 1024).unwrap();
+        c.get(8, 4, 1024).unwrap();
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn invalid_geometry_is_not_cached() {
+        let c = CodecCache::new(4);
+        assert!(c.get(0, 0, 1024).is_err());
+        assert_eq!(c.len(), 0);
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-erasure cache`
+Expected: 编译失败，`CodecCache` 未定义
+
+- [ ] **Step 3: 实现**
+
+用 `std::sync::Mutex<lru::LruCache<(usize, usize, usize), Codec>>` 包一层。
+`get` 时先查缓存，未命中则 `Codec::new` 并插入；**构造失败不插入**。
+默认容量 32（对应 DESIGN §10.2）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-erasure`
+Expected: 全部 PASS
+
+```bash
+git add crates/erasure/src/cache.rs
+git commit -m "feat(erasure): LRU cache for codec shells"
+```
+
+---
+
+## M2 — 元数据容器 `meta.xl`
+
+### Task 2.1: 数据模型
+
+**Files:**
+- Create: `crates/meta/src/fileinfo.rs`
+- Create: `crates/meta/src/keys.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nil_version_id_differs_from_absent() {
+        let with_nil = FileVersionHeader { version_id: Some(Uuid::nil()), ..Default::default() };
+        let without = FileVersionHeader { version_id: None, ..Default::default() };
+        assert_ne!(with_nil.version_id, without.version_id);
+        assert!(with_nil.version_id.is_some());
+    }
+
+    #[test]
+    fn epoch_decodes_to_none_mod_time() {
+        let h = FileVersionHeader { mod_time: Some(0), ..Default::default() };
+        let enc = encode_header(&h).unwrap();
+        let dec = decode_header(&enc).unwrap();
+        assert_eq!(dec.mod_time, None);
+    }
+
+    #[test]
+    fn caps_geometry_is_readable_from_header() {
+        let h = FileVersionHeader { ec_m: 4, ec_n: 6, ..Default::default() };
+        assert_eq!(h.data_shards(), 4);
+        assert_eq!(h.total_shards(), 6);
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-meta fileinfo`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+按 DESIGN §8.2 定义 `FileVersionHeader`、`VersionType`、`Flags`、`ShallowVersion`、
+`ObjectMeta`、`ObjectBody`、`PartInfo`。要点：
+
+- `mod_time: Option<u64>`：`None` 编码为 `0`，解码时 `0` 还原为 `None`；
+- `version_id: Option<Uuid>`：**nil UUID 与 `None` 必须在语义上不同**，编码时保留区别；
+- `data_dir` 存 **16 字节原始 UUID**；长度不是 16 → `Corrupt`，不是 `None`；
+- header 必须携带 `ec_m` / `ec_n`，使 quorum 决策无需解析 body。
+
+`keys.rs` 定义内部键常量（全部以 `x-rs-` 开头）与 `RUSTORAGE_KEY_PREFIX` 常量。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-meta fileinfo`
+Expected: PASS
+
+```bash
+git add crates/meta/src/fileinfo.rs crates/meta/src/keys.rs
+git commit -m "feat(meta): object metadata data model with nil/epoch semantics"
+```
+
+---
+
+### Task 2.2: 容器编码与解码
+
+**Files:**
+- Create: `crates/meta/src/container.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn sample_meta() -> ObjectMeta { /* 构造一个含 2 个版本的样本 */ }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let m = sample_meta();
+        let bytes = encode(&m).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.versions.len(), m.versions.len());
+        assert_eq!(back.versions[0].header, m.versions[0].header);
+    }
+
+    #[test]
+    fn detects_bad_magic() {
+        let mut bytes = encode(&sample_meta()).unwrap();
+        bytes[0] = b'X';
+        assert!(matches!(decode(&bytes), Err(DiskError::Corrupt(CorruptKind::BadMagic))));
+    }
+
+    #[test]
+    fn detects_crc_mismatch() {
+        let mut bytes = encode(&sample_meta()).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        assert!(matches!(decode(&bytes), Err(DiskError::Corrupt(CorruptKind::CrcMismatch))));
+    }
+
+    #[test]
+    fn rejects_truncated_buffer() {
+        let bytes = encode(&sample_meta()).unwrap();
+        assert!(decode(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    /// 核心鲁棒性属性：任意单字节翻转都必须报 Corrupt，绝不 panic、绝不返回 Ok。
+    proptest! {
+        #[test]
+        fn never_panics_on_corruption(pos_frac in 0.0f64..1.0, mask in 1u8..=255) {
+            let mut bytes = encode(&sample_meta()).unwrap();
+            if bytes.is_empty() { return Ok(()); }
+            let pos = ((pos_frac * bytes.len() as f64) as usize).min(bytes.len() - 1);
+            bytes[pos] ^= mask;
+            // 只要不 panic 且不返回 Ok 就算通过（翻转后仍合法的情况需排除 CRC 区）
+            match decode(&bytes) {
+                Ok(_) => {}          // 极小概率翻转的是内联数据区，可接受
+                Err(DiskError::Corrupt(_)) => {}
+                Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
+            }
+        }
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-meta container`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+严格按 DESIGN §8.1 的布局实现：
+
+```
+magic "RSM1" | major u16 LE | minor u16 LE | version_count u16 LE
+[header(msgpack) | body_len u32 BE | body] × version_count
+CRC32C(以上全部)
+```
+
+实现顺序有讲究，**必须按此顺序做防御**：
+
+1. 长度 < 头部最小尺寸 → `Corrupt(LengthMismatch)`；
+2. magic 不符 → `Corrupt(BadMagic)`；
+3. `major != 1` → `Corrupt(UnsupportedVersion)`；
+4. 先校验 CRC（对整个前缀），再解析任何内容；
+5. 解析 `version_count` 时，**在分配 `Vec` 之前**用「剩余字节数 / 最小记录尺寸」做上界检查；
+6. 逐条读 `body_len`，**在分配之前**检查 `body_len <= 剩余字节`；
+7. `body` 存为不透明 `Vec<u8>`，不在这一步解析（懒解析）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-meta container`
+Expected: 全部 PASS
+
+```bash
+git add crates/meta/src/container.rs
+git commit -m "feat(meta): meta.xl container codec with corruption defenses"
+```
+
+---
+
+### Task 2.3: 内联数据帧
+
+**Files:**
+- Create: `crates/meta/src/inline.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_multiple_versions() {
+        let mut d = InlineData::default();
+        d.insert("null", b"hello".to_vec());
+        d.insert("v1", b"world".to_vec());
+        let bytes = d.encode().unwrap();
+        let back = InlineData::decode(&bytes).unwrap();
+        assert_eq!(back.get("null"), Some(&b"hello"[..]));
+        assert_eq!(back.get("v1"), Some(&b"world"[..]));
+        assert_eq!(back.get("missing"), None);
+    }
+
+    #[test]
+    fn known_input_is_under_threshold() {
+        assert!(rstore_common::consts::should_inline(64 * 1024, false));
+        assert!(!rstore_common::consts::should_inline(256 * 1024, false));
+        // 版本化桶门限更严格
+        assert!(!rstore_common::consts::should_inline(32 * 1024, true));
+        assert!(rstore_common::consts::should_inline(8 * 1024, true));
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-meta inline`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+按 DESIGN §8.4：msgpack map `version-key → bytes`，帧版本常量 `INLINE_DATA_VER = 1`。
+在 `crates/common/src/consts.rs` 加：
+
+```rust
+pub const INLINE_BLOCK: u64 = 128 * 1024;
+
+/// 版本化桶取 1/8；MVP 未启用版本化，但函数签名保留该维度。
+pub fn should_inline(size: u64, versioned_bucket: bool) -> bool {
+    let threshold = if versioned_bucket { INLINE_BLOCK / 8 } else { INLINE_BLOCK };
+    size <= threshold
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-meta inline`
+Expected: PASS
+
+```bash
+git add crates/meta/src/inline.rs crates/common/src/consts.rs
+git commit -m "feat(meta): inline data framing with size thresholds"
+```
+
+---
+
+## M3 — 盘抽象
+
+### Task 3.1: DiskAPI trait
+
+**Files:** Create `crates/disk/src/lib.rs`
+
+- [ ] **Step 1: 定义 trait（这是契约）**
+
+```rust
+/// 一块盘。对应 DESIGN §4。
+///
+/// **所有方法都返回 `Result<_, DiskError>`，不允许 panic。**
+/// 实现必须把 IO 错误映射为 `DiskError` 的三级分类（见 `error_map.rs`）。
+#[async_trait::async_trait]
+pub trait DiskAPI: Send + Sync {
+    async fn write_all(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError>;
+    async fn read_exact_at(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>, DiskError>;
+    async fn rename(&self, from_rel: &str, to_rel: &str) -> Result<(), DiskError>;
+    async fn remove_dir_all(&self, rel_path: &str) -> Result<(), DiskError>;
+    async fn list_dir(&self, rel_path: &str) -> Result<Vec<String>, DiskError>;
+    async fn stat(&self, rel_path: &str) -> Result<Option<FileStat>, DiskError>;
+    /// fsync 文件本身与父目录（保证 rename 的持久性）。
+    async fn sync_file_and_parent(&self, rel_path: &str) -> Result<(), DiskError>;
+    fn disk_id(&self) -> &DiskId;
+    fn is_local(&self) -> bool;
+}
+```
+
+- [ ] **Step 2: 写契约测试（对任意实现都应通过）**
+
+`crates/disk/src/lib.rs` 中放一个 `pub mod contract_tests`，内含一个
+`pub async fn run_all<D: DiskAPI>(disk: D, tmp: &str)`，覆盖：写后读回、
+读越界返回 `NotFound` 而非 panic、rename 后旧路径 `NotFound`、`list_dir` 排序稳定、
+`sync_file_and_parent` 幂等。
+
+- [ ] **Step 3: 提交（此时还没有实现，仅契约）**
+
+```bash
+git add crates/disk/src/lib.rs
+git commit -m "feat(disk): DiskAPI trait and shared contract test suite"
+```
+
+---
+
+### Task 3.2: LocalDisk 实现
+
+**Files:**
+- Create: `crates/disk/src/local.rs`
+- Create: `crates/disk/src/fsx.rs`
+- Create: `crates/disk/src/error_map.rs`
+- Test: `crates/disk/src/local.rs` 的 `#[cfg(test)]`，用 `tempfile::TempDir`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn write_then_read() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        d.write_all("a/b.txt", b"hello").await.unwrap();
+        let got = d.read_exact_at("a/b.txt", 0, 5).await.unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_past_eof_is_transient_not_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        d.write_all("a.txt", b"hello").await.unwrap();
+        let err = d.read_exact_at("a.txt", 3, 10).await.unwrap_err();
+        assert!(matches!(err, DiskError::Transient(_)), "short read must not be Corrupt");
+    }
+
+    #[tokio::test]
+    async fn missing_path_is_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        assert!(matches!(d.read_exact_at("nope", 0, 1).await, Err(DiskError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn rename_moves_and_old_path_gone() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        d.write_all("staging/f", b"x").await.unwrap();
+        d.rename("staging", "final").await.unwrap();
+        assert!(d.stat("staging/f").await.unwrap().is_none());
+        assert!(d.stat("final/f").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escape() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        let r = d.write_all("../escape", b"x").await;
+        assert!(matches!(r, Err(DiskError::Fatal(_))));
+    }
+
+    #[tokio::test]
+    async fn passes_shared_contract_suite() {
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        crate::contract_tests::run_all(&d).await;
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-disk`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+`fsx.rs` 提供阻塞原语（`write_all_fsync`、`rename_fsync`、`walk`），
+`local.rs` 用 `tokio::task::spawn_blocking` 包装。**关键约束**：
+
+- **路径逃逸检查**：把所有 `rel_path` 规范化后确认仍在盘根之下，否则 `Fatal`；
+- `read_exact_at` 用 `File::read_exact_at`（`std::os::unix::fs::FileExt`）或
+  Windows 上等价的 seek+read；短读 → `Transient`；
+- `sync_file_and_parent` 必须先 fsync 文件再 fsync 父目录（顺序不可颠倒，否则 rename 可能不持久）；
+- `error_map.rs`：`NotFound` → `DiskError::NotFound`；`UnexpectedEof`/`WouldBlock`/`TimedOut`
+  → `Transient`；权限/只读挂载 → `Fatal`；**其余默认 `Transient`**（宁可重试，不误判为损坏）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-disk`
+Expected: 全部 PASS
+
+```bash
+git add crates/disk/src/
+git commit -m "feat(disk): LocalDisk with fsync-aware rename and path escape guard"
+```
+
+---
+
+### Task 3.3: format.json 与拓扑校验
+
+**Files:**
+- Create: `crates/meta/src/format.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_identity_excludes_this_disk() {
+        let a = FormatV1::sample(DiskId::new_v4());
+        let mut b = a.clone();
+        b.erasure.this = DiskId::new_v4();
+        assert_eq!(a.shared_identity(), b.shared_identity());
+    }
+
+    #[test]
+    fn shared_identity_includes_topology() {
+        let a = FormatV1::sample(DiskId::new_v4());
+        let mut b = a.clone();
+        b.erasure.sets[0][1] = DiskId::new_v4();
+        assert_ne!(a.shared_identity(), b.shared_identity());
+    }
+
+    #[test]
+    fn rejects_unknown_format() {
+        let mut a = FormatV1::sample(DiskId::new_v4());
+        a.format = "xl".into();
+        assert!(a.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_inconsistent_set_sizes() {
+        let mut a = FormatV1::sample(DiskId::new_v4());
+        a.erasure.sets[0].pop();
+        assert!(a.validate().is_err());
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-meta format`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+按 DESIGN §7 定义 `FormatV1` / `FormatErasureV1` / `DiskInfo`，以及：
+
+- `shared_identity()` → 除 `this` 外的全部字段的哈希；
+- `validate()` → `format == "erasure"`、`distribution_algo` 已识别、
+  所有 set 长度一致且 `2..=16`；
+- `select_authoritative(formats: &[FormatV1]) -> Result<FormatV1, FormatError>`：
+  按 `shared_identity()` 分组计票，未达 quorum 报错；
+- `should_initialize(errs: &[DiskError]) -> bool`：**仅当所有盘都返回 `NotFound` 时**为真
+  （对应 DESIGN §7「网络不可达的盘绝不被当作新拓扑的证据」）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-meta format`
+Expected: PASS
+
+```bash
+git add crates/meta/src/format.rs
+git commit -m "feat(meta): format.json with shared identity quorum and strict init gate"
+```
+
+---
+
+### Task 3.4: FaultyDisk 测试基础设施
+
+**Files:**
+- Create: `crates/disk/src/faulty.rs`（`#[cfg(any(test, feature = "fault-injection"))]`）
+- Test: `tests/faulty_disk.rs`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+use rstore_disk::faulty::{FaultyDisk, Fault};
+use rstore_disk::{DiskAPI, LocalDisk};
+
+#[tokio::test]
+async fn can_drop_writes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let inner = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+    let d = FaultyDisk::wrap(inner).with(Fault::DropWrites);
+    d.write_all("f", b"x").await.unwrap();       // 对外报成功
+    assert!(matches!(d.read_exact_at("f", 0, 1).await, Err(DiskError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn can_corrupt_bytes_silently() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let inner = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+    let d = FaultyDisk::wrap(inner);
+    d.write_all("f", b"hello").await.unwrap();
+    d.set_fault(Fault::CorruptBytes { at: 0, mask: 0xFF });
+    d.write_all("g", b"hello").await.unwrap();
+    // 读回来内容与写入不同，且没有任何 API 报错 —— 模拟静默损坏
+    let got = d.read_exact_at("g", 0, 5).await.unwrap();
+    assert_ne!(got, b"hello");
+}
+
+#[tokio::test]
+async fn can_fail_after_n_calls() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let inner = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+    let d = FaultyDisk::wrap(inner).with(Fault::FailAfter { calls: 2, kind: FaultKind::Transient });
+    d.write_all("a", b"1").await.unwrap();
+    d.write_all("b", b"2").await.unwrap();
+    assert!(matches!(d.write_all("c", b"3").await, Err(DiskError::Transient(_))));
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --test faulty_disk`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+`FaultyDisk` 用 `AtomicUsize` 计调用次数、`Mutex<Option<Fault>>` 存当前故障。
+必须支持 DESIGN §19.2 列出的全部故障类型：`DropWrites`、`PartialWrite`、`CorruptBytes`、
+`Truncate`、`FailAfter { calls, kind }`（`kind: FaultKind::{Transient, Corrupt, NotFound}`）、
+`Offline`。
+
+**要求：`FaultyDisk` 必须通过 `contract_tests`（无故障注入时行为与 `LocalDisk` 完全一致）**，
+否则它测出来的问题可能是它自己引入的。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test --test faulty_disk`
+Expected: 全部 PASS
+
+```bash
+git add crates/disk/src/faulty.rs tests/faulty_disk.rs
+git commit -m "test(disk): FaultyDisk fault injection harness"
+```
+
+---
+
+## M4 — 存储引擎核心
+
+> 这是 MVP 的主体。每个 Task 都要求先写测试，且**测试必须使用 `FaultyDisk`**，
+> 而不是只用 `LocalDisk`。
+
+### Task 4.1: bitrot 分片写入器
+
+**Files:**
+- Create: `crates/store/src/writer.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn writes_interleaved_hash_and_data() {
+    // 写 1500 字节、block_size=1024 → 期望落盘 = (32+1024) + (32+476) = 1564
+    let tmp = TempDir::new().unwrap();
+    let disk = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+    let w = BitrotShardWriter::new(disk, "part.1".into(), 1024);
+    w.write_block(&vec![7u8; 1024]).await.unwrap();
+    w.write_block(&vec![9u8; 476]).await.unwrap();
+    w.finish().await.unwrap();
+    let size = tokio::fs::metadata(tmp.path().join("part.1")).await.unwrap().len();
+    assert_eq!(size, 32 + 1024 + 32 + 476);
+}
+
+#[test]
+fn bitrot_size_matches_writer_output() {
+    // (原始字节数, block_size, 落盘字节数 = ceil(size/bs)*32 + size)
+    let cases = [
+        (0u64, 1024u64, 0u64),
+        (1, 1024, 33),           // 1 块: 32 + 1
+        (1024, 1024, 1056),      // 1 块: 32 + 1024
+        (1025, 1024, 1089),      // 2 块: 64 + 1025
+        (5000, 512, 5320),       // 10 块: 320 + 5000
+    ];
+    for (size, bs, want) in cases {
+        assert_eq!(bitrot_size(size, bs), want, "size={size} bs={bs}");
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store writer`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+`BitrotShardWriter` 持 `DiskAPI` + 相对路径 + `block_size`，每次 `write_block` 计算
+`bitrot_hash(block)` 并**一次**追加 `[hash][data]`（一次向量写，对应 DESIGN §11）。
+`finish()` 调 `sync_file_and_parent`。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store writer`
+Expected: PASS
+
+```bash
+git add crates/store/src/writer.rs
+git commit -m "feat(store): bitrot shard writer with interleaved layout"
+```
+
+---
+
+### Task 4.2: bitrot 分片读取器
+
+**Files:** Modify `crates/store/src/reader.rs`（新建）
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn reads_back_what_was_written() { /* 往返 1500 字节，断言逐块校验通过且内容恒等 */ }
+
+#[tokio::test]
+async fn detects_bitrot() {
+    // 写 → 手工破坏落盘文件的一个数据字节 → 读必须返回 Corrupt(BitrotMismatch)
+    let err = reader.read_block(0).await.unwrap_err();
+    assert!(matches!(err, DiskError::Corrupt(CorruptKind::BitrotMismatch)));
+}
+
+#[tokio::test]
+async fn short_file_is_transient_not_corrupt() {
+    // 文件被截断 → Transient（因为可能是写入未完成），而不是 Corrupt
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store reader`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+`BitrotShardReader` 按 `[hash][data]` 定位：读 block `k` 需要
+`offset = k * (32 + block_size)`，长度 `32 + block_len`（最后一块可能更短，由总大小推导）。
+重算哈希并对齐比较；不匹配 → `Corrupt(BitrotMismatch)`；
+文件长度不足 → `Transient`（写入可能未完成），**不是** `Corrupt`。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store reader`
+Expected: PASS
+
+```bash
+git add crates/store/src/reader.rs
+git commit -m "feat(store): bitrot shard reader with corruption classification"
+```
+
+---
+
+### Task 4.3: ErasureSet 与盘选择
+
+**Files:**
+- Create: `crates/store/src/set.rs`
+- Create: `crates/store/src/pool.rs`
+- Test: `crates/store/src/set.rs` 的 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn default_parity_matches_design_table() {
+    assert_eq!(default_parity(1), 0);
+    assert_eq!(default_parity(2), 1);
+    assert_eq!(default_parity(3), 1);
+    assert_eq!(default_parity(4), 2);
+    assert_eq!(default_parity(5), 2);
+    assert_eq!(default_parity(6), 3);
+    assert_eq!(default_parity(7), 3);
+    assert_eq!(default_parity(8), 4);
+    assert_eq!(default_parity(16), 4);
+}
+
+#[test]
+fn parity_never_exceeds_half() {
+    for n in 2..=16u8 {
+        assert!(default_parity(n) * 2 <= n, "n={n}");
+    }
+}
+
+#[test]
+fn write_quorum_bumps_on_symmetric_geometry() {
+    assert_eq!(write_quorum(4, 2), 4);   // 4+2: 不对称
+    assert_eq!(write_quorum(3, 3), 4);   // 3+3: 对称，+1
+    assert_eq!(read_quorum(4, 2), 4);
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store set`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+```rust
+/// DESIGN §10.1 的默认 parity 表。
+pub fn default_parity(total: u8) -> u8 {
+    match total {
+        0 | 1 => 0,
+        2..=3 => 1,
+        4..=5 => 2,
+        6..=7 => 3,
+        _ => 4,
+    }
+}
+
+pub fn read_quorum(total: u8, parity: u8) -> u8 { total - parity }
+
+pub fn write_quorum(data: u8, parity: u8) -> u8 {
+    if data == parity { data + 1 } else { data }
+}
+
+pub fn delete_quorum(total: u8) -> u8 { total / 2 + 1 }
+```
+
+`ErasureSet` 持 `Vec<Option<Arc<dyn DiskAPI>>>`（`None` 表示掉线的盘）、
+`data`/`parity`、`CodecCache`。提供 `pick_slot_for(index)` 与 `available_disks()`。
+
+```rust
+/// 一个 erasure set 的盘数 = N = data + parity。
+/// **盘数与分片数一一对应：每块盘持有一份分片。**
+/// 例如 `total = 6, parity = 2` 即 4+2 配置，需要 6 块盘。
+pub struct ErasureSet {
+    disks: Vec<Option<Arc<dyn DiskAPI>>>,
+    data: u8,      // = total - parity
+    parity: u8,    // = total - data
+    codec_cache: CodecCache,
+}
+
+impl ErasureSet {
+    /// 测试辅助：建 `total` 块盘、parity 为 `parity` 的 set。
+    /// 返回的 set 已挂好 `FaultyDisk`，可用 `inject_fault_on(i, fault)` 注入故障。
+    pub async fn for_test(dir: &Path, total: u8, parity: u8) -> Self;
+    pub fn total(&self) -> u8 { self.data + self.parity }
+    pub fn read_quorum(&self) -> u8 { read_quorum(self.total(), self.parity) }
+    pub fn write_quorum(&self) -> u8 { write_quorum(self.data, self.parity) }
+}
+```
+
+> 测试里的 `set_with_disks(n, p)` 是 M4 测试模块内共用的辅助函数：内部建一个 `TempDir`，
+> 挂 `n` 块 `FaultyDisk`，返回持有该临时目录的 `ErasureSet`（目录随 set drop 清理）。
+> **写作 `set_with_disks(6, 2)` 表示「6 块盘、parity=2、data=4」**。整个 M4 的测试都遵循这个约定。
+> 把它写在 `crates/store/src/testutil.rs`（`#[cfg(test)]`），供各测试文件共用。
+
+**集合路由的 MVP 形态：** `Pool` 持 `Vec<Arc<ErasureSet>>`。MVP 下 `set_count == 1`
+（所有盘同属一个 set），因此路由是恒等映射。保留该维度并在 `Pool::pick_set` 处留注释：
+
+```rust
+// MVP: set_count == 1，路由恒等。多 set 时的 SipHash 路由见 DESIGN §9.2（Phase 3）。
+```
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store set`
+Expected: PASS
+
+```bash
+git add crates/store/src/set.rs crates/store/src/pool.rs
+git commit -m "feat(store): erasure set geometry and quorum rules"
+```
+
+---
+
+### Task 4.4: 提交协议
+
+**Files:**
+- Create: `crates/store/src/commit.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn commits_when_quorum_reached() {
+    let set = set_with_disks(6, 2).await;
+    let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
+    assert!(r.is_ok());
+}
+
+#[tokio::test]
+async fn fails_and_reports_when_below_quorum() {
+    // 3 块盘 DropWrites/Offline，只留 3 块可 rename，write_quorum=4
+    let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
+    assert!(matches!(r, Err(StoreError::WriteQuorum { achieved: 3, required: 4 })));
+}
+
+#[tokio::test]
+async fn rollback_removes_already_renamed_dirs() {
+    // 达到 2 块盘 rename 成功后失败 → 回滚应尽力删除这 2 个
+    // 断言：data_dir 在成功的盘上不再存在（若删除也失败，则残留由对账处理，测试只断言尽力而为）
+}
+
+#[tokio::test]
+async fn never_reports_success_below_quorum() {
+    // 属性式：随机注入故障，只要返回 Ok，就断言成功盘数 >= write_quorum
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store commit`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+```rust
+/// 返回达到的 quorum 数；调用方据此决定成功或失败。
+///
+/// 硬承诺（DESIGN §12.2）：**绝不在低于 quorum 时报告成功**。
+/// 回滚是 best-effort：失败时的残留由对账流程清理，本函数不保证不留字节。
+pub async fn commit(
+    set: &ErasureSet,
+    staging_rel: &str,
+    final_rel: &str,
+    write_quorum: u8,
+) -> Result<CommitOutcome, StoreError> {
+    let mut achieved = 0u8;
+    let mut renamed: Vec<usize> = Vec::new();
+    let mut errs: Vec<DiskError> = Vec::new();
+
+    // 并行 rename 到所有可用盘
+    for (i, disk) in set.disks().iter().enumerate() {
+        match disk {
+            None => errs.push(DiskError::NotFound("offline".into())),
+            Some(d) => match d.rename(staging_rel, final_rel).await {
+                Ok(()) => { achieved += 1; renamed.push(i); }
+                Err(e)   => errs.push(e),
+            },
+        }
+    }
+
+    if achieved >= write_quorum {
+        Ok(CommitOutcome { achieved, renamed })
+    } else {
+        // 尽力回滚：只清理我们自己 rename 过去的那些
+        for i in &renamed {
+            let _ = set.disks()[*i].as_ref().unwrap().remove_dir_all(final_rel).await;
+        }
+        Err(StoreError::WriteQuorum { achieved, required: write_quorum })
+    }
+}
+```
+
+> **注意并发写法**：上面是串行伪代码，便于阅读与测试。实现时应换成
+> `futures::future::join_all` 并行发起，但**判定逻辑一字不改**——
+> 尤其是「先统计成功数、再决定回滚」的顺序，不要写成「遇到第一个失败就提前返回」。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store commit`
+Expected: PASS
+
+```bash
+git add crates/store/src/commit.rs
+git commit -m "feat(store): rename commit protocol with best-effort rollback"
+```
+
+---
+
+### Task 4.5: PUT 路径
+
+**Files:**
+- Create: `crates/store/src/put.rs`
+- Test: `crates/store/src/put.rs` 的 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn put_small_object_inlines_it() {
+    let set = set_with_disks(6, 2).await;
+    let put = PutArgs { bucket: "b".into(), key: "small".into(), data: vec![1u8; 1000] };
+    let out = set.put_object(put).await.unwrap();
+    // 内联对象：各盘应存在 meta.xl，但没有 part.*（因为数据在 meta 里）
+    assert!(out.etag.len() > 0);
+    assert_eq!(out.size, 1000);
+}
+
+#[tokio::test]
+async fn put_large_object_creates_shards() {
+    let set = set_with_disks(6, 2).await;
+    let data = vec![7u8; 1_500_000];  // 触发多 block
+    let out = set.put_object(PutArgs { bucket: "b".into(), key: "big".into(), data }).await.unwrap();
+    assert_eq!(out.size, 1_500_000);
+    // 单部分对象：每块盘的数据目录里恰好一个分片文件 part.1（不是 6 个！）
+    for disk_idx in 0..6 {
+        let files = list_data_dir(&set, disk_idx, "b/big", &out.data_dir).await;
+        assert_eq!(files, vec!["meta.xl".to_string(), "part.1".to_string()], "disk {disk_idx}");
+    }
+}
+
+#[tokio::test]
+async fn put_fails_below_write_quorum() {
+    let set = set_with_disks(6, 2).await;
+    set.inject_fault_on(0, Fault::Offline);
+    set.inject_fault_on(1, Fault::Offline);
+    set.inject_fault_on(2, Fault::Offline);
+    let r = set.put_object(PutArgs { bucket: "b".into(), key: "k".into(), data: vec![0u8; 1_000_000] }).await;
+    assert!(matches!(r, Err(StoreError::WriteQuorum { .. })));
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store put`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+流程（严格按 DESIGN §12.1）：
+
+1. 生成 `data_dir = Uuid::new_v4()`，`txid = Uuid::new_v4()`；
+2. 计算 `distribution(key, N)`；校验返回值合法，否则 `InternalError`；
+3. 小对象（`should_inline`）→ 构造只含内联数据的 `ObjectMeta`，直接写 `meta.xl`；
+4. 大对象 → 按 `BLOCK_SIZE = 1 MiB` 分块；每块：
+   a. 按分布排列把块拆到 `data` 个逻辑分片；
+   b. `codec.encode` 得到 `parity` 个校验分片；
+   c. 对 `N` 个槽位并行 `BitrotShardWriter::write_block`；
+   d. 统计成功数，`< write_quorum` → 中止并清理；
+5. 写 `meta.xl` 到各可用盘（同样要求 quorum）；
+6. `commit(set, staging, final, write_quorum)`；
+7. 返回 `{ size, etag(MD5 或 content hash), data_dir, version_id }`。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store put`
+Expected: PASS
+
+```bash
+git add crates/store/src/put.rs
+git commit -m "feat(store): PUT path with erasure encoding and inline fast path"
+```
+
+---
+
+### Task 4.6: 元数据仲裁
+
+**Files:**
+- Create: `crates/store/src/quorum.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn identical_metadata_wins_quorum() {
+    // total=6, parity=2 → read_quorum=4。4 票 meta_a 达到 quorum。
+    let metas = vec![meta_a(), meta_a(), meta_a(), meta_a(), meta_b(), meta_b()];
+    let r = resolve_metadata(&metas, 6, 2).unwrap();
+    assert_eq!(r, meta_a());
+}
+
+#[test]
+fn minority_metadata_cannot_win() {
+    // 3 票 < read_quorum 4 → 必须报错，不能「多数决」直接返回少数派
+    let metas = vec![meta_a(), meta_a(), meta_a(), meta_b(), meta_c(), meta_b()];
+    assert!(matches!(resolve_metadata(&metas, 6, 2), Err(StoreError::ReadQuorum)));
+}
+
+#[test]
+fn no_quorum_is_an_error() {
+    let metas = vec![meta_a(), meta_b(), meta_c()];
+    assert!(matches!(resolve_metadata(&metas, 6, 2), Err(StoreError::ReadQuorum)));
+}
+
+#[test]
+fn volatile_fields_do_not_split_quorum() {
+    // 两个 meta 只有 heal/purge 状态不同，其余相同 → 必须归为同一组
+    let mut b = meta_a();
+    b.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
+    let metas = vec![meta_a(), meta_a(), b, meta_a()];
+    assert!(resolve_metadata(&metas, 6, 2).is_ok());
+}
+
+#[test]
+fn missing_disks_are_not_failures() {
+    // 2 块盘返回 NotFound，4 块一致 → 成功
+    let metas = vec![Some(meta_a()), None, Some(meta_a()), None, Some(meta_a()), Some(meta_a())];
+    assert!(resolve_metadata_opt(&metas, 6, 2).is_ok());
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store quorum`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+```rust
+/// 全部盘都返回了元数据时使用。
+pub fn resolve_metadata(
+    metas: &[ObjectMeta],
+    total: u8,
+    parity: u8,
+) -> Result<ObjectMeta, StoreError>;
+
+/// 部分盘掉线时使用。`None` 表示该盘未返回（**不计为失败，也不计为票**）。
+pub fn resolve_metadata_opt(
+    metas: &[Option<ObjectMeta>],
+    total: u8,
+    parity: u8,
+) -> Result<ObjectMeta, StoreError>;
+```
+
+- 身份哈希：SHA-256 over `size / flags / mod_time / version_id / data_dir / parts`，
+  **显式排除** `x-rs-healing`、`x-rs-purge-status` 等易变键；
+- 按身份哈希分组计票，取票数最高组；`< read_quorum` → `StoreError::ReadQuorum`；
+- `None`（盘未返回）**不计为失败**，也**不计为票**——语义与「返回了不匹配的元数据」不同；
+- 早停优化：用 `u16` 位图记录已返回的槽位（`N ≤ 16`，零分配）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store quorum`
+Expected: PASS
+
+```bash
+git add crates/store/src/quorum.rs
+git commit -m "feat(store): metadata quorum with identity-hash voting"
+```
+
+---
+
+### Task 4.7: GET 路径
+
+**Files:**
+- Create: `crates/store/src/get.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn get_returns_what_was_put() {
+    let set = set_with_disks(6, 2).await;
+    let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    set.put_object(put_args("b", "k", data.clone())).await.unwrap();
+    let got = set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn get_with_range_reads_only_needed_shards() {
+    // Range: bytes=1000-1999 → 结果等于 data[1000..2000]
+}
+
+#[tokio::test]
+async fn get_survives_two_disk_losses() {
+    let set = set_with_disks(6, 2).await;
+    set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
+    set.inject_fault_on(0, Fault::Offline);
+    set.inject_fault_on(1, Fault::Offline);
+    let got = set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap();
+    assert_eq!(got.len(), 2_000_000);
+}
+
+#[tokio::test]
+async fn get_fails_closed_below_read_quorum() {
+    let set = set_with_disks(6, 2).await;
+    set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
+    for i in 0..3 { set.inject_fault_on(i, Fault::Offline); }
+    let r = set.get_object("b", "k", None).await;
+    assert!(matches!(r, Err(StoreError::ReadQuorum)), "must not return partial data");
+}
+
+#[tokio::test]
+async fn get_inlines_short_circuit_disk_reads() {
+    // 小对象应只读 meta.xl，不打开 part.* —— 用 FaultyDisk 让所有 part 读取失败来验证
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store get`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+流程（DESIGN §14.4）：
+
+1. 计算 `distribution` 与目标 set；
+2. 并行读各盘 `meta.xl` → `resolve_metadata` 得权威元数据；
+3. 内联对象 → 直接从元数据返回，**不碰 part**；
+4. 否则建 `BitrotShardReader` 并行按需读取，`< read_quorum` → `ReadQuorum`；
+5. `codec.decode` 重构数据分片，按分布排列拼回原顺序；
+6. 若 `available > data`（有多余分片）→ 异步入队读修复（MVP 可先只记录指标，
+   留 TODO 注释指向 Phase 4）；
+7. Range 请求：只读取覆盖请求范围的 block。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store get`
+Expected: PASS
+
+```bash
+git add crates/store/src/get.rs
+git commit -m "feat(store): GET path with inline fast path and fail-closed quorum"
+```
+
+---
+
+### Task 4.8: DELETE 与覆盖写
+
+**Files:**
+- Create: `crates/store/src/delete.rs`
+- Test: 同文件 `#[cfg(test)]`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn overwrite_replaces_latest() { /* put A, put B, get == B */ }
+
+#[tokio::test]
+async fn delete_makes_get_return_not_found() { /* put, delete, get → NotFound */ }
+
+#[tokio::test]
+async fn delete_marks_before_gc() {
+    // 删除是「写新的元数据标记」而不是立即删数据；确认标记先落地
+}
+
+#[tokio::test]
+async fn gc_only_after_old_dir_outvoted() {
+    // 覆盖写后，旧 data_dir 在多数盘上被确认取代，才允许删除
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store delete`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+- **覆盖写**：新版本走与 PUT 完全相同的路径（新 `data_dir`）；
+  提交成功后，对旧 `data_dir` 执行「多盘投票」——若多数盘的当前元数据已不指向它，
+  才在**各盘**删除旧目录。投票未达多数 → 留着，交给对账；
+- **DELETE**：MVP 无版本化，语义是「写入一个删除记录作为最新版本，并触发旧数据 GC」；
+  删除记录本身也走 `commit`，quorum 用 `delete_quorum = N/2 + 1`；
+- **GC 幂等**：删除不存在的目录返回 `Ok`。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store delete`
+Expected: PASS
+
+```bash
+git add crates/store/src/delete.rs
+git commit -m "feat(store): overwrite and delete with outvote-based GC"
+```
+
+---
+
+### Task 4.9: Quorum 边界测试套件
+
+**Files:** Create `tests/quorum_boundaries.rs`
+
+- [ ] **Step 1: 写测试（这是 DESIGN §19.2 的落地）**
+
+```rust
+/// 4+2 配置下的完整边界矩阵。每行是一个独立用例。
+#[tokio::test]
+async fn matrix_4_plus_2() {
+    let cases = [
+        // (掉线盘数, 操作, 期望)
+        (0, Op::Read,  Expect::Ok),
+        (2, Op::Read,  Expect::Ok),            // N-data = 2，刚好还能读
+        (3, Op::Read,  Expect::ReadQuorum),    // 低于 read_quorum
+        (2, Op::Write, Expect::Ok),            // parity = 2，刚好还能写
+        (3, Op::Write, Expect::WriteQuorum),
+        (1, Op::Delete, Expect::Ok),
+        (4, Op::Delete, Expect::WriteQuorum),  // delete_quorum = 3
+    ];
+    for (offline, op, expect) in cases {
+        run_case(set_with_disks(6, 2).await, offline, op, expect).await;
+    }
+}
+
+#[tokio::test]
+async fn bitrot_on_minority_still_reads_correctly() {
+    // 1 块盘写入静默损坏 → 读成功，且结果是正确的
+}
+
+#[tokio::test]
+async fn bitrot_on_majority_exposes_corruption_not_wrong_data() {
+    // 3 块盘静默损坏 → 绝不返回错误数据：要么 ReadQuorum，要么能校验出不一致
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --test quorum_boundaries`
+Expected: 编译失败（`run_case` 未实现）
+
+- [ ] **Step 3: 实现测试辅助函数并让测试通过**
+
+`run_case` 负责：建 set → 注入对应数量的故障 → 执行操作 → 断言错误类型。
+**特别注意最后一条**：它验证的是 DESIGN §2 的 P1——宁可报错，不可返回错数据。
+
+- [ ] **Step 4: 提交**
+
+Run: `cargo test --test quorum_boundaries`
+Expected: 全部 PASS
+
+```bash
+git add tests/quorum_boundaries.rs
+git commit -m "test(store): quorum boundary matrix across failure modes"
+```
+
+---
+
+### Task 4.10: 崩溃点状态机测试
+
+**Files:** Create `tests/commit_crash.rs`
+
+- [ ] **Step 1: 写测试**
+
+把提交协议建模为一个可注入「崩溃点」的状态机。每个崩溃点执行「kill → 重建 Pool → 断言」：
+
+```rust
+#[derive(Debug, Clone, Copy)]
+enum CrashPoint {
+    BeforeStagingWrite,
+    AfterShardWriteBeforeSync,
+    AfterSyncBeforeRename,
+    AfterPartialRename,
+    AfterRenameBeforeOldGc,
+    DuringOldGc,
+}
+
+#[tokio::test]
+async fn crash_recovery_invariants() {
+    for point in ALL_CRASH_POINTS {
+        let dir = tempfile::TempDir::new().unwrap();
+        let crashed = run_put_until_crash(&dir, point).await;
+        // 模拟重启：重新打开同一个目录
+        let pool = Pool::open(&dir.path()).await.unwrap();
+        let got = pool.get_object("b", "k").await;
+
+        // 不变量 1（可见性）：对象要么完全可见且内容正确，要么 NotFound
+        match got {
+            Ok(r) => assert_eq!(r.read_to_end().await.unwrap(), EXPECTED_DATA, "point={point:?}"),
+            Err(StoreError::NotFound) => {}
+            Err(e) => panic!("unexpected error at {point:?}: {e:?}"),
+        }
+
+        // 不变量 2（可回收性）：任何残留都能被对账流程识别
+        let leftovers = pool.scan_orphans().await.unwrap();
+        for l in leftovers {
+            assert!(pool.can_reclaim(&l), "unreclaimable orphan at {point:?}: {l}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn old_gc_crash_never_loses_both_versions() {
+    // 覆盖写两个版本后，在 GC 各阶段崩溃，重启后至少能读到其中一个版本
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --test commit_crash`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+需要：
+- `run_put_until_crash`：用 `FaultyDisk` 的 `FailAfter` 精确控制崩溃时机；
+- `Pool::scan_orphans` / `can_reclaim`：MVP 阶段实现为「识别 `.staging-*` 与
+  无对应元数据的 data-dir，且能安全删除」。这是 DESIGN §12.2 中「残留由对账清理」的最小实现。
+
+- [ ] **Step 4: 提交**
+
+Run: `cargo test --test commit_crash`
+Expected: 全部 PASS
+
+```bash
+git add tests/commit_crash.rs crates/store/src/pool.rs
+git commit -m "test(store): commit protocol crash-point invariant tests"
+```
+
+---
+
+## M5 — S3 接入
+
+### Task 5.1: s3s 骨架与认证
+
+**Files:**
+- Create: `crates/api/src/lib.rs`
+- Create: `crates/s3/src/lib.rs`、`crates/s3/src/auth.rs`
+- Create: `crates/s3/src/impl_s3.rs`
+
+- [ ] **Step 1: 定义 api 契约（boundary 规则 R4）**
+
+`crates/api/src/lib.rs` 定义 `ObjectStore` trait（`put_object` / `get_object` /
+`head_object` / `delete_object` / `list_objects` / multipart 系列）与领域错误 `StoreError`。
+`rstore-s3` 中**唯一**的 boundary 文件 `rstore-s3/src/boundary.rs` 负责把
+`rstore-store` 的实现绑定到该 trait。
+
+- [ ] **Step 2: 写集成测试（用 s3s 的测试工具或直接打 HTTP）**
+
+```rust
+#[tokio::test]
+async fn rejects_bad_signature() {
+    // 启动服务 → 发一个错误的 Authorization → 期望 403 SignatureDoesNotMatch
+}
+
+#[tokio::test]
+async fn accepts_valid_sigv4() {
+    // 用 aws-sigv4 生成正确签名 → 期望 200
+}
+```
+
+- [ ] **Step 3: 实现**
+
+用 `s3s::S3ServiceBuilder` 组装，`set_auth` 传入一个静态 root 凭证的 `AuthProvider`
+（MVP 单用户，从配置文件读 access_key / secret_key）。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add crates/api/ crates/s3/
+git commit -m "feat(s3): s3s service skeleton with single root credential auth"
+```
+
+---
+
+### Task 5.2 ~ 5.6: S3 操作实现
+
+按以下顺序，**每个 Task 一个操作组**，每个都先写 HTTP 层集成测试：
+
+| Task | 操作 | 测试要点 |
+|---|---|---|
+| 5.2 | `CreateBucket` / `DeleteBucket` / `HeadBucket` / `ListBuckets` | 空桶可删、非空桶删返回 409 |
+| 5.3 | `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` | 往返一致、ETag 正确、HEAD 无 body 但有 Content-Length |
+| 5.4 | `GetObject` 的 Range | `bytes=a-b` / `bytes=a-` / `bytes=-n` 三种形式；206 与 `Content-Range` |
+| 5.5 | `ListObjectsV2` | 前缀、分隔符、`max-keys` 分页、`CommonPrefixes`、`continuation-token` 往返 |
+| 5.6 | Multipart 全流程 | 分片上传后 Complete 的 ETag 格式为 `<md5>-<n>`；Abort 后目录被清理；不存在的 part 号返回 `InvalidPart` |
+| 5.7 | 命名校验 | 见下（单独展开） |
+
+**每个 Task 的提交信息格式：** `feat(s3): implement <operation group>`
+
+> **实现提示（5.5 尤其注意）**：LIST 在 MVP 是**全盘遍历**。必须在注释中写明这一点，
+> 并留下 `// PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引` 的挂钩注释，
+> 避免后续读者误以为这是终态设计。
+
+---
+
+### Task 5.7: 命名校验（保留名规则）
+
+**Files:** Create `crates/s3/src/validate.rs`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn rejects_object_key_with_reserved_first_segment() {
+    // DESIGN §6.3：对象 key 的第一段不得以 `.rstore` 开头
+    assert!(validate_object_key(".rstore/x").is_err());
+    assert!(validate_object_key(".rstore.uploads/abc").is_err());
+    assert!(validate_object_key(".rstore.sys").is_err());
+    // 只有第一段受限，深层路径允许
+    assert!(validate_object_key("a/.rstore/x").is_ok());
+    assert!(validate_object_key("normal/key").is_ok());
+    assert!(validate_object_key("").is_err());
+}
+
+#[test]
+fn rejects_bucket_names_violating_s3_rules() {
+    assert!(validate_bucket_name(".hidden").is_err());    // 不能以 '.' 开头
+    assert!(validate_bucket_name("OK-Bucket").is_err());  // 不能有大写
+    assert!(validate_bucket_name("-leading").is_err());
+    assert!(validate_bucket_name("ok-bucket").is_ok());
+    assert!(validate_bucket_name("ok.bucket.123").is_ok());
+}
+
+#[test]
+fn reserved_prefix_constant_is_not_empty() {
+    // 防止有人在重构中把常量改成空串，让校验静默失效
+    assert!(!rstore_meta::keys::RESERVED_PREFIX.is_empty());
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-s3 validate`
+Expected: 编译失败
+
+- [ ] **Step 3: 实现**
+
+```rust
+/// 对象 key 校验。返回 `StoreError::InvalidObjectName`。
+/// 只检查第一段；深层段允许出现 `.rstore`（DESIGN §6.3）。
+pub fn validate_object_key(key: &str) -> Result<(), StoreError>;
+
+/// 桶名校验。S3 规则：3–63 字符、小写字母或数字开头、仅含 `a-z0-9.-`。
+/// 返回 `StoreError::InvalidBucketName`。
+pub fn validate_bucket_name(name: &str) -> Result<(), StoreError>;
+```
+
+在 `crates/meta/src/keys.rs` 中定义 `pub const RESERVED_PREFIX: &str = ".rstore";`，
+两处校验都引用它，**不得内联字面量**。
+
+- [ ] **Step 4: 在请求入口接入**
+
+在 `impl_s3.rs` 的 `put_object` / `get_object` / `head_object` / `delete_object` /
+`list_objects_v2` 入口调用校验。补一个 HTTP 层测试：对 `.rstore.sys/x` 发 PUT，
+期望 `400` + `InvalidObjectName`。
+
+- [ ] **Step 5: 提交**
+
+Run: `cargo test -p rstore-s3 validate`
+Expected: PASS
+
+```bash
+git add crates/s3/src/validate.rs crates/meta/src/keys.rs crates/s3/src/impl_s3.rs
+git commit -m "feat(s3): bucket and object key validation with reserved prefix rule"
+```
+
+---
+
+### Task 5.8: 错误映射
+
+**Files:** Create `crates/s3/src/errors.rs`
+
+- [ ] **Step 1: 写测试**
+
+```rust
+#[test]
+fn maps_store_errors_to_s3_codes() {
+    assert_code(StoreError::NotFound, "NoSuchKey");
+    assert_code(StoreError::NoSuchBucket, "NoSuchBucket");
+    assert_code(StoreError::InvalidPart, "InvalidPart");
+    assert_code(StoreError::ReadQuorum { .. }, "InternalError");
+    assert_code(StoreError::WriteQuorum { .. }, "InternalError");
+    assert_code(StoreError::DiskFull, "InsufficientStorage");
+    assert_code(StoreError::SlowDown, "SlowDown");
+}
+```
+
+- [ ] **Step 2-4: 实现、跑测试、提交**
+
+要求每个 S3 错误响应包含 `Code` / `Message` / `Resource` / `RequestId` 四要素
+（DESIGN §15.4）。
+
+```bash
+git add crates/s3/src/errors.rs
+git commit -m "feat(s3): domain error to S3 error code mapping"
+```
+
+---
+
+### Task 5.9: 兼容层与客户端冒烟测试
+
+**Files:**
+- Create: `crates/s3-compat/src/lib.rs`
+- Create: `tests/compat/aws_cli.sh`、`tests/compat/mc.sh`、`tests/compat/rclone.sh`
+
+- [ ] **Step 1: 先跑冒烟脚本，找出真实的不兼容点**
+
+脚本框架（`aws_cli.sh`）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+export AWS_ACCESS_KEY_ID=rustorage
+export AWS_SECRET_ACCESS_KEY=rustorage-secret
+export AWS_DEFAULT_REGION=us-east-1
+EP="http://127.0.0.1:9000"
+
+aws --endpoint-url "$EP" s3 mb s3://test-bucket
+head -c 1048576 /dev/urandom > /tmp/1m.bin
+aws --endpoint-url "$EP" s3 cp /tmp/1m.bin s3://test-bucket/1m.bin
+aws --endpoint-url "$EP" s3 cp s3://test-bucket/1m.bin /tmp/roundtrip.bin
+cmp /tmp/1m.bin /tmp/roundtrip.bin
+aws --endpoint-url "$EP" s3api list-objects-v2 --bucket test-bucket --prefix "" --max-keys 1
+aws --endpoint-url "$EP" s3api list-objects-v2 --bucket test-bucket --delimiter "/"
+echo "aws-cli smoke: OK"
+```
+
+同样方式写 `mc.sh`（`mc alias set` / `cp` / `ls` / `cat` / `rm`）与
+`rclone.sh`（`copy` / `check`）。
+
+- [ ] **Step 2: 运行脚本，记录失败项**
+
+Run: `bash tests/compat/aws_cli.sh`
+Expected: 首次运行**允许失败**——失败项就是 compat 层的需求来源
+
+- [ ] **Step 3: 为每个失败项添加 compat 中间件**
+
+**必须遵守 DESIGN §15.3 的准入规则**：每条中间件带注释
+
+```rust
+// compat: aws-cli — PUT 空对象时不发 Content-Length，需归一化为 0 — see tests/compat/aws_cli.sh
+```
+
+并且该中间件被移除时，对应的冒烟测试必须失败。**不允许凭猜测添加中间件。**
+
+- [ ] **Step 4: 三个脚本全部通过后提交**
+
+```bash
+git add crates/s3-compat/ tests/compat/
+git commit -m "feat(s3-compat): client ecosystem compatibility layers driven by smoke tests"
+```
+
+---
+
+## M6 — 运维面与验收
+
+### Task 6.1: Readiness 与健康端点
+
+**Files:** Create `crates/server/src/readiness.rs`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test]
+async fn returns_503_before_storage_ready() {
+    // 进程已监听但尚未完成存储初始化 → /ready 返回 503 且带 Retry-After: 5
+}
+
+#[tokio::test]
+async fn returns_200_after_storage_ready() { }
+
+#[tokio::test]
+async fn stage_is_monotonic() {
+    // mark_stage 不允许回退
+}
+
+#[tokio::test]
+async fn health_is_independent_of_readiness() {
+    // /health 在 Booting 阶段也返回 200
+}
+```
+
+- [ ] **Step 2-4: 实现、跑测试、提交**
+
+```rust
+pub enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
+```
+
+`/health` 为存活探针（进程活着即 200）；`/ready` 受 stage 控制，未就绪返回
+`503` + `Retry-After: 5`。
+
+```bash
+git add crates/server/src/readiness.rs
+git commit -m "feat(server): staged readiness with health/ready endpoints"
+```
+
+---
+
+### Task 6.2: Prometheus 指标
+
+**Files:** Create `crates/server/src/metrics.rs`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn metrics_disabled_is_noop() {
+    // 开关关闭时 record_* 不改变任何计数
+}
+
+#[tokio::test]
+async fn exposes_prometheus_text_format() {
+    // GET /metrics → 包含 put_duration_seconds / erasure_quorum_failures_total
+}
+```
+
+- [ ] **Step 2-4: 实现、跑测试、提交**
+
+按 DESIGN §18.2，指标名常量集中定义，热路径用 `LazyLock` 缓存 handle。
+至少暴露：`put_duration_seconds{stage}`、`get_duration_seconds{stage}`、
+`erasure_quorum_failures_total{op}`、`bitrot_mismatch_total`、
+`buffer_pool_acquire_total{class}`、`disk_errors_total{kind}`。
+
+```bash
+git add crates/server/src/metrics.rs
+git commit -m "feat(server): prometheus metrics endpoint"
+```
+
+---
+
+### Task 6.3: 启动与关闭编排
+
+**Files:** Create `crates/server/src/startup.rs`、`crates/server/src/config_load.rs`
+
+- [ ] **Step 1: 写测试**
+
+```rust
+#[tokio::test]
+async fn refuses_to_start_on_inconsistent_formats() {
+    // 两盘 format.json 的 shared_identity 不一致 → 启动失败且错误信息指明是哪些盘
+}
+
+#[tokio::test]
+async fn refuses_to_reformat_reachable_disks() {
+    // 一盘有数据、一盘空白 → 必须拒绝，不能把有数据的盘当新盘初始化
+}
+
+#[tokio::test]
+async fn shutdown_cleanly_stops_accepting_then_drains() { }
+```
+
+- [ ] **Step 2-4: 实现、跑测试、提交**
+
+启动顺序：解析配置 → 打开各盘 → 读/校验 `format.json` → 构造 `Pool` →
+`mark_stage(StorageReady)` → 起 HTTP 服务。
+关闭：停止接受新连接 → 等待在飞请求（带超时）→ 退出。
+所有长生命周期任务绑定 `CancellationToken`。
+
+```bash
+git add crates/server/src/startup.rs crates/server/src/config_load.rs crates/server/src/main.rs
+git commit -m "feat(server): startup/shutdown orchestration with format validation"
+```
+
+---
+
+### Task 6.4: 端到端验收
+
+**Files:** Create `tests/acceptance.sh`
+
+- [ ] **Step 1: 写验收脚本**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# 启动 6 盘 4+2 实例（4 数据分片 + 2 校验分片 = 6 块盘）
+mkdir -p /tmp/rs/{d1,d2,d3,d4,d5,d6}
+cargo run -p rstore-server -- --volumes /tmp/rs/d{1,2,3,4,5,6} --port 9000 &
+SERVER_PID=$!
+sleep 3
+
+# 1. 客户端冒烟
+bash tests/compat/aws_cli.sh
+bash tests/compat/mc.sh
+bash tests/compat/rclone.sh
+
+# 2. 容错：停掉两块盘（用 chmod 000 模拟，或直接删除目录权限）
+#    → 读仍成功
+# 3. 恢复后校验数据完整
+
+kill $SERVER_PID
+echo "ACCEPTANCE: OK"
+```
+
+- [ ] **Step 2: 运行，直到全部通过**
+
+Run: `bash tests/acceptance.sh`
+Expected: 输出 `ACCEPTANCE: OK`
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add tests/acceptance.sh
+git commit -m "test: end-to-end acceptance script"
+```
+
+---
+
+## 完成检查清单
+
+MVP 交付时必须全部为真：
+
+- [ ] `cargo build --workspace` 无 warning
+- [ ] `cargo test --workspace` 全绿
+- [ ] `cargo clippy --all-targets -- -D warnings` 通过
+- [ ] `bash scripts/check-layer-deps.sh` 退出码 0
+- [ ] `bash tests/acceptance.sh` 输出 `ACCEPTANCE: OK`
+- [ ] 4+2 配置下：掉 2 盘可读、掉 2 盘可写、掉 3 盘读返回 `ReadQuorum` 而非错误数据
+- [ ] `FaultyDisk` 注入静默字节损坏时，读路径能检出 `BitrotMismatch`
+- [ ] 崩溃点测试覆盖 DESIGN §12.3 的全部窗口
+- [ ] `rstore-s3-compat` 中每个中间件都有对应的冒烟测试，且注释指明来源客户端
+- [ ] DESIGN §1.2 的非目标清单中，没有任何一项被意外实现（范围不蔓延）
+
+---
+
+## 风险与注意事项
+
+| 风险 | 应对 |
+|---|---|
+| `reed-solomon-simd` 的 API 与预期不符 | Task 1.3 已把库调用完全封在门面内；若签名不同，只改 `encode`/`decode` 内部，测试不变 |
+| 各平台 `read_exact_at` 差异（Windows 无 `FileExt::read_exact_at`） | `fsx.rs` 用 seek + read 的通用实现；Linux/macOS 再加 `#[cfg]` 优化路径 |
+| 单节点下 rename 的持久性依赖文件系统 | `sync_file_and_parent` 必须先 fsync 文件再 fsync 父目录，Task 3.2 有专门测试 |
+| LIST 全盘扫描在大数据集上很慢 | MVP 明确接受，接口留挂钩位；不要在这一阶段引入索引（YAGNI） |
+| 崩溃点测试难以稳定复现 | 用 `FaultyDisk::FailAfter` 精确控制，而非依赖真实 kill；不确定的路径不要写进测试 |
+
+---
+
+*本计划对应 `docs/DESIGN.md` v1。计划与设计冲突时，先修正设计文档再改计划。*
