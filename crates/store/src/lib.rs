@@ -7,6 +7,8 @@ pub mod get;
 pub mod pool;
 pub mod put;
 pub mod quorum;
+#[cfg(test)]
+mod quorum_boundaries;
 pub mod reader;
 pub mod set;
 #[cfg(test)]
