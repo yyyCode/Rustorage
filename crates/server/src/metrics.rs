@@ -82,7 +82,8 @@ impl Metrics {
         }
     }
 
-    /// 记一次盘错误，按错误类型（如 `transient` / `permanent`）分档。
+    /// 记一次盘错误，按错误类型（`transient` / `corrupt` / `fatal`，
+    /// 对应 `DiskError` 的三级分类）分档。
     pub fn record_disk_error(&self, kind: &str) {
         if self.enabled {
             inc_labeled(&self.disk_errors, kind);

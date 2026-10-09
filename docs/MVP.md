@@ -8182,6 +8182,14 @@ fn exposes_prometheus_text_format() {
 至少暴露：`put_duration_seconds{stage}`、`get_duration_seconds{stage}`、
 `erasure_quorum_failures_total{op}`、`bitrot_mismatch_total`、`disk_errors_total{kind}`。
 
+> **`{stage}` 在 MVP 只能是占位值 `total`。** 上面测试钉住的 API 是
+> `record_put(Duration)` / `record_get(Duration)`——**不带 stage 参数**，而 MVP 里
+> 没有任何调用方能提供「rename 阶段 / fsync 阶段分别是多久」这种细分。所以序列
+> 会渲染成 `put_duration_seconds{stage="total"} 0.003`，含义是**整体**耗时。
+> 加这个标签而不是干脆去掉它，是为了让序列名一出现就和 DESIGN §18.2 一致——
+> 将来调用方真的能报阶段时，这是**加一个标签值**，不是改一个指标名。
+> （这是计划自己的内部矛盾：API 面与指标名要求对不上，实现时以 API 面为准。）
+
 时长类指标的**累计值只用 `AtomicU64` 存「纳秒总和」**，不做桶（Histogram 要的是一组
 边界，而 MVP 没有分位数消费方，加了只会得到一份没人看的输出）。`render()` 里除以
 `1e9` 输出秒。`{label}` 是用 `HashMap<&'static str, AtomicU64>` 还是固定几个计数器
@@ -8745,6 +8753,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **错误 XML 只有 `Code` + `Message`** | DESIGN §15.4 要求四要素，但 s3s 的 `S3Error` 序列化器（`src/error/mod.rs:170`）**把 `Resource` 那两行注释掉了**，`RequestId` 也只有调用过 `set_request_id` 才出现——而全库无人调用它。要补只能绕开 s3s 自己改写 XML 字符串 | — | 真需要时在组合根加一层中间件做 XML 注入；`RequestId` 更简单的做法是给 `to_s3_error` 传一个请求 id。**同样是对 DESIGN 的静默遗漏** |
 | **`S3Response::with_status` 在 `S3` trait 路径上是空操作** | s3s 0.17 的生成 operation 只取 `s3_resp.output`/`.headers`/`.extensions`，**不读 `.status`**（全库唯一读它的地方是 `CustomRoute` 分支，`src/ops/mod.rs:467`）。所以 handler 想返回非默认状态码只有三条路：靠 `output` 字段隐含（`content_range` → 206、`DeleteObject` 无字段也硬编码 204）、走 `serialize_error` 的错误通道（304 就是这么做的）、或挂 `S3Error` 的码。**日后若要做 `CopyObject` 的 201、或 206 以外的成功码，先回来看这条**——写 `with_status` 会**静默**变成 200 | 5.10 | 无上游修复可等（0.17 的生成器就是这样）。真要任意状态码只能自己 wrap `S3Service`，那是 Phase 2 中间件层的事 |
 | **DESIGN §14.2 的 7 层服务栈只落地了 compat 栈** | `CatchPanic` / `RateLimit` / `ReadinessGate` / `RequestId` / `Trace` 五层**在 M1~M6 里没有任何任务**（`grep CatchPanic\|RateLimit\|RequestId docs/MVP.md` 在实现任务里零命中）。6.1 只做了 `/health`、`/ready` 两个**端点**，不是「未就绪时把 s3s 挡在外面」的那层中间件；handler 里 panic 的表现是连接被断开，而不是 500 | — | Phase 2。**静默遗漏**，写在这里让最终复审看得见。`CatchPanic` 若要补，位置是 `crates/server` 的 tower 栈（`rstore-s3` 看不见 s3s 之外的层，接不进去） |
+| **指标的动态标签族走 `Mutex<HashMap<..>>`，不是 lock-free handle** | DESIGN §18.2 设想的是「热路径用 `LazyLock` 缓存 handle」。6.2 为了不引入 `prometheus` crate，`erasure_quorum_failures_total{op}` 与 `disk_errors_total{kind}` 每次 `record_*` 都先加一次互斥锁去取那一格计数器——锁只守护注册表查询、临界区极短，但确实进了热路径。**没有任何实测数据**：MVP 既没有并发压测，也还没有调用方（第一个调用方是 6.3） | 6.2 | Phase 2。有两条更轻的路：给 `op` / `kind` 这两个**闭合**的标签域用固定计数器 + `&str → 索引` 的 `match`（最省事，还顺手去掉锁中毒分支），或照设计用 `Arc<AtomicU64>` + 读一次缓存句柄 |
 | **单节点** | 无多节点、无 heal 的调度者。DESIGN §17 说 heal 由「观测到 `Corrupt`」触发：目前 `Corrupt` 会被分类、记录、参与 quorum 判定，但**没有自动修复流程** | — | Phase 3 |
 
 > **加新限制时，必须同时确认代码里有对应的拒绝路径。** 比如「不支持 multipart」
