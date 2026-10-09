@@ -6380,7 +6380,14 @@ async fn create_bucket(&self, req: S3Request<CreateBucketInput>)
 ```
 
 `delete_bucket` / `head_bucket` 同形。`head_bucket` 的输出四个字段**全部留 `None`**——
-MVP 不实现 region，`aws s3 mb` 与 `mc` 都不依赖它。
+MVP 不实现 region，`aws s3 mb` 不依赖它。
+
+> **但 `mc` 依赖 `GetBucketLocation`——原计划这句写的是「`mc` 也不依赖它」，已被 Task 5.9
+> 的实跑推翻。** 默认参数的 `mc alias set` 会先发一次 region 探测
+> `GET /probe-bsign-<随机串>/?location=`（`mc --debug` 实测），拿到 s3s 默认的
+> `501 NotImplemented` 就判定「该别名不可用」——**建桶都还没开始就失败了**。
+> 该操作已由 Task 5.9 补进 `impl_s3.rs`。教训记在这里：**「某客户端不依赖 X」这类断言，
+> 必须在 5.9 用真实客户端证伪过才算数**；本节其余同类判断请一并按此重新掂量。
 
 `list_buckets`：
 
@@ -7258,19 +7265,25 @@ export RCLONE_CONFIG_RS_ACCESS_KEY_ID=rustorage
 export RCLONE_CONFIG_RS_SECRET_ACCESS_KEY=rustorage-secret
 export RCLONE_CONFIG_RS_FORCE_PATH_STYLE=true
 
-rclone mkdir rs/test-bucket
+# **remote 语法是 `rs:路径`，冒号不能省。** 写成 `rs/test-bucket`（不带冒号）时
+# rclone 把它当作**本地相对目录**：全程一次都没碰服务端，却在仓库根建出
+# `rs/test-bucket/1m.bin`、并且**退出码 0**。这是本计划里第二处「静默绿灯」——
+# 脚本说 OK，服务端其实没被测试过。（Task 5.9 实跑时踩到并修正。）
+# 对照：`mc` 的写法**就是** `rs/test-bucket`（斜杠，无冒号），别把两边改成一模一样。
+rclone mkdir rs:test-bucket
 mkdir -p "$WORK/src"
 head -c 1048576 /dev/urandom > "$WORK/src/1m.bin"
-rclone copy "$WORK/src" rs/test-bucket/
+rclone copy "$WORK/src" rs:test-bucket/
 # **必须是 `copyto`，不能写 `copy`。** `rclone copy <文件> <路径>` 把目标当**目录**，
 # 实际产出 `$WORK/roundtrip.bin/1m.bin`，而且**退出码是 0**（已实测：`rclone copy
 # src/a.bin dst/out.bin` 建出 `dst/out.bin/a.bin`，静默成功）。下面那行 `cmp` 于是
 # 变成「拿文件比目录」而失败，报错完全指不到真正的原因。`copyto` 是文件到文件的语义。
-rclone copyto rs/test-bucket/1m.bin "$WORK/roundtrip.bin"
+rclone copyto rs:test-bucket/1m.bin "$WORK/roundtrip.bin"
 cmp "$WORK/src/1m.bin" "$WORK/roundtrip.bin"
 # `check` 会比对大小与 **ETag**——它正是 #3 那个「HEAD 的 ETag 必须与 LIST 的一致」
 # 的验收点。ETag 两处算法分叉时，这条会失败而 `cmp` 不会。
-rclone check "$WORK/src" rs/test-bucket --one-way
+# **看输出里的 `S3 bucket …` 而不是 `Local file system …`**：后者说明冒号又漏了。
+rclone check "$WORK/src" rs:test-bucket --one-way
 echo "rclone smoke: OK"
 ```
 
@@ -7285,15 +7298,37 @@ echo "rclone smoke: OK"
 Run: `bash tests/compat/aws_cli.sh`
 Expected: 首次运行**允许失败**——失败项就是 compat 层的需求来源
 
-- [ ] **Step 3: 为每个失败项添加 compat 中间件**
+- [ ] **Step 3: 先按失败项的「性质」分类，再决定修在哪一层**
 
-**必须遵守 DESIGN §15.3 的准入规则**：每条中间件带注释
+**计划原文把这一步叫「为每个失败项添加 compat 中间件」，这个模型是错的。**
+它假定**所有**失败都是「同一操作上的行为差异」。Task 5.9 的实跑结果是：
+观察到的两处失败**没有一条**属于这一类，两处都是**缺失的标准 S3 操作**。
+
+| 现象 | 性质 | 正确归属 |
+|---|---|---|
+| `mc alias set` 失败（`GetBucketLocation` 501） | 缺失的标准操作 | 补在 `impl_s3.rs`（协议主干） |
+| `mc rm` 失败（`DeleteObjects` 501，**删单个对象也走批量**） | 缺失的标准操作 | 补在 `impl_s3.rs` |
+| 同一操作上的行为分歧（例如某客户端少发 `Content-Length`） | 行为差异 | 这才轮到 `crates/s3-compat` |
+
+**判据一句话：「S3 协议里本来就该有的操作」还是「同一操作上的行为分歧」？**
+前者补主干，后者才进 compat 层。把标准操作用中间件伪造出来，等于把路由/端点塞进
+中间件层——违反 DESIGN §15.2 对中间件的定位，也让 `S3Route` 那层白白绕开。
+补在主干的每一条，都要配一个**移除即红**的回归测试（本次三条，
+`impl_s3.rs` 里的 `get_bucket_location_*` / `delete_objects_*`）。
+
+**`crates/s3-compat` 最终保持为空**（只有一句模块文档）——这不是偷懒：本次观察到的失败
+没有一条属于「行为差异」那一类。**不允许凭猜测添加中间件。**
+
+---
+
+**（下面这段只在确实观察到「行为差异」类失败时才用。）** 必须遵守 DESIGN §15.3 的准入
+规则：每条中间件带注释
 
 ```rust
 // compat: aws-cli — PUT 空对象时不发 Content-Length，需归一化为 0 — see tests/compat/aws_cli.sh
 ```
 
-并且该中间件被移除时，对应的冒烟测试必须失败。**不允许凭猜测添加中间件。**
+并且该中间件被移除时，对应的冒烟测试必须失败。
 
 > **`crates/s3-compat` 的接线缺口，动手前先看这条。** 护栏 allowlist 给它的是
 > `{rstore-common}`，而 `rstore-s3` 的允许集是 `{rstore-common, rstore-api}`——
@@ -7316,9 +7351,19 @@ Expected: 首次运行**允许失败**——失败项就是 compat 层的需求�
 
 - [ ] **Step 4: 三个脚本全部通过后提交**
 
+**`git add` 的列表要照着**实际**改动写，别照抄下面这段。** 原计划写的是
+`git add crates/s3-compat/ tests/compat/`，而它和第 3 步自己给的接线方案是矛盾的：
+接线方案说中间件要么挂在 `crates/server`、要么落在 `impl_s3.rs`，**都**不在那个
+add 列表里。按实际改动 add，提交前用 `git status --porcelain` 复核一遍。
+
+**提交信息也别沿用原来的 subject。** 原计划的
+`feat(s3-compat): client ecosystem compatibility layers driven by smoke tests`
+会说「加了 compat 层」，而本次**一个中间件都没加**（改动全在 `crates/s3` 与
+`tests/`）。标题要如实。本次实际提交：
+
 ```bash
-git add crates/s3-compat/ tests/compat/
-git commit -m "feat(s3-compat): client ecosystem compatibility layers driven by smoke tests
+git add tests/compat/ crates/s3/src/impl_s3.rs
+git commit -m "test(compat): 客户端冒烟脚本 + 补齐 mc 依赖的两个 S3 操作
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
@@ -9004,6 +9049,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | 限制 | 表现 | 所属 Task | 日后要补时 |
 |---|---|---|---|
 | **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`（前提是**请求形状本身合法**：`CompleteMultipartUpload` 若不带合法的 XML body，先在 s3s 的解析层拿到 `400 MalformedXML`，还没轮到我们的 501——这是 s3s 的正常前置校验，不是我们的行为）。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
+| **未覆写的 S3 操作一律「静默 501」** | s3s 的 `S3` trait 每个方法默认实现都是 `Err(s3_error!(NotImplemented, "… is not implemented yet"))`，所以**「漏实现」与「刻意不支持 multipart」在响应上长得一模一样**（都是 501 `NotImplemented`）。Task 5.9 正是靠这一点发现 `GetBucketLocation` 与 `DeleteObjects` 其实是漏实现。判据：501 的 `Message` 里带 `is not implemented yet` 的就是 s3s 的默认实现，不是我们写的。**已确认仍会 501 的**有 `GetObjectLockConfiguration`（mc 容忍它，不影响冒烟） | 5.9 | 照 5.9 的 Step 3 先分类：「协议主干缺失」补 `impl_s3.rs` 并配移除即红的回归测试；确认是「刻意不支持」才留在本表 |
 | **载荷上限约 8 MiB** | 同上一条的推论：交付给客户端的大对象只能靠 < 8 MiB 的单次 PUT | 5.6 / 5.9 | 同 5.6 |
 | **条件请求只覆盖 GET / HEAD** | `PUT` 带 `If-None-Match: *`（条件创建）**不求值**，会被当成普通 PUT。`If-Range` 也不支持 | 5.10 | 需要先给 `ObjectStore` 加原子的 conditional-put——在 S3 层「先查再写」是 TOCTOU，不能这么补 |
 | **含空段 / `.` / `..` / 首尾斜杠的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b`、`a/`、`/a` 都当成与 `a/b`、`a` 不同的独立 key，我们一律 400 `InvalidArgument`。**客户端真能构造出这些 key**，不是理论边角：s3s 在 `ops/mod.rs:696` 对 URI path 做 `urlencoding::decode`，所以 `--key 'a%2F%2Fb'` 解码后到达校验的就是 `a//b`。实际会撞上的场景是**目录占位对象**（`aws s3api put-object --bucket b --key dir/` —— 只为了建一个「文件夹」），以及任何以 `/` 结尾的 key | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
