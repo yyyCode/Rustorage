@@ -2163,6 +2163,22 @@ pub trait DiskAPI: Send + Sync {
 }
 ```
 
+`FileStat` 与 `DiskId` 的形状（原计划未给出，这里补上——否则实现者只能自己拍脑袋）：
+
+- `FileStat` 只有 disk 层用（不是线格式），直接定义在 `crates/disk/src/lib.rs`：
+
+  ```rust
+  #[derive(Debug, Clone, PartialEq, Eq)]
+  pub struct FileStat { pub size: u64, pub is_dir: bool }
+  ```
+
+  `size` 是 M4 读路径需要的（决定读多少字节），**别省**。
+- `DiskId` 放 `crates/common/src/disk_id.rs`（定义在 common 而非 disk：Task 3.3 的
+  `format.json` 也要用它，而依赖方向是 `disk → meta`，meta 无法反向依赖 disk）。
+  API：`new_v4()` / `from_bytes([u8;16])` / `as_bytes() -> &[u8;16]`，
+  另加 `Debug/Clone/Copy/PartialEq/Eq/Hash/Ord` 与 `serde`（Task 3.3 要把它写进 `format.json`）。
+  `Display` 用 uuid 的 canonical 形式，**别自己拼十六进制**。
+
 - [ ] **Step 2: 写契约测试（对任意实现都应通过）**
 
 `crates/disk/src/lib.rs` 中放一个 `pub mod contract_tests`，内含一个
@@ -2178,12 +2194,30 @@ pub trait DiskAPI: Send + Sync {
 > 契约测试对**任意** `D: DiskAPI` 都要通过，所以不能依赖具体实现的路径布局。
 > `run_all` 内部自己造一条临时相对路径（如 `__contract__/probe`），用完删掉。
 
-- [ ] **Step 3: 提交（此时还没有实现，仅契约）**
+- [ ] **Step 3: 门禁与提交（此时还没有实现，仅契约）**
+
+本任务**没有「跑测试看它变红」的环节**（无实现），门禁是**编译通过 + clippy 干净**：
 
 ```bash
-git add crates/disk/src/lib.rs
-git commit -m "feat(disk): DiskAPI trait and shared contract test suite"
+cargo fmt --all && cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+bash scripts/check-layer-deps.sh ; echo "guard exit=$?"
 ```
+
+```bash
+git add crates/disk/ crates/common/
+git commit -m "feat(disk): DiskAPI trait and shared contract test suite
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+> **原计划这里写的是 `git add crates/disk/src/lib.rs`——错的**：会漏掉本任务同时改动的
+> `crates/common/src/disk_id.rs`、`crates/common/src/error.rs`、`crates/common/src/lib.rs`
+> 和 `crates/disk/Cargo.toml`，提交出来直接编译不过。
+
+> `run_all` 在 3.1 阶段无人调用——这是**刻意的**，契约先于实现存在。因为是 `pub`，
+> 不会有 dead-code 警告，别为了消除警告加 `#[allow]` 或提前写实现。
 
 ---
 
@@ -2193,6 +2227,9 @@ git commit -m "feat(disk): DiskAPI trait and shared contract test suite"
 - Create: `crates/disk/src/local.rs`
 - Create: `crates/disk/src/fsx.rs`
 - Create: `crates/disk/src/error_map.rs`
+- **Modify: `crates/disk/src/lib.rs`**（加 `pub mod local; pub mod fsx; pub mod error_map;`
+  与 `pub use local::LocalDisk;`）——原计划漏了这条。**不加模块声明，这三个文件根本不会被编译**，
+  `cargo test -p rstore-disk` 会报「找不到 `LocalDisk`」而不是你预期的编译错误。
 - Test: `crates/disk/src/local.rs` 的 `#[cfg(test)]`，用 `tempfile::TempDir`
 
 - [ ] **Step 1: 写失败测试**
@@ -2270,11 +2307,29 @@ impl LocalDisk {
 ```
 
 `fsx.rs` 提供阻塞原语（`write_all_fsync`、`rename_fsync`、`walk`），
-`local.rs` 用 `tokio::task::spawn_blocking` 包装。**关键约束**：
+`local.rs` 用 `tokio::task::spawn_blocking` 包装。**注意 `spawn_blocking` 要求闭包是
+`'static + Send`**——不能捕获 `&self` 或 `&str` 借用的路径。先 clone 出
+`Arc<PathBuf>`（盘根）与 `PathBuf`（目标）再 move 进闭包；
+`&self` 上的方法这么写：
+```rust
+let root = Arc::clone(&self.root);
+spawn_blocking(move || fsx::write_all_fsync(&root, &rel_path, data))
+    .await
+    .map_err(|_| DiskError::Transient(TransientKind::Io))?
+```
+另：workspace 开了 `clippy::await_holding_lock = "deny"`，**不要在 `await` 期间持有
+`std::sync::Mutex` 守卫**——若为跨平台读写做了加锁兜底，用 `tokio::sync::Mutex`
+或把临界区整个移进 `spawn_blocking` 里。**关键约束**：
 
-- **路径逃逸检查**：把所有 `rel_path` 规范化后确认仍在盘根之下，否则 `Fatal`；
-- `read_exact_at` 用 `File::read_exact_at`（`std::os::unix::fs::FileExt`）或
-  Windows 上等价的 seek+read；短读 → `Transient`；
+- **路径逃逸检查**：把所有 `rel_path` 规范化后确认仍在盘根之下，否则 `Fatal(PathEscape)`。
+  **用 `Path::components()` 逐段判断，不要用 `starts_with("..")` 字符串前缀检查**——
+  后者漏掉 `a/../../b`。且目标路径可能尚不存在，**不能依赖 `canonicalize()`**
+  （它会去访问文件系统并失败）。同时要拒绝绝对路径与 Windows 盘符前缀
+  （`C:\...`、`\...`、`/...`）；
+- `read_exact_at` **要跨平台**：本机是 Windows，CI 是 Linux——
+  `std::os::unix::fs::FileExt::read_at` 与 `std::os::windows::fs::FileExt::seek_read`
+  是两个不同的 trait，需要 `#[cfg]` 分流（或退回 seek+read，但那要处理并发读的共享游标）。
+  **原计划只提了 unix 那条**。短读 → `Transient(ShortRead)`；
 - `sync_file_and_parent` 必须先 fsync 文件再 fsync 父目录（顺序不可颠倒，否则 rename 可能不持久）；
 - `error_map.rs`：`NotFound` → `DiskError::NotFound`；`UnexpectedEof`/`WouldBlock`/`TimedOut`
   → `Transient`；权限/只读挂载 → `Fatal`；**其余默认 `Transient`**（宁可重试，不误判为损坏）。
@@ -2285,8 +2340,10 @@ Run: `cargo test -p rstore-disk`
 Expected: 全部 PASS
 
 ```bash
-git add crates/disk/src/
-git commit -m "feat(disk): LocalDisk with fsync-aware rename and path escape guard"
+git add crates/disk/
+git commit -m "feat(disk): LocalDisk with fsync-aware rename and path escape guard
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
