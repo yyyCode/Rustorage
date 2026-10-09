@@ -1200,6 +1200,8 @@ git commit -m "feat(meta): shard distribution permutation with property tests"
 
 **Files:**
 - Create: `crates/checksum/src/lib.rs`
+- Modify: `crates/checksum/Cargo.toml`（加 `[dev-dependencies] proptest.workspace = true`；
+  `blake3.workspace = true` 已在 `[dependencies]` 里，无需再加）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -1270,7 +1272,11 @@ Expected: 编译失败，`bitrot_hash` 未定义
 pub const HASH_LEN: usize = 32;
 
 /// 具名 key 常量。**不得内联到调用点**——改变它会让所有既有数据校验失败。
-pub const BITROT_KEY_V1: [u8; 32] = *b"rustorage.bitrot.key.v1\0\0\0\0\0\0\0\0";
+///
+/// 长度必须恰好 32：`"rustorage.bitrot.key.v1"` 是 23 字节，补 **9** 个 `\0`
+/// 凑满 32。下面的编译期断言兜住数错 `\0` 的情况（数错会直接编译失败）。
+pub const BITROT_KEY_V1: [u8; 32] = *b"rustorage.bitrot.key.v1\0\0\0\0\0\0\0\0\0";
+const _: () = assert!(BITROT_KEY_V1.len() == 32);
 
 pub fn bitrot_hash(block: &[u8]) -> [u8; HASH_LEN] {
     let mut h = blake3::Hasher::new_keyed(&BITROT_KEY_V1);
@@ -1288,11 +1294,9 @@ pub fn bitrot_size(size: u64, shard_size: u64) -> u64 {
 }
 ```
 
-> 注意 `BITROT_KEY_V1` 必须是恰好 32 字节。上面这个字面量：`"rustorage.bitrot.key.v1"` 是 23 字节，
-> 加 9 个 `\0` 共 32。实现时用 `const fn` 或编译期断言校验长度：
-> ```rust
-> const _: () = assert!(BITROT_KEY_V1.len() == 32);
-> ```
+> **已知边界**：`bitrot_size(size, 0)` 会因 `div_ceil` 除零 panic。调用方保证
+> `shard_size > 0`（分片尺寸来自纠删码布局，恒为正），本层不做防御——MVP 阶段
+> 记录在案，不额外加断言。
 
 - [ ] **Step 4: 跑测试，并钉住 KAT**
 
@@ -1305,7 +1309,7 @@ Expected: 全部 PASS
 - [ ] **Step 5: 提交**
 
 ```bash
-git add crates/checksum/
+git add crates/checksum/ Cargo.lock
 git commit -m "feat(checksum): keyed blake3 bitrot hashing with pinned KAT"
 ```
 
@@ -1314,8 +1318,10 @@ git commit -m "feat(checksum): keyed blake3 bitrot hashing with pinned KAT"
 ### Task 1.3: 纠删码门面
 
 **Files:**
-- Create: `crates/erasure/src/lib.rs`
 - Create: `crates/erasure/src/error.rs`
+- Modify: `crates/erasure/src/lib.rs`（现只有一行 doc comment）
+- Modify: `crates/erasure/Cargo.toml`（加 `[dev-dependencies] proptest.workspace = true`；
+  `reed-solomon-simd` / `thiserror` / `lru` 已在 `[dependencies]` 里）
 - Test: `crates/erasure/src/lib.rs` 的 `#[cfg(test)]`
 
 - [ ] **Step 1: 定义接口（这就是契约，先写下来）**
@@ -1358,7 +1364,7 @@ pub enum ErasureConstructionError {
     ZeroShardSize,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ErasureError {
     #[error("expected {expected} shards, got {got}")]
     WrongShardCount { expected: usize, got: usize },
@@ -1477,10 +1483,19 @@ Expected: 编译失败，`Codec` 方法未实现
 `decode(original_count, recovery_count, original_shards, recovery_shards)`，
 以 `HashMap<usize, Vec<u8>>` 传入索引），把库调用完全包在门面内。
 
+`lib.rs` 顶部要 `pub mod error;` 并 `pub use error::{ErasureConstructionError, ErasureError};`，
+外部只见门面类型，不感知 `error` 模块路径。
+
 关键点：
-- 所有分片长度必须相等，否则返回 `UnequalShardLength`（不要交给库去 panic）；
-- 库返回 `Result`，映射到 `ErasureError::Backend`；
-- `decode` 中统计非 `None` 槽位数，`< data` 时**先返回** `TooFewShards`，不调用库。
+- **长度语义要钉死**：`encode` 要求 `data_shards.len() == data` 且**每片长度 == `self.shard_size`**；
+  `decode` 要求 `slots.len() == total_shards` 且每个非 `None` 槽位长度 == `self.shard_size`。
+  长度不符一律返回 `UnequalShardLength`（不要交给库去 panic）。不做"长度相等即可"的宽松判定——
+  把 `shard_size` 收严，畸形输入才有唯一的解释。
+- **槽位如何映射到库**：`slots[0..data]` 是数据分片，`slots[data..total]` 是校验分片。
+  `Some` 的槽位按各自下标放进库要求的 `HashMap<usize, Vec<u8>>`；
+  两个 map 都为空时库会报错，但那时必然已经被 `TooFewShards` 拦下。
+- 库返回 `Result`，映射到 `ErasureError::Backend`（用 `format!("{e}")` 存字符串）。
+- `decode` 中**先**统计非 `None` 槽位数，`< data` 时立即返回 `TooFewShards`，不调用库。
 
 - [ ] **Step 5: 跑测试确认通过**
 
@@ -1490,7 +1505,7 @@ Expected: 全部 PASS（属性测试默认 256 次）
 - [ ] **Step 6: 提交**
 
 ```bash
-git add crates/erasure/
+git add crates/erasure/ Cargo.lock
 git commit -m "feat(erasure): codec facade with roundtrip and fail-closed property tests"
 ```
 
@@ -1500,6 +1515,7 @@ git commit -m "feat(erasure): codec facade with roundtrip and fail-closed proper
 
 **Files:**
 - Create: `crates/erasure/src/cache.rs`
+- Modify: `crates/erasure/src/lib.rs`（加 `pub mod cache;` 与 `pub use cache::CodecCache;`）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -1546,13 +1562,25 @@ Expected: 编译失败，`CodecCache` 未定义
 `get` 时先查缓存，未命中则 `Codec::new` 并插入；**构造失败不插入**。
 默认容量 32（对应 DESIGN §10.2）。
 
+> **`lru` 的构造参数是 `NonZeroUsize`，不是 `usize`**（`lru = "0.12"`）——直接传 `usize` 编译不过。
+> 容量 0 无意义（什么都存不下），收敛到 1 而不是 panic：
+> ```rust
+> pub fn new(capacity: usize) -> Self {
+>     let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+>     Self { inner: Mutex::new(LruCache::new(cap)) }
+> }
+> ```
+>
+> 注意 `CodecCache::new(4)` 接收的是 `usize`（测试就是这么调的），转换发生在内部。
+> `Mutex` 提供内部可变性，所以 `get` / `len` 都用 `&self`——测试里的 `let c = ...` 是不可变绑定。
+
 - [ ] **Step 4: 跑测试确认通过并提交**
 
 Run: `cargo test -p rstore-erasure`
 Expected: 全部 PASS
 
 ```bash
-git add crates/erasure/src/cache.rs
+git add crates/erasure/
 git commit -m "feat(erasure): LRU cache for codec shells"
 ```
 
@@ -1565,7 +1593,10 @@ git commit -m "feat(erasure): LRU cache for codec shells"
 **Files:**
 - Create: `crates/meta/src/fileinfo.rs`
 - Create: `crates/meta/src/keys.rs`
+- Modify: `crates/common/src/error.rs`（加 `DiskError` / `CorruptKind`，见 Step 3 末尾）
+- Modify: `crates/meta/src/lib.rs`（加 `pub mod fileinfo;`、`pub mod keys;` 与相应 `pub use`）
 - Test: 同文件 `#[cfg(test)]`
+- 无需改 `Cargo.toml`：`serde` / `uuid` / `rmp-serde` / `thiserror` 已在 `[dependencies]`，`proptest` 已在 `[dev-dependencies]`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1580,6 +1611,14 @@ mod tests {
         let without = FileVersionHeader { version_id: None, ..Default::default() };
         assert_ne!(with_nil.version_id, without.version_id);
         assert!(with_nil.version_id.is_some());
+
+        // 内存里不同还不够——线格式上必须也不同，否则落盘后区分不出来。
+        let a = encode_header(&with_nil).unwrap();
+        let b = encode_header(&without).unwrap();
+        assert_ne!(a, b, "nil UUID 与 None 编码成了同样的字节");
+        // uuid 必须走原始 16 字节（bin），不是带连字符的字符串——
+        // 线格式一旦落盘不可改（DESIGN §8.3），在这里钉住。
+        assert!(!a.contains(&b'-'), "uuid 被编码成了人类可读字符串: {a:?}");
     }
 
     #[test]
@@ -1609,12 +1648,87 @@ Expected: 编译失败
 按 DESIGN §8.2 定义 `FileVersionHeader`、`VersionType`、`Flags`、`ShallowVersion`、
 `ObjectMeta`、`ObjectBody`、`PartInfo`。要点：
 
-- `mod_time: Option<u64>`：`None` 编码为 `0`，解码时 `0` 还原为 `None`；
+- `mod_time: Option<u64>`：`None` 编码为线格式的 `0`，解码时 `0` 还原为 `None`；
+  ——注意这是**对 DESIGN §8.2 原文 `mod_time: u64` 的有意收紧**（DESIGN 已同步改为
+  `Option<u64>`）：让「未设置」在类型里显式可表达，而不是靠 0 这个魔数。
+  代价是 epoch（真实的 0）被折叠为 `None`，这是可接受的——文件不可能真有 1970 年的 mtime。
 - `version_id: Option<Uuid>`：**nil UUID 与 `None` 必须在语义上不同**，编码时保留区别；
-- `data_dir` 存 **16 字节原始 UUID**；长度不是 16 → `Corrupt`，不是 `None`；
+- `data_dir: Option<Uuid>` 走 **16 字节原始 UUID**；载荷里长度不是 16 → `Corrupt`，不是 `None`；
 - header 必须携带 `ec_m` / `ec_n`，使 quorum 决策无需解析 body。
 
+`fileinfo.rs` 另外提供 header 级的编解码（container 级的编解码是 Task 2.2 的事）：
+
+```rust
+/// header 的 msgpack 编解码。`Option` ↔ 线格式的映射**只发生在这一处**。
+pub fn encode_header(h: &FileVersionHeader) -> Result<Vec<u8>, DiskError>;
+pub fn decode_header(bytes: &[u8]) -> Result<FileVersionHeader, DiskError>;
+```
+
+另外先钉住这几个最小形状，避免 M2 内部的任务依赖倒置（Task 2.3 才给
+`InlineData` 加帧化逻辑，但 Task 2.2 的样本就要构造它）：
+
+```rust
+/// 内联数据帧：version-key -> 原始字节（DESIGN §8.4）。
+/// **必须是 newtype 而不是 `type` 别名**——Task 2.3 要在它上面挂 `encode`/`decode`，
+/// 而类型别名不能带固有方法。`#[serde(transparent)]` 让它在 msgpack 上就是那个 map。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct InlineData(BTreeMap<String, Vec<u8>>);
+
+impl InlineData {
+    pub fn new() -> Self { Self(BTreeMap::new()) }
+    pub fn insert(&mut self, k: impl Into<String>, v: Vec<u8>) -> Option<Vec<u8>>;
+    pub fn get(&self, k: &str) -> Option<&[u8]>;
+    // encode / decode 在 Task 2.3 的 inline.rs 里实现（同一 crate 内可以跨模块 impl）
+}
+
+pub type OpaqueBody = Vec<u8>;                     // 懒解析的 body 原始字节
+```
+
+`Flags` 用 `u8` newtype + const 位（`FREE_VERSION` / `USES_DATA_DIR` / `INLINE_DATA`），
+提供 `empty()` / `contains()` / `insert()`；**不引入 `bitflags` 依赖**（workspace 里没有）。
+`VersionType` 是 `Object | DeleteMarker` 的普通 enum。凡是需要过 msgpack 的类型都 derive
+`serde::{Serialize, Deserialize}`。
+
 `keys.rs` 定义内部键常量（全部以 `x-rs-` 开头）与 `RUSTORAGE_KEY_PREFIX` 常量。
+
+**同时在 `crates/common/src/error.rs` 加共享错误词汇表**——`DiskError` 定义在 `common`
+而不是 `disk`，因为 meta 层也要表达「确定性损坏」，而依赖方向是 `disk → meta`，
+meta 不能反向依赖 disk：
+
+```rust
+/// 确定性损坏的种类。重试无意义，应触发 repair（DESIGN §17）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CorruptKind {
+    #[error("bad magic")]
+    BadMagic,
+    #[error("unsupported format version")]
+    UnsupportedVersion,
+    #[error("length mismatch")]
+    LengthMismatch,
+    #[error("malformed header")]
+    MalformedHeader,
+    #[error("crc mismatch")]
+    CrcMismatch,
+    #[error("bitrot checksum mismatch")]
+    BitrotMismatch,
+    #[error("invalid shard distribution")]
+    InvalidDistribution,
+}
+
+/// 磁盘/存储层错误。`#[non_exhaustive]`：`Transient` / `Fatal` 两个变体
+/// 在 M3 引入，届时属于非破坏性变更（DESIGN §17）。
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DiskError {
+    /// 对象/分片不存在。参与 quorum 计数时计为「缺失」，不计为「失败」。
+    #[error("not found")]
+    NotFound,
+    /// 确定性损坏。重试无意义，应触发 repair。
+    #[error("corrupt: {0}")]
+    Corrupt(CorruptKind),
+}
+```
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -1622,7 +1736,7 @@ Run: `cargo test -p rstore-meta fileinfo`
 Expected: PASS
 
 ```bash
-git add crates/meta/src/fileinfo.rs crates/meta/src/keys.rs
+git add crates/meta/ crates/common/src/error.rs
 git commit -m "feat(meta): object metadata data model with nil/epoch semantics"
 ```
 
@@ -1632,6 +1746,7 @@ git commit -m "feat(meta): object metadata data model with nil/epoch semantics"
 
 **Files:**
 - Create: `crates/meta/src/container.rs`
+- Modify: `crates/meta/src/lib.rs`（加 `pub mod container;` 与 `pub use container::{encode, decode};`）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -1642,7 +1757,39 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn sample_meta() -> ObjectMeta { /* 构造一个含 2 个版本的样本 */ }
+    /// 两个版本的样本：一个普通对象 + 一个删除标记。
+    /// 刻意让两个 header 在 version_id / mod_time / data_dir 上都不同，
+    /// 这样任何一个字段的编解码出错都会在 roundtrip 里暴露。
+    fn sample_meta() -> ObjectMeta {
+        let obj = FileVersionHeader {
+            version_id: Some(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            ty: VersionType::Object,
+            size: 1234,
+            mod_time: Some(1_700_000_000_000_000_000),
+            ec_m: 4,
+            ec_n: 6,
+            flags: Flags::empty(),
+            data_dir: Some(Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0001)),
+        };
+        let marker = FileVersionHeader {
+            version_id: None,           // 与上面的 Some(Uuid) 形成对照
+            ty: VersionType::DeleteMarker,
+            size: 0,
+            mod_time: None,             // 与上面的 Some(..) 形成对照
+            ec_m: 4,
+            ec_n: 6,
+            flags: Flags::empty(),
+            data_dir: None,
+        };
+        ObjectMeta {
+            versions: vec![
+                ShallowVersion { header: obj, body: vec![0xde, 0xad, 0xbe, 0xef] },
+                ShallowVersion { header: marker, body: Vec::new() },
+            ],
+            inline: InlineData::new(),
+            meta_ver: 1,
+        }
+    }
 
     #[test]
     fn encode_decode_roundtrip() {
@@ -1662,10 +1809,20 @@ mod tests {
 
     #[test]
     fn detects_crc_mismatch() {
-        let mut bytes = encode(&sample_meta()).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
-        assert!(matches!(decode(&bytes), Err(DiskError::Corrupt(CorruptKind::CrcMismatch))));
+        let bytes = encode(&sample_meta()).unwrap();
+        // 必须翻转 body 里的字节：body 是不透明的，结构解析不受影响，才会稳定
+        // 走到 CRC 校验。翻转 header 区可能先报 MalformedHeader。
+        let needle = [0xde, 0xad, 0xbe, 0xef];
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("样本 body 应当出现在字节流中");
+        let mut tampered = bytes.clone();
+        tampered[pos] ^= 0xFF;
+        assert!(matches!(
+            decode(&tampered),
+            Err(DiskError::Corrupt(CorruptKind::CrcMismatch))
+        ));
     }
 
     #[test]
@@ -1684,7 +1841,9 @@ mod tests {
             bytes[pos] ^= mask;
             // 只要不 panic 且不返回 Ok 就算通过（翻转后仍合法的情况需排除 CRC 区）
             match decode(&bytes) {
-                Ok(_) => {}          // 极小概率翻转的是内联数据区，可接受
+                // 翻转落在 inline_data 区时 CRC 依然匹配（CRC 不覆盖内联帧），
+                // 解出 Ok 是合法结果。
+                Ok(_) => {}
                 Err(DiskError::Corrupt(_)) => {}
                 Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
             }
@@ -1703,20 +1862,53 @@ Expected: 编译失败
 严格按 DESIGN §8.1 的布局实现：
 
 ```
-magic "RSM1" | major u16 LE | minor u16 LE | version_count u16 LE
-[header(msgpack) | body_len u32 BE | body] × version_count
-CRC32C(以上全部)
+magic "RSM1" (4B) | major u16 LE | minor u16 LE | version_count u16 LE
+[ header(msgpack，自描述) | body_len u32 BE | body ] × version_count
+trailer CRC32C (u32 LE，覆盖从 magic 到最后一个 body 的字节)
+inline_data (msgpack map；可为空)
 ```
 
-实现顺序有讲究，**必须按此顺序做防御**：
+```rust
+pub fn encode(meta: &ObjectMeta) -> Result<Vec<u8>, DiskError>;
+pub fn decode(bytes: &[u8]) -> Result<ObjectMeta, DiskError>;
+```
 
-1. 长度 < 头部最小尺寸 → `Corrupt(LengthMismatch)`；
+**CRC 在 `inline_data` 之前，所以它不在文件末尾**——`crc32c(&bytes[..len-4])` 这种写法是错的。
+DESIGN §8.1 有意如此：CRC 只保护结构部分，且让「只读前缀即可完成 LIST/HEAD」的
+增量读成为可能。代价是解码必须**顺序解析**，走到记录结束处才知道 CRC 在哪。
+
+防御**必须按此顺序**：
+
+1. `bytes.len() < 14`（= 4+2+2+2+4）→ `Corrupt(LengthMismatch)`；
 2. magic 不符 → `Corrupt(BadMagic)`；
 3. `major != 1` → `Corrupt(UnsupportedVersion)`；
-4. 先校验 CRC（对整个前缀），再解析任何内容；
-5. 解析 `version_count` 时，**在分配 `Vec` 之前**用「剩余字节数 / 最小记录尺寸」做上界检查；
-6. 逐条读 `body_len`，**在分配之前**检查 `body_len <= 剩余字节`；
-7. `body` 存为不透明 `Vec<u8>`，不在这一步解析（懒解析）。
+4. `minor > 0` → `Corrupt(UnsupportedVersion)`（DESIGN §8.1：minor 过新也是确定性损坏）；
+5. 读 `version_count`（偏移 10..12）。**在分配之前**用「剩余字节数 / 最小记录尺寸」
+   做上界检查 → `Corrupt(LengthMismatch)`；
+6. 逐条解析记录：把 `rmp_serde::Deserializer` 套在 `&mut Cursor` 上读一个
+   `FileVersionHeader`（msgpack 自描述，读完 `cursor.position()` 就是边界，
+   **不需要长度前缀**）；随后读 `body_len u32 BE`，**分配之前**检查
+   `body_len <= 剩余字节` → `Corrupt(LengthMismatch)`；再读 `body_len` 字节作为
+   不透明 `Vec<u8>`。msgpack 解析失败 → `Corrupt(MalformedHeader)`；
+7. 记录读完处就是 CRC：算 `crc32c(&bytes[..crc_pos])`，与
+   `u32::from_le_bytes(bytes[crc_pos..crc_pos + 4])` 比对，不符 → `Corrupt(CrcMismatch)`；
+8. CRC 通过后，剩余字节 `bytes[crc_pos + 4..]` 用 msgpack 解成 `InlineData`
+   （空切片 → 空 map）。失败 → `Corrupt(MalformedHeader)`。
+
+`encode` 侧对称：记录写完后写 u32 LE 的 CRC，再写 `rmp_serde::to_vec(&meta.inline)`。
+
+> 这里直接调 `rmp_serde::to_vec`（Task 2.3 才会给 `InlineData` 加上
+> `encode`/`decode` 方法）。等 2.3 落地后，把这一处和对应的解码处替换成
+> `meta.inline.encode()` / `InlineData::decode(tail)`——别留着两份做着同一件事的代码。
+
+> **第 5–6 步在 CRC 之前，这不是疏忽。** CRC 的物理位置由记录长度决定，不解析就找不到它——
+> 把「先校验 CRC 再解析任何内容」写进计划是自相矛盾的，别照做。这么做的安全性由
+> 两个「分配之前」的上界检查，加上 msgpack 解码器对畸形输入返回 `Err` 而非 panic 来兜。
+>
+> 副作用：被篡改的输入可能报 `MalformedHeader` 而不是 `CrcMismatch`。两者都是
+> `Corrupt`，对 heal 的触发条件（DESIGN §17：观察到 `Corrupt` 即触发）没有区别。
+> 正因如此，`detects_crc_mismatch` 必须**翻转 body 里的字节**（body 是不透明的，
+> 解析不受影响，才会稳定走到 CRC）——见 Step 1 的测试。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -1724,7 +1916,7 @@ Run: `cargo test -p rstore-meta container`
 Expected: 全部 PASS
 
 ```bash
-git add crates/meta/src/container.rs
+git add crates/meta/
 git commit -m "feat(meta): meta.xl container codec with corruption defenses"
 ```
 
@@ -1733,7 +1925,11 @@ git commit -m "feat(meta): meta.xl container codec with corruption defenses"
 ### Task 2.3: 内联数据帧
 
 **Files:**
+- Create: `crates/common/src/consts.rs`（**目前不存在**，需要新建）
 - Create: `crates/meta/src/inline.rs`
+- Modify: `crates/common/src/lib.rs`（加 `pub mod consts;`）
+- Modify: `crates/meta/src/lib.rs`（加 `pub mod inline;`）
+- Modify: `crates/meta/src/fileinfo.rs`（给 `InlineData` 补 `encode`/`decode`，也可放在 inline.rs，同一 crate 内均可）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -1773,10 +1969,18 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-按 DESIGN §8.4：msgpack map `version-key → bytes`，帧版本常量 `INLINE_DATA_VER = 1`。
-在 `crates/common/src/consts.rs` 加：
+按 DESIGN §8.4，内联帧就是纯 msgpack map：`version-key → bytes`。
+
+> **不要引入 `INLINE_DATA_VER` 之类的帧内版本字节。** 整个 `meta.xl` 已经有
+> `major`/`minor` 承载格式演进（DESIGN §8.3：「字段增删一律通过新的 minor 版本承载」），
+> 内联帧再挂一套版本号是重复的版本承载点，将来两边怎么对齐是个麻烦。
+> `InlineData` 靠 `#[serde(transparent)]` 直接序列化成那个 map。
+
+在 `crates/common/src/consts.rs`（新建）加：
 
 ```rust
+//! 跨层共享的常量与门限。
+
 pub const INLINE_BLOCK: u64 = 128 * 1024;
 
 /// 版本化桶取 1/8；MVP 未启用版本化，但函数签名保留该维度。
@@ -1786,13 +1990,27 @@ pub fn should_inline(size: u64, versioned_bucket: bool) -> bool {
 }
 ```
 
+`InlineData` 上的两个方法（`crates/meta/src/inline.rs`）：
+
+```rust
+impl InlineData {
+    /// 编码成 msgpack map。
+    pub fn encode(&self) -> Result<Vec<u8>, DiskError>;
+
+    /// 从字节解出。空输入视为空 map——容器解码时尾部可能什么都没有。
+    pub fn decode(bytes: &[u8]) -> Result<Self, DiskError>;
+}
+```
+
+失败一律映射为 `DiskError::Corrupt(CorruptKind::MalformedHeader)`。
+
 - [ ] **Step 4: 跑测试确认通过并提交**
 
 Run: `cargo test -p rstore-meta inline`
 Expected: PASS
 
 ```bash
-git add crates/meta/src/inline.rs crates/common/src/consts.rs
+git add crates/meta/ crates/common/
 git commit -m "feat(meta): inline data framing with size thresholds"
 ```
 

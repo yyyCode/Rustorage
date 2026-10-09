@@ -312,7 +312,7 @@ struct FileVersionHeader {
     version_id: Option<Uuid>,    // 必须保留 nil 与 None 的区别
     ty:         VersionType,     // Object | DeleteMarker
     size:       u64,
-    mod_time:   u64,             // unix 纳秒；None 编码为 0
+    mod_time:   Option<u64>,     // unix 纳秒；None 编码为线格式的 0
     ec_m:       u8,              // data shards，quorum 决策直接可读
     ec_n:       u8,              // total shards
     flags:      Flags,           // FreeVersion | UsesDataDir | InlineData
