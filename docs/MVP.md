@@ -5546,6 +5546,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/store/src/bucket.rs`、`crates/store/src/list.rs`
 - Modify: `crates/store/src/error.rs`（加 `BucketNotEmpty`）
 - Modify: `crates/store/src/get.rs`（把「取一个权威版本的 etag」抽成 `pub(crate)` 复用）
+- Modify: `crates/store/src/reconcile.rs`（`entries_under` 改 `pub(crate)`，见「对象列举怎么走」）
 - Modify: `crates/store/src/lib.rs`（加 `pub mod bucket;`、`pub mod list;`）
 
 > **为什么会有这一节。** M5 的 5.2（`CreateBucket` / `DeleteBucket` / `HeadBucket` /
@@ -5576,7 +5577,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - `create_bucket`：逐盘写标记，成功盘数 ≥ 严格多数 → `Ok`；否则
   `Err(StoreError::WriteQuorum { achieved, required: 严格多数 })`。
 - `bucket_exists`：标记在 **≥ 严格多数** 的盘上存在 → `true`。
-- `delete_bucket`：逐盘 `remove_dir_all("<bucket>")`，成功盘数 ≥ 严格多数 → `Ok`。
+- `delete_bucket`：逐盘 `remove_dir_all("<bucket>")`，成功盘数 ≥ 严格多数 → `Ok`；
+  否则 `Err(StoreError::WriteQuorum { achieved, required: 严格多数 })`
+  （**复用 `WriteQuorum`，不要为「删桶没删动」新造变体**——5.8 的错误映射表里
+  它对应 500，与新建桶失败同一类；测试 `delete_bucket_needs_a_strict_majority`
+  断言的就是这个变体）。
+  删之前先确认桶存在：桶压根不在 → `Err(StoreError::NotFound)`。
 
 用同一个数是为了避免再造一个新常量；写进注释说明它是「桶级元数据的多数派门槛」，
 **不是** `delete_quorum` 在语义上被挪用——两者恰好都是「严格多数」而已。
@@ -5648,8 +5654,18 @@ BucketNotEmpty,
 2. 对每个候选 key：`resolve_version(set, bucket, key)`，只有 `live()` 是 `Some` 才收录。
    删除标记与「只剩暂存目录」的 key 因此自然消失——**与 GET 用的是同一处判断**，
    不会有「GET 说没有、LIST 说有」。
+   **`Err(e)` 必须原样上抛，不能 `if let Ok(..)` 吞掉。** 只剩 2 块在线盘的 set
+   照样能列出候选目录，但元数据过不了 `read_quorum`——此时「列不全」与「列对了」
+   在返回值上无法区分，唯一安全的做法是报 `ReadQuorum`。吞掉它的表现是
+   **静默返回一个残缺列表**，而 `rclone sync` 会拿这个列表去删远端数据。
 3. 按 key 升序排序（并集来自多块盘，顺序不保证）。
 4. `prefix` 过滤在最后做一次 `key.starts_with(prefix)`。
+
+> **「并集」别再写第二遍。** `reconcile.rs` 里已经有一个 `entries_under(rel)`，
+> 做的就是「各在线盘 `list_dir(rel)` 的并集，缺失/读不到按空处理」。把它改成
+> `pub(crate)` 后 `list.rs` 直接用——本任务的文件清单里因此要加一行
+> `Modify: crates/store/src/reconcile.rs`。在 `list.rs` 里重写一遍的代价是
+> 两处「某块盘读不到怎么办」的策略会各自漂移，而对账与列举对这件事的答案必须相同。
 
 **性能**：MVP 是全盘遍历 + 每 key 一次元数据仲裁，`// PERF: 见 DESIGN §1.2 与 §20
 Phase 2 — 命名空间索引` 的挂钩注释留在这里（5.5 还要再留一次）。不要试图在 MVP 里
@@ -5667,6 +5683,17 @@ Phase 2 — 命名空间索引` 的挂钩注释留在这里（5.5 还要再留�
 /// 分片对象直接读 `parts[0].etag`；内联对象现算 `etag_of(inline)`。
 pub(crate) fn etag_of_meta(meta: &rstore_meta::ObjectMeta) -> Result<String, StoreError>;
 ```
+
+它内部就是 `get_object` 现在那两段：取 `latest_version(meta)` → `decode_body(latest.body)`
+→ 看 `Flags::INLINE_DATA` / `keys::INLINE_DATA` 分流。**一个例外要单独处理**：
+`get_object` 分片分支在 `parts` 为空时回落到 `etag_of(&full)`，而 `etag_of_meta`
+手上**没有 `full`**（它不该为了算个 etag 去读整份分片）。所以 `parts` 为空且不是内联
+→ `Err(StoreError::Internal("version has neither inline data nor parts"))`。
+这是元数据自相矛盾的信号，不是正常路径；报错比猜一个 etag 强。
+
+改完之后 `get_object` 的两处 etag 计算都换成调用 `etag_of_meta(meta)`（内联分支
+本来就用 `etag_of(&full)`，而 `full` 就是 `inline["null"]`，与 `etag_of_meta` 算的
+是同一个值——**换成共用那个，别留两份**）。
 
 **别在 `list.rs` 里再写一份**——两处算法分叉的表现是「HEAD 的 ETag 与 LIST 的不一样」，
 而 S3 客户端（`rclone check`）会拿它当校验依据。
