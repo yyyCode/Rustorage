@@ -5796,8 +5796,14 @@ async fn exposes_prometheus_text_format() {
 
 按 DESIGN §18.2，指标名常量集中定义，热路径用 `LazyLock` 缓存 handle。
 至少暴露：`put_duration_seconds{stage}`、`get_duration_seconds{stage}`、
-`erasure_quorum_failures_total{op}`、`bitrot_mismatch_total`、
-`buffer_pool_acquire_total{class}`、`disk_errors_total{kind}`。
+`erasure_quorum_failures_total{op}`、`bitrot_mismatch_total`、`disk_errors_total{kind}`。
+
+> **去掉原计划里的 `buffer_pool_acquire_total{class}`。** DESIGN §13.3 的四级缓冲池
+> 在 MVP 里**没有任何任务实现它**（M1~M5 全篇没有缓冲池），照抄这个指标名只会得到一个
+> 永远为 0、没人能解释的序列——运维看到「acquire 一直是 0」第一反应是「是不是坏了」，
+> 而不是「哦这个功能还没做」。等 Phase 2 真把缓冲池做出来时再一起加指标。
+> 这也正好是 Task 5.8 里删掉 `DiskFull` / `SlowDown` 的同一条理由：
+> **不为不存在的代码注册指标/错误码。**
 
 ```bash
 git add crates/server/src/metrics.rs
