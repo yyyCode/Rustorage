@@ -8450,17 +8450,26 @@ async fn shutdown_stops_accepting_then_drains() {
     //     回 503 与「不再 accept」是两回事，只有这一条能区分。
     //
     // (b) 关闭发起**之前**已经接住的在飞工作**跑完了才返回**：
-    //     用 `CancellationToken` 代替真实慢 handler，起一个任务先 `sleep(200ms)`
-    //     再置 `DONE`——**这个任务完全不看 token**（真实请求也不会因为关闭信号
-    //     自己中止，那正是 drain 的含义），然后在它 sleep 完之前调 `shutdown()`。
-    //     断言 `shutdown().await` 返回时 `DONE` 已经是 true。
-    //     `shutdown` 的实现是「先 cancel 让 accept 循环退出，再 await 各任务的
+    //     用 `Running::track_task` 登记一个 `tokio::spawn` 的任务，它先
+    //     `sleep(200ms)` 再置 `DONE`——**这个任务完全不看 token**（真实请求也不会
+    //     因为关闭信号自己中止，那正是 drain 的含义），然后在它 sleep 完之前调
+    //     `shutdown()`。断言 `shutdown().await` 返回时 `DONE` 已经是 true。
+    //     `shutdown` 的实现是「先 cancel 让 accept 循环退出，再 await 各已登记的
     //     JoinHandle」，这条断言正好钉住后半句。
+    //     顺序也要对：**先 `track_task` 再 `shutdown`**（`shutdown` 吃掉 `self`，
+    //     登记晚了就没有任何东西可等）。
     //
     // **只断言「shutdown() 返回 Ok」等于没测**——那不碰任何连接或任务的生命周期。
     // 这个写法不依赖真实的慢 HTTP handler，因此不会因机器快慢而偶发失败。
 }
 ```
+
+> **测试怎么造出 `Config`。** 前两条测试要调 `open_disks(&Config)`，得先有一个
+> `Config`。`Config` 由 clap `derive` 出来，字段默认**模块私有**——写在 `startup`
+> 模块里的测试**看不见** `config::Config` 的私有字段，结构体字面量直接编译不过。
+> 把 `Config` 的字段标成 `pub(crate)`，测试里就写结构体字面量；这是最省事的一种，
+> 别为了造一个配置去拼 argv 数组，也别给 `Config` 加「只给测试用」的构造函数
+> ——那会变成第二个必须与 clap 定义同步的地方。
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
@@ -8473,6 +8482,13 @@ impl Running {
     /// 其余交给 s3s。返回后服务已在跑。
     pub async fn bind(cfg: &Config, ready: Arc<Readiness>, m: Arc<Metrics>) -> anyhow::Result<Self>;
     pub fn local_addr(&self) -> SocketAddr;
+    /// 登记一个在飞任务的句柄，`shutdown()` 会等它跑完。
+    /// **这是 `shutdown_stops_accepting_then_drains` 的 (b) 断言唯一的钩子**：
+    /// 没有它，测试就构造不出「已经接住、但还没跑完」的工作，那条断言只能退化成
+    /// `assert!(shutdown().await.is_ok())`——等于没测。`serve()` 自己也用它登记
+    /// HTTP 服务任务。内部用 `Mutex<Vec<JoinHandle<()>>>`，**加锁取值后立刻出
+    /// 作用域再 `.await`**（`clippy::await_holding_lock` 是 deny）。
+    pub fn track_task(&self, handle: tokio::task::JoinHandle<()>);
     /// 先停止 accept，再等在飞请求跑完（要有上限，别无限等）。
     pub async fn shutdown(self);
 }
