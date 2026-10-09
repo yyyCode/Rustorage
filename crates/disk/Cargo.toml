@@ -13,6 +13,11 @@ tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 
+[features]
+# 跨 crate 开启故障注入盘（crate 内单测由 `cfg(test)` 自动可见）。
+# 见 `src/faulty.rs`：集成测试是独立编译的 crate，`#[cfg(test)]` 在那里不生效。
+fault-injection = []
+
 [dev-dependencies]
 tempfile.workspace = true
 

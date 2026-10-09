@@ -8,8 +8,18 @@ pub mod local;
 
 pub use local::LocalDisk;
 
+// 故障注入盘（Task 3.4）。门控用 `any(test, feature)`：crate 内单测靠 `cfg(test)`
+// 自动可见；跨 crate（如 `rstore-store` 的集成测试）是独立编译的 crate，
+// `cfg(test)` 不生效，需显式开启 `fault-injection` feature。
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod faulty;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use faulty::{Fault, FaultKind, FaultyDisk};
+
 use rstore_common::disk_id::DiskId;
-use rstore_common::error::DiskError;
+// 公开再导出：集成测试按 `rstore_disk::DiskError` 引用它（`rstore-disk` 是独立编译的
+// crate，只能看到本 crate 的公开路径），无需再单独依赖 `rstore-common`。
+pub use rstore_common::error::DiskError;
 
 /// 一块盘的元信息。只有 disk 层用（不是线格式），故定义在这里而非 common。
 #[derive(Debug, Clone, PartialEq, Eq)]
