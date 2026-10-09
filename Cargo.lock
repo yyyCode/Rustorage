@@ -722,6 +722,7 @@ dependencies = [
  "rstore-disk",
  "rstore-erasure",
  "rstore-meta",
+ "tempfile",
  "thiserror",
  "tokio",
  "uuid",
