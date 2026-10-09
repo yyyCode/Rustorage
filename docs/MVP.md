@@ -331,6 +331,7 @@ cargo metadata --format-version 1 --no-deps | "$PYTHON" "$SCRIPT_DIR/check_layer
      必须与 1 分开，否则 CI 日志会把基础设施故障读成「有人加了违规依赖」。
 """
 import json
+import os
 import sys
 
 ALLOWED = {
@@ -400,20 +401,47 @@ def require(cond, what):
         raise MetadataShapeError(what)
 
 
+def is_inside(path, root):
+    """path 是否落在 workspace 根目录内。
+
+    用来判"内部 crate"：判据是 workspace 边界，而不是"这个依赖带不带 path
+    字段"。后者会把本地 fork 的外部 crate（`serde = { path = "../forks/serde" }`）
+    一起卷进来——它同样带 path 字段，但显然不是内部 crate，报违规就是误伤。
+
+    必须用 commonpath 而不是字符串前缀比较：`E:\\rust\\Rustorage-other` 以
+    `E:\\rust\\Rustorage` 开头，但不在里面。commonpath 懂这一点。
+
+    判断不了（字段缺失、相对路径、跨盘符）时返回 True，即按内部依赖处理。
+    失效方向必须是 fail-closed：宁可多查一条边，也不要因为路径解析失败
+    就静默放过一条依赖边。
+    """
+    if not isinstance(path, str) or not isinstance(root, str):
+        return True
+    if not os.path.isabs(path) or not os.path.isabs(root):
+        return True                      # 相对路径无从比较；cargo 实际给绝对路径
+    try:
+        root = os.path.realpath(root)
+        return os.path.commonpath([root, os.path.realpath(path)]) == root
+    except ValueError:
+        return True                      # 跨盘符等，判断不了
+
+
 def check(meta):
     """返回违规消息列表。空列表表示合规。
 
     结构不符时抛 MetadataShapeError，而不是返回违规——「cargo 的输出看不懂」
     和「架构违规」必须分开报，前者是护栏故障（2），后者才是发现违规（1）。
 
-    路径依赖（带 path 字段）一律按下内部依赖约束：这类依赖必然来自本仓库或
-    本地目录，名字不带 rstore- 并不代表它不在图里。只按前缀过滤的话，一个放在
-    crates/ 之外、名字又没前缀的内部 crate 会同时漏掉 UNKNOWN CRATE 和这条边。
+    内部依赖的判据是"名字带 rstore- 前缀，或路径落在 workspace 根内"，不是
+    "名字带前缀"：只按前缀过滤的话，一个放在 crates/ 之外、名字又没前缀的
+    内部 crate 会同时漏掉 UNKNOWN CRATE（它不是 workspace 成员，--no-deps
+    不列它）和这条边。
     """
     require(isinstance(meta, dict), f"顶层不是对象：{type(meta).__name__}")
     packages = meta.get("packages")
     require(isinstance(packages, list), f"packages 不是列表：{type(packages).__name__}")
     require(packages, "packages 为空——workspace 里应当有 crate")
+    workspace_root = meta.get("workspace_root")
 
     violations = []
     for pkg in packages:
@@ -434,8 +462,13 @@ def check(meta):
             dep_name = dep.get("name")
             require(isinstance(dep_name, str), f"{name} 的依赖名不是字符串：{dep_name!r}")
 
-            if dep.get("path") is None and not dep_name.startswith("rstore-"):
-                continue                      # 注册表依赖：不受内部层次约束
+            if not dep_name.startswith("rstore-"):
+                # 不带前缀的依赖分三类：注册表依赖（无 path，比如 serde）、
+                # 仓内路径依赖（内部 crate）、仓外路径依赖（本地 fork 的外部
+                # crate）。只有中间那类受内部层次约束。
+                dep_path = dep.get("path")
+                if dep_path is None or not is_inside(dep_path, workspace_root):
+                    continue
             if dep_name not in ALLOWED[name]:
                 kind = dep.get("kind") or "normal"
                 violations.append(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
@@ -517,6 +550,7 @@ Expected: 退出码 0，无输出
 运行：python3 scripts/tests/test_check_layer_deps.py
 """
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -527,6 +561,7 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 CHECKER = SCRIPTS_DIR / "check_layer_deps.py"
+REPO_ROOT = str(SCRIPTS_DIR.parent)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import check_layer_deps as chk  # noqa: E402
@@ -565,13 +600,24 @@ CASES = [
         pkg("rstore-api", "rstore-store"),
     ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
 
-    # 路径依赖带着 path 字段，即使名字没有 rstore- 前缀也必须被约束。
-    # 不能写成 pkg(...)：那个辅助函数只造 {"name": ...}，造不出 path 字段，
-    # 而 path 字段正是这条用例要验的东西。
-    ("路径依赖绕过前缀过滤", {"packages": [
+    # 路径依赖带着 path 字段，落在 workspace 内、名字又没前缀的，必须被约束——
+    # 否则放在 crates/ 之外的内部 crate 两头都漏。不能写成 pkg(...)：那个辅助
+    # 函数只造 {"name": ...}，造不出 path 字段。
+    #
+    # 路径由 REPO_ROOT 现算而不是写死，才能同时在本机和 Linux CI 上成立。
+    ("仓内路径依赖绕过前缀过滤", {"workspace_root": REPO_ROOT, "packages": [
         {"name": "rstore-server", "dependencies": [
-            {"name": "evilhelper", "path": "../tools/evilhelper"}]},
+            {"name": "evilhelper",
+             "path": str(Path(REPO_ROOT) / "tools" / "evilhelper")}]},
     ]}, 1, "FORBIDDEN EDGE: rstore-server -> evilhelper"),
+
+    # 反面：本地 fork 的外部 crate 同样带 path 字段，但落在 workspace 之外，
+    # 不是内部 crate。判据若只看"有没有 path"，这条会被误报成架构违规。
+    ("仓外路径依赖（本地 fork）不算违规", {"workspace_root": REPO_ROOT, "packages": [
+        {"name": "rstore-common", "dependencies": [
+            {"name": "serde",
+             "path": str(Path(REPO_ROOT).parent / "forks" / "serde")}]},
+    ]}, 0, None),
 ]
 
 
@@ -734,13 +780,17 @@ def main():
     skip = {"test_fixture_cases"}
     unit_tests = [
         fn for nm, fn in sorted(globals().items())
-        if nm.startswith("test_") and callable(fn) and nm not in skip
+        if nm.startswith("test_") and inspect.isfunction(fn) and nm not in skip
     ]
     for fn in unit_tests:
         try:
             fn()
-        except AssertionError as e:
-            failures.append(f"{fn.__name__}: {e}")
+        except Exception as e:                # noqa: BLE001
+            # 放宽到 Exception，不是只接 AssertionError：一个签名不对的 test_
+            # 函数（比如漏了参数）抛 TypeError 会带着 traceback 直接结束进程，
+            # 汇总行都不打印，之前累积的失败也一并丢掉。这里要的是"记一笔、
+            # 继续跑、最后汇总"。
+            failures.append(f"{fn.__name__}: {type(e).__name__}: {e}")
 
     for f in failures:
         print(f"FAIL {f}")
@@ -753,7 +803,7 @@ if __name__ == "__main__":
 ```
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: 全部通过（`13 项通过，0 项失败`），退出码 0
+Expected: 全部通过（`14 项通过，0 项失败`），退出码 0
 
 - [ ] **Step 3b: 端到端确认——真仓库上护栏仍能抓到违规**
 
@@ -884,7 +934,7 @@ Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: `13 项通过，0 项失败`，退出码 0
+Expected: `14 项通过，0 项失败`，退出码 0
 
 - [ ] **Step 7: 提交**
 
@@ -1005,11 +1055,17 @@ git commit -m "ci: run layer guard, lint, and tests on every push and PR"
 > 文件级约定（实现绑定只允许出现在 `rstore-server/src/wiring.rs`），
 > 依赖图看不出这一点——那一半仍然靠 review。别把这个脚本当成 R4 的完整保险。
 
-> **一处想清楚后留下的取舍**：解释器探测在两个地方各写了一遍
-> （`scripts/check-layer-deps.sh` 与 `ci.yml` 的自测步骤）。抽成
-> `scripts/find-python.sh` 再 source 能消除重复，但会多一个文件、多一处
-> source 路径假设。两份拷贝漂移的代价不对称：写坏的是本机，而 CI 跑在
-> ubuntu-latest 上 `python3` 必然存在，不会因此变红。等第三处需要它时再抽。
+> **两处想清楚后留下的取舍**，都不是遗漏：
+>
+> 1. **解释器探测在两个地方各写了一遍**（`scripts/check-layer-deps.sh` 与
+>    `ci.yml` 的自测步骤）。抽成 `scripts/find-python.sh` 再 source 能消除重复，
+>    但会多一个文件、多一处 source 路径假设。两份拷贝漂移的代价不对称：
+>    写坏的是本机，而 CI 跑在 ubuntu-latest 上 `python3` 必然存在，不会因此变红。
+>    等第三处需要它时再抽。
+> 2. **CI 只跑 `scripts/tests/test_check_layer_deps.py` 这一个文件**，同目录将来
+>    新增的 `test_*.py` 不会被收集。现在只有一个测试文件，加一层"遍历目录"的
+>    机制是为不存在的场景付复杂度。新增测试文件时记得同步 CI——这条写在这里，
+>    就是因为那一天的作者多半不会想到。
 
 ---
 
