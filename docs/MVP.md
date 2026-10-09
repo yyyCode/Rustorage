@@ -6170,22 +6170,390 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 5.2 ~ 5.6: S3 操作实现
 
-按以下顺序，**每个 Task 一个操作组**，每个都先写 HTTP 层集成测试：
+> **先读这一节的前三段，它们把 5.2~5.6 共用的东西讲完。**
+> 原计划这五个 Task 挤成一个表格，每格一句「测试要点」，没有一行代码、没有一个
+> 文件路径。实现者拿到的是「实现 `PutObject` / `GetObject` / `HeadObject` /
+> `DeleteObject`」这种句子——这跟没有规格的区别，只是它看起来像有规格。
 
-| Task | 操作 | 测试要点 |
-|---|---|---|
-| 5.2 | `CreateBucket` / `DeleteBucket` / `HeadBucket` / `ListBuckets` | 空桶可删、非空桶删返回 409 |
-| 5.3 | `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` | 往返一致、ETag 正确、HEAD 无 body 但有 Content-Length |
-| 5.4 | `GetObject` 的 Range | `bytes=a-b` / `bytes=a-` / `bytes=-n` 三种形式；206 与 `Content-Range` |
-| 5.5 | `ListObjectsV2` | 前缀、分隔符、`max-keys` 分页、`CommonPrefixes`、`continuation-token` 往返 |
-| 5.6 | Multipart 系列 | **MVP 不实现**：见下方注记。测试只验证「六个 multipart 操作各自返回 `501` + 合法 S3 错误响应体」 |
-| 5.7 | 命名校验 | 见下（单独展开） |
+#### 一、s3s 0.17 已经替你做完的事（已逐条核实，别再自己造）
 
-**每个 Task 的提交信息格式：** `feat(s3): implement <operation group>`
+| 事实 | 后果 |
+|---|---|
+| `S3` trait 的**每个方法都有默认实现**，就是 `Err(s3_error!(NotImplemented, "… is not implemented yet"))` | **5.6 是零代码**：只要不覆写那六个 multipart 方法，它们天生返回 501。别再手写六个 `Err(...)` |
+| `BucketName` / `ObjectKey` / `Prefix` / `Delimiter` / `Token` / `NextToken` / `StartAfter` / `ETag` / `ContentRange` / `AcceptRanges` / `ObjectVersionId` 都是 `pub type X = String` | 直接当 `String` 用，不必 `into()` 猜类型 |
+| `Size` / `ContentLength` / `ObjectSize` = `i64`；`MaxKeys` / `KeyCount` = `i32`；`IsTruncated` = `bool` | 注意 `Size` 是 **`i64`**，`ObjectData.size` 是 `u64`，要显式 `as i64` |
+| `pub type List<T> = Vec<T>`；`Buckets = List<Bucket>`；`ObjectList = List<Object>` | `contents: Some(vec![Object { … }])` |
+| `S3Response<T>` 的 `output` 字段**会被自动序列化成响应头**（`etag` → `ETag`、`content_length` → `Content-Length`、`last_modified` → `Last-Modified`、`e_tag`、`accept_ranges`、`content_range`…） | 只需要填 `output` 的字段；**不要**手工往 `S3Response.headers` 里塞这些头，塞了也是双份 |
+| `GetObjectOutput.content_range` 为 `Some` 时，序列化器**自动把状态码设成 206** | 5.4 不需要自己设 status，只要算出 `content_range` 字符串 |
+| `GetObjectInput.range` 已经被 s3s 解析成 `Range::Int { first, last: Option<u64> }` / `Range::Suffix { length: u64 }`（`Range::parse` 内部做） | **5.4 不写 `bytes=` 解析器**。s3s 只做到「语法解析」，它不知道对象多大，所以**闭合区间与越界检查仍是我们的活** |
+| `StreamingBlob::from_bytes(Bytes)`；`StreamingBlob` 实现 `Stream<Item = Result<Bytes, StdError>>` | 读请求体用 `futures::TryStreamExt::try_concat()`（`futures` 已在 workspace 依赖里）；造响应体用 `StreamingBlob::from_bytes` |
+| `Timestamp: From<SystemTime>` | `mod_time`（Unix 纳秒）→ `SystemTime::UNIX_EPOCH + Duration::from_nanos(n)` → `Timestamp::from(..)` |
+| `s3s::validation::NameValidation` 只有 `validate_bucket_name`；`S3ServiceBuilder` 默认挂 `AwsNameValidation` | 桶名校验白送；**对象 key 没有校验钩子**，只能自己写（5.7） |
 
-> **实现提示（5.5 尤其注意）**：LIST 在 MVP 是**全盘遍历**。必须在注释中写明这一点，
-> 并留下 `// PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引` 的挂钩注释，
-> 避免后续读者误以为这是终态设计。
+#### 二、测试怎么打：零端口、零磁盘、零引擎
+
+`rstore-s3` 的 allowlist 是 `{rstore-common, rstore-api}`——**它连 `rstore-store` 都看不见**，
+所以 M5 的测试**不可能**建一个真的 `ErasureSet`，也不该建（引擎的正确性 M4 已经测完了）。
+M5 要测的是**协议翻译**：状态码、响应头、XML 形状、XML 字段。
+
+做法：写一个内存版 `ObjectStore` 假实现，再用 `tower::ServiceExt::oneshot` 把请求直接
+打给 `S3Service`（它是 hyper + tower 的 service，**不绑端口、不等待**）。
+
+- [ ] **Step 1（5.2 的下属步骤）: 建 `crates/s3/src/mock.rs`**
+
+`#[cfg(test)]` 门控；`lib.rs` 里 `#[cfg(test)] mod mock;`。
+它是 5.2~5.6 **全部测试**共用的夹具，先建它。
+
+```rust
+//! 内存版 `ObjectStore`，只为 S3 层的协议测试服务。
+//!
+//! **为什么不用真的 `ErasureSet`**：`rstore-s3` 的 allowlist 里没有 `rstore-store`
+//! （见 `scripts/check_layer_deps.py`），依赖边根本不存在。而这也正是对的——
+//! 引擎的行为由 M4 的测试负责，这里只该验证「协议翻译」这一层。
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
+
+#[derive(Default)]
+pub struct MockStore {
+    /// `(bucket, key) -> (内容, etag, mod_time_nanos)`
+    objects: Mutex<BTreeMap<(String, String), (Vec<u8>, String, u64)>>,
+    buckets: Mutex<Vec<String>>,
+    /// 下一次 `object_miss` 要返回 `NoSuchKey` 而不是 `Unavailable`。
+    /// 5.8 的错误映射要靠它区分 404 与 500。
+    pub fail_next_with: Mutex<Option<ApiError>>,
+}
+```
+
+要点，**照做，不要即兴**：
+
+- 锁一律 `std::sync::Mutex`，且**临界区里绝不能出现 `.await`**。`clippy::await_holding_lock`
+  在 workspace lints 里是 **`deny`**（不是 warn），跨 await 持锁会直接挡死门禁。
+  每个方法里「加锁 → 取值/改值 → 出作用域」写完再 await。
+- `fail_next_with` 是个小开关：取一次就清空。**5.8 的错误映射测试需要它**——
+  否则「store 返回 `NoSuchKey` 时 S3 层回 404」这条断言没法触发，只能干看着工具函数。
+- `put_object` 存进 map 时 etag 自算（`format!("{:x}", md5::compute(&data))` 或直接
+  `"deadbeef…"` 之类的固定串——**测试用的是我们自己写死的 etag**，不必真算 MD5；
+  但要在测试里断言响应头 `ETag` 等于它，这样才测到「传下去了」）。
+- `list_objects` 按 key 升序返回，`prefix` 照常过滤。
+- `get_object` 的 `range`：**MockStore 也做裁剪**（切片成 `data[start..=end]`），
+  但 `size` 返回**整个对象的长度**——这正是真实契约（见 `ObjectData.size` 的注释）。
+  5.4 的 `Content-Range` 断言依赖这一点。
+
+#### 三、5.2 ~ 5.6 的公共骨架
+
+每个 Task 都改 `crates/s3/src/impl_s3.rs`（5.1 已建），并在文件里的 `#[cfg(test)] mod tests`
+追加本组的测试。**提交粒度**：一个 Task 一个 commit，信息格式
+`feat(s3): implement <operation group>`。
+
+测试的公共工具（也在 `mock.rs` 或测试模块顶部）：
+
+```rust
+/// 打一个请求进去，返回 (状态码, 响应头, 响应体字节)。
+async fn call(req: Request<Vec<u8>>) -> (StatusCode, HeaderMap, Bytes);
+
+/// 解析错误响应体的 `<Code>`，例如 `"NoSuchKey"`。XML 里就这一个字段要断言。
+fn error_code(body: &[u8]) -> String;
+```
+
+`call` 用 `service().oneshot(req)`；`ServiceExt::oneshot` 需要 `tower` 与
+`http-body-util`（`BodyExt::collect`）——**两者都要加进 `crates/s3/Cargo.toml` 的
+`[dev-dependencies]`**，别加进 `[dependencies]`。
+
+---
+
+#### Task 5.2: 桶操作
+
+**Files:** Modify `crates/s3/src/impl_s3.rs`、Create `crates/s3/src/mock.rs`、Modify `crates/s3/src/lib.rs`、Modify `crates/s3/Cargo.toml`
+
+- [ ] **Step 1: 写测试**（`MockStore` 按上面的 Step 1 建好）
+
+```rust
+#[tokio::test]
+async fn create_bucket_then_head_and_list() {
+    // PUT /bucket  → 200；head_bucket 走 ObjectStore::head_bucket → 200 空体
+    // GET /        → 200，XML 里 <Buckets> 含 <Name>test-bucket</Name>
+}
+
+#[tokio::test]
+async fn delete_non_empty_bucket_is_409() {
+    // MockStore 里先塞一个对象，再 DELETE /bucket
+    // → 409，error_code == "BucketNotEmpty"
+}
+
+#[tokio::test]
+async fn head_missing_bucket_is_404_nosuchbucket() {
+    // → 404，error_code == "NoSuchBucket"
+}
+```
+
+- [ ] **Step 2: 实现四个方法**
+
+```rust
+async fn create_bucket(&self, req: S3Request<CreateBucketInput>)
+    -> S3Result<S3Response<CreateBucketOutput>>
+{
+    self.store.create_bucket(&req.input.bucket).await?;
+    // location 留 None：MVP 没有 region 概念，返回 <Location></Location> 即可。
+    Ok(S3Response::new(CreateBucketOutput { bucket_arn: None, location: None }))
+}
+```
+
+`delete_bucket` / `head_bucket` 同形。`head_bucket` 的输出四个字段**全部留 `None`**——
+MVP 不实现 region，`aws s3 mb` 与 `mc` 都不依赖它。
+
+`list_buckets`：
+
+```rust
+let names = self.store.list_buckets().await?;
+let buckets = names.into_iter()
+    .map(|name| Bucket { name: Some(name), creation_date: None, ..Default::default() })
+    .collect();
+Ok(S3Response::new(ListBucketsOutput {
+    buckets: Some(buckets), continuation_token: None, owner: None, prefix: None,
+}))
+```
+
+> `creation_date: None` 是**有意的**：桶的创建时间在设计里根本没存
+> （`.rstore.sys/bucket.meta` 的内容就是 `{}`）。补一个假时间戳会骗客户端。
+
+**`ApiError → S3 错误` 的映射**由 5.8 统一提供（那时才写 `impl`）；
+本 Task 先按 5.8 的表把 `NoSuchBucket` / `BucketNotEmpty` 这两条落进去，
+免得 5.2 的测试要等 5.8 才能跑。**5.8 只补齐剩下的行，不重写这两条。**
+
+- [ ] **Step 3: 三道门禁 + 提交**（`cargo test -p rstore-s3`、`clippy`、`check-layer-deps.sh`）
+
+---
+
+#### Task 5.3: 对象读写
+
+**Files:** Modify `crates/s3/src/impl_s3.rs`
+
+- [ ] **Step 1: 写测试**
+
+```rust
+#[tokio::test]
+async fn put_then_get_round_trips_bytes() {
+    // PUT /b/k  body = b"hello rustorage"  → 200，响应头 ETag 非空
+    // GET /b/k  → 200，体 == b"hello rustorage"，Content-Length == 15
+}
+
+#[tokio::test]
+async fn head_object_has_length_but_no_body() {
+    // HEAD /b/k → 200，Content-Length == 15，且响应体**为空**
+}
+
+#[tokio::test]
+async fn get_missing_key_is_404_nosuchkey() {
+    // → 404，error_code == "NoSuchKey"
+}
+
+#[tokio::test]
+async fn delete_object_is_204_and_idempotent() {
+    // DELETE /b/k → 204；再 DELETE 一次仍 204（S3 的 DELETE 幂等）
+}
+```
+
+- [ ] **Step 2: 实现**
+
+```rust
+async fn put_object(&self, req: S3Request<PutObjectInput>)
+    -> S3Result<S3Response<PutObjectOutput>>
+{
+    let data = match req.input.body {
+        Some(body) => body.try_concat().await?.to_vec(),
+        // 空对象是合法的 PUT（`touch` 一个 0 字节文件）：body 为 None 就是空。
+        None => Vec::new(),
+    };
+    let info = self.store.put_object(&req.input.bucket, &req.input.key, data).await?;
+    Ok(S3Response::new(PutObjectOutput {
+        e_tag: Some(info.etag), ..Default::default()
+    }))
+}
+```
+
+> `..Default::default()` 在这里**是必须的**：`PutObjectOutput` 有四十多个字段，
+> 逐个写 `None` 既长又会在 s3s 升级加字段时编译失败。
+> 前提是这些 DTO 都 `#[derive(Default)]`——已核实，是的。
+
+`get_object`（不带 Range 的那部分；Range 在 5.4 加）：
+
+```rust
+let out = self.store.get_object(&req.input.bucket, &req.input.key, None).await?;
+Ok(S3Response::new(GetObjectOutput {
+    body: Some(StreamingBlob::from_bytes(Bytes::from(out.data))),
+    content_length: Some(out.size as i64),
+    e_tag: Some(out.etag),
+    last_modified: Some(timestamp_of(out.mod_time)),
+    accept_ranges: Some("bytes".to_string()),
+    content_range: None,   // 无 Range → 序列化器不会设 206
+    ..Default::default()
+}))
+```
+
+`head_object` 与 `get_object` 同形，但**输出类型不同**（`HeadObjectOutput`）、
+`body` 必须留 `None`，且要调 `self.store.head_object(..)` 而不是 `get_object`——
+否则 HEAD 会把整份对象读进内存再丢掉。
+
+`delete_object` → `S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT)`。
+
+- [ ] **Step 3: 三道门禁 + 提交**
+
+---
+
+#### Task 5.4: Range
+
+**Files:** Modify `crates/s3/src/impl_s3.rs`
+
+**不写 `bytes=` 解析器**——`req.input.range` 已经是 `Option<Range>`（见本节表）。
+这一步只做三件事：把 `Range` 解成闭区间、查对象长度、越界时回 `416`。
+
+- [ ] **Step 1: 写测试**（三种写法各一条）
+
+```rust
+#[tokio::test]
+async fn range_int_form_returns_206_with_content_range() {
+    // 对象 26 字节 "abcdefghijklmnopqrstuvwxyz"，Range: bytes=2-5  → "cdef"
+    // 206；Content-Range == "bytes 2-5/26"；Content-Length == 4
+}
+
+#[tokio::test]
+async fn range_open_ended_form() {
+    // bytes=22-  → "wxyz"；Content-Range == "bytes 22-25/26"
+}
+
+#[tokio::test]
+async fn range_suffix_form() {
+    // bytes=-4   → "wxyz"；Content-Range == "bytes 22-25/26"
+}
+
+#[tokio::test]
+async fn range_beyond_size_is_416() {
+    // bytes=100-200  → 416，error_code == "InvalidRange"
+}
+```
+
+- [ ] **Step 2: 实现**
+
+```rust
+/// 把 s3s 解析好的 `Range` 收敛成真实对象的闭区间。越界 → `ApiError::InvalidRange`。
+fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
+    match r {
+        Range::Int { first, last } => {
+            if first >= size { return Err(ApiError::InvalidRange); }
+            let end = last.unwrap_or(size - 1).min(size - 1);
+            if end < first { return Err(ApiError::InvalidRange); }
+            Ok(ByteRange { start: first, end })
+        }
+        Range::Suffix { length } => {
+            if length == 0 || size == 0 { return Err(ApiError::InvalidRange); }
+            let start = size.saturating_sub(length);
+            Ok(ByteRange { start, end: size - 1 })
+        }
+    }
+}
+```
+
+**需要对象长度才能闭合区间**，而 `ObjectStore::get_object` 的返回值里**有** `size`——
+但那要先把整份对象读回来才知道。所以顺序是：先 `head_object` 拿 `size`，再 `get_object`
+带 range。两次调用是可接受的（MVP 本来就不流式），**别为此去改 trait**。
+
+`content_range` 字符串：`format!("bytes {}-{}/{}", br.start, br.end, out.size)`——
+注意分母是**整个对象长度**，不是请求范围的。写错这一处，`rclone` 会认为数据被截断。
+
+- [ ] **Step 3: 三道门禁 + 提交**
+
+---
+
+#### Task 5.5: ListObjectsV2
+
+**Files:** Modify `crates/s3/src/impl_s3.rs`
+
+`ObjectStore::list_objects` 返回**已排序的全量列表**（4.11），
+`prefix` / `delimiter` / `max_keys` / `continuation_token` **全部在这一层做**。
+
+- [ ] **Step 1: 写测试**
+
+```rust
+// 夹具：b 下有 "a.txt", "dir/x", "dir/y", "dir/sub/z", "z.txt"
+#[tokio::test] async fn lists_all_sorted() { /* 5 条，按 key 升序 */ }
+#[tokio::test] async fn prefix_filters() { /* prefix="dir/" → 3 条 */ }
+#[tokio::test] async fn delimiter_rolls_up_common_prefixes() {
+    // delimiter="/" → contents 是 ["a.txt", "z.txt"]，
+    // common_prefixes 是 ["dir/"]（**只一条**，不是 dir/x、dir/y、dir/sub 三条）
+}
+#[tokio::test] async fn max_keys_truncates_and_sets_is_truncated() {
+    // max-keys=2 → key_count == 2，is_truncated == true，
+    // next_continuation_token 非空
+}
+#[tokio::test] async fn continuation_token_resumes_without_gap_or_dup() {
+    // 用上一步的 token 再请求 → 拿到剩下的，且两页**并集等于全集、交集为空**
+}
+```
+
+> 最后一条是这组的核心断言。**「翻页不漏不重」**正是客户端 `rclone sync` 会依赖的性质：
+> 漏一条 = 远端文件被当成不存在而**删除**。别只断言「第二页有 N 条」。
+
+- [ ] **Step 2: 实现**
+
+```rust
+let entries = self.store.list_objects(&req.input.bucket, req.input.prefix.as_deref()).await?;
+let delimiter = req.input.delimiter.as_deref().filter(|d| !d.is_empty());
+let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
+// 续传起点：**不解析 token 的内容，就当它是「上一个 key」**——见下方注记。
+let start_after = req.input.continuation_token.clone().or(req.input.start_after.clone());
+```
+
+遍历 `entries`（已排序），维护 `contents: Vec<Object>` 与
+`common_prefixes: BTreeSet<String>`：
+
+1. `if let Some(s) = &start_after { if entry.key <= *s { continue; } }`（**字符串比较，不是下标**）
+2. 有 delimiter 且 `key[prefix.len()..]` 里含有 delimiter → 截到第一个 delimiter **含**它，
+   得到 `cp`；`common_prefixes.insert(cp)`；
+3. 否则 `contents.push(Object { key, size, e_tag, last_modified, ..Default::default() })`；
+4. **每推进一条就检查 `contents.len() + common_prefixes.len() == max_keys`**——到了就停，
+   并记下 `is_truncated = true`、`next_continuation_token = 这一条的 key`。
+
+`key_count = contents.len() + common_prefixes.len()`（S3 的定义就是两者之和）。
+
+> **continuation token 就用裸 key，不做 base64。** S3 没有规定 token 的内容，只要
+> 「传回来能接着走」即可。用 base64 只是让 token 看起来不透明，代价是多一个依赖和一个
+> 编解码来回。**这是有意的简化**，写进注释；要改成不透明 token 时，唯一要保证的是
+> 「解码出来的 key 仍然是全序里的位置」，而现在是同一个东西，反而不会错。
+
+> 留下挂钩注释：`// PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引`
+> ——MVP 是**全盘遍历**（4.11），不是终态设计。
+
+- [ ] **Step 3: 三道门禁 + 提交**
+
+---
+
+#### Task 5.6: Multipart 一律 501
+
+**Files:** Modify `crates/s3/src/impl_s3.rs`（**只为加测试**）
+
+**没有实现步骤——因为不需要。** s3s 的六个 multipart 方法默认实现就是
+`Err(s3_error!(NotImplemented, "… is not implemented yet"))`（已核实），
+**不要覆写它们**。
+
+- [ ] **Step 1: 写测试**
+
+```rust
+#[tokio::test]
+async fn all_six_multipart_ops_are_501_not_implemented() {
+    // 对 POST /b/k?uploads、PUT /b/k?partNumber=1&uploadId=x、
+    // POST /b/k?uploadId=x、DELETE /b/k?uploadId=x、GET /b/k?uploadId=x、
+    // GET /b?uploads 各打一次，逐个断言：
+    //   status == 501 且 error_code == "NotImplemented"
+}
+```
+
+六个都断言，**不要只测一个就 `..` 掉**：`S3` trait 方法众多，日后有人覆写了其中一个
+（比如为了别的目的实现了 `UploadPart`），只有单独断言才能发现。
+
+- [ ] **Step 2: 三道门禁 + 提交**
 
 > **为什么 5.6 是「返回 501」而不是「实现 multipart」**：Task 4.5 冻结的存储层
 > 每个版本只写一个 `part.1`，`PutArgs { bucket, key, data }` 里没有 part 列表，
