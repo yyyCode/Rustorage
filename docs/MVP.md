@@ -3245,7 +3245,9 @@ fn parity_never_exceeds_half() {
 fn write_quorum_bumps_on_symmetric_geometry() {
     assert_eq!(write_quorum(4, 2), 4);   // 4+2: 不对称
     assert_eq!(write_quorum(3, 3), 4);   // 3+3: 对称，+1
-    assert_eq!(read_quorum(4, 2), 4);
+    // 注意第一个参数是 **total**，不是 data：4+2 配置的 total 是 6，read_quorum = 6 - 2 = 4。
+    // （原计划这里写 `read_quorum(4, 2)`，把 data 当成了 total。）
+    assert_eq!(read_quorum(6, 2), 4);
 }
 ```
 
