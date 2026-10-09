@@ -8963,10 +8963,27 @@ cmp $WORK/payload.bin $WORK/write-back.bin
 #     和「正常报错」一起吞掉，这条就等于没测。注意放在 `if` 条件里的命令
 #     不会触发 `set -e`。
 mv $ROOT/d4 $ROOT/d4.off
-if $AWS s3 cp s3://accept/big.bin $WORK/too-far.bin 2>/dev/null; then
+if $AWS s3 cp s3://accept/big.bin $WORK/too-far.bin 2>$WORK/too-far.err; then
     echo "低于 read_quorum 时读竟然成功了" >&2
     exit 1
 fi
+# **只断言「失败了」还不够**：服务整个挂掉、桶被删了、网络断了，都会让上面那条
+# `if` 成立——那样这条边界验收就是**假通过**。必须断言失败的原因**就是**读 quorum
+# 不足。Task 5.8 把 `StoreError::ReadQuorum` 映射成 503 `ServiceUnavailable`
+# （wiring.rs 的 `map_object_err`），所以这里钉住它。
+#
+# **两个大版本打印的形态不同，只匹配一个就会在换版本时假失败**（本机 aws-cli
+# v1.46.1 实测）：
+#   v1：`fatal error: An error occurred (503) when calling the HeadObject operation
+#        (reached max retries: 4): Service Unavailable`   ← 打的是**状态码**
+#   v2：`An error occurred (ServiceUnavailable) when calling …`  ← 打的是**错误码**
+# 顺带记住：`s3 cp` 下载前先发 `HeadObject`，所以 quorum 不足是在 **HEAD** 上就
+# 暴露的，不是等到 GET——「读失败」发生在更早的一步。
+grep -qE '\(503\)|ServiceUnavailable' $WORK/too-far.err || {
+    echo "读确实失败了，但原因不是读 quorum 不足（期望 ServiceUnavailable）：" >&2
+    cat $WORK/too-far.err >&2
+    exit 1
+}
 mv $ROOT/d4.off $ROOT/d4
 
 # 4. 恢复，再读一次确认恢复没把数据改坏（同一条比对，但走的是另一条盘路径）。
@@ -8994,6 +9011,27 @@ echo "ACCEPTANCE: OK"
 > `curl -f` 或者 `aws … >/dev/null`。`cmp` 失败会带出首个不同字节的偏移，
 > 而「读成功但内容不对」恰恰是纠删码实现最典型的坏法（P1：宁可报错，绝不返回错数据）。
 > 载荷用 `/dev/urandom` 而不是全零：全零的字节里，分片错位与补零 bug 都看不出来。
+
+> **本脚本已在真实三客户端（aws-cli 1.46.1 / mc RELEASE.2025-07-21 / rclone v1.75.2）
+> 环境下实跑通过。** 严格说：上面这版脚本（不含 3c 的错误码断言）**第一次运行就是绿的**，
+> 随后连续复跑结果一致（可重跑性顺带验了）。**但 3c 的错误码断言是补上之后才成立的，
+> 而且第一次补错了**——这条值得单独记下来：
+>
+> **第 3c 步的断言修过一次，原因是「客户端打印错误码」这件事与版本有关。** 我先按
+> 「v1 会打 `ServiceUnavailable`」写，实测不匹配；真实的 v1 输出是
+> `An error occurred (503) when calling the HeadObject operation (reached max retries: 4):
+> Service Unavailable`——v1 打的是**状态码**，v2 才打**错误码**。所以断言写成
+> `grep -qE '\(503\)|ServiceUnavailable'` 两个都认。**这是「先跑再写」的价值**：
+> 凭印象写下的错误消息字符串，多半是错的。
+>
+> 另外两点实跑观察，供以后改脚本时对照：
+>
+> - **第 3c 步的 503 出现在 `HeadObject` 上**，不是 `GetObject`：`s3 cp` 下载前先发
+>   HEAD，而 HEAD 同样受 `read_quorum` 约束，所以「读失败」在更早的一步就暴露了。
+>   aws-cli 对 503 会自动重试 4 次（`retry-after: 1`，服务端会回这个头），
+>   所以这一步用时约 4 秒，不是卡住。
+> - **`mc` 在运行中会额外对 `GetObjectLockConfiguration` 吃一个 501**，
+>   它容忍该错误、不影响脚本。这不是缺陷，已在「已知限制」表登记。
 
 - [ ] **Step 2: 运行，直到全部通过**
 
