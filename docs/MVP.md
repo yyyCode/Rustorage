@@ -6718,6 +6718,22 @@ let start_after = req.input.continuation_token.clone().or(req.input.start_after.
 > 同时把 `name`（桶名）、`prefix`、`delimiter`、`max_keys`、
 > `continuation_token`（**回显输入的那个 token**）都填上——AWS 会回显它们，
 > 而有些客户端会拿回显值做校验。
+>
+> **`is_truncated` 与 `key_count` 也必须显式填 `Some(..)`**，不能省。
+> `is_truncated: Option<IsTruncated>` 是 `Option<bool>`，`None` 会渲染成**没有**
+> `<IsTruncated>` 元素；而 S3 客户端把它当**必填**读（boto3 的
+> `IsTruncated` 是 `ResponseMetadata` 之外的分页判据，缺失会被当成 `false` 或直接
+> 报解析错）。桶空时也要 `Some(false)`。
+>
+> **`encoding_type` 刻意不实现，两边都不做。** 请求里的 `encoding-type=url`
+> 需要响应把每个 key/prefix/delimiter/common-prefix 都做百分号编码，并把
+> `<EncodingType>url</EncodingType>` 回显出来。MVP **既不编码，也不回显**
+> （`encoding_type: None`），返回原始 key——这是**自洽**的一套：客户端是按
+> **响应里**的 `EncodingType` 决定要不要解码的（boto3 / aws-cli / rclone 都如此），
+> 我们回 `None`，它们就不会解，拿到的是真 key。若只回显不回显混着做（比如回显了
+> `url` 却不编码），客户端会把 `a b` 当成 `a%20b` 去解，那才是真坏。
+> 这一条的代价是「请求了 url 编码的客户端拿不到编码结果」——写进注释即可，
+> 不必进「已知限制」表（它不会产生错数据）。
 
 > **continuation token 就用裸 key，不做 base64。** S3 没有规定 token 的内容，只要
 > 「传回来能接着走」即可。用 base64 只是让 token 看起来不透明，代价是多一个依赖和一个
