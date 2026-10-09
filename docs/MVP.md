@@ -4314,18 +4314,51 @@ impl ErasureSet {
 Task 4.10 的对账都要问同一个问题「现在哪个目录是权威的」：
 
 ```rust
+/// `resolve_version` 的结果。**三态，不是一个 `Option`**。
+pub(crate) enum Resolved {
+    /// 权威版本目录 + 它的元数据。**可能是删除标记**——用 `live()` 判要不要读。
+    Version { dir: String, meta: rstore_meta::ObjectMeta },
+    /// 所有盘上都没有这个 key 的任何候选目录（从来没写过，或已被对账清空）。
+    Absent,
+}
+
+impl Resolved {
+    /// 有对象可读时返回 `(权威目录名, 元数据)`；`Absent` 与「最新版本是删除标记」
+    /// 都返回 `None`。
+    pub(crate) fn live(&self) -> Option<(&str, &rstore_meta::ObjectMeta)>;
+}
+
 /// 找到 `bucket/key` 当前权威的版本目录及其实元数据。
-/// `Ok(None)` = 所有盘上都没有这个对象（或最新版本是删除标记）；`Err(ReadQuorum)` = 有数据但选不出。
+/// `Ok(Absent)` = 所有盘上都没有这个 key 的任何候选目录；
+/// `Err(ReadQuorum)` = 有候选目录但一个都过不了 quorum。
 pub(crate) async fn resolve_version(
     set: &ErasureSet,
     bucket: &str,
     key: &str,
-) -> Result<Option<(String, rstore_meta::ObjectMeta)>, StoreError>;
+) -> Result<Resolved, StoreError>;
 ```
 
-`get_object` 的第一步就是调它。**「最新版本是删除标记 → `Ok(None)`」这条语义放在
-`resolve_version` 里**，别让调用方各自判一次：DELETE 之后的 GC（4.8）与对账（4.10）
-对「这个目录还算不算活数据」必须给出同一个答案，两处各写一遍必然分叉。
+`get_object` 的第一步就是调它：
+
+```rust
+let resolved = resolve_version(self, bucket, key).await?;
+let Some((dir, meta)) = resolved.live() else {
+    return Err(StoreError::NotFound);
+};
+```
+
+（借用注意：`live()` 借用 `resolved`，所以必须像上面这样先绑定再 `let-else`；
+写成 `resolve_version(…).await?.live()` 是在借一个临时值。）
+
+**为什么必须带上 `dir` 而不是把「是删除标记」直接压成 `NotFound`：** 对账（4.10）
+要问的不是「有没有对象」，而是「**哪个目录是权威的、绝对不能删**」。删除标记**就是**
+一个权威目录——DELETE 之后那些没拿到标记的盘还留着旧数据目录，正是靠标记目录压住它们
+才读不出旧版本。若 `resolve_version` 在这里返回「什么都没有」，对账就会把标记目录也当成
+垃圾删掉，旧版本随即在那些盘上复活，而 `read_quorum` 恰好够——「对账不得改变可观测结果」
+这条不变量会以「数据复活」的形式被破掉。
+
+「能不能读」这件事仍然**只有一处答案**（`live()`），Task 4.8 的 GC 与 4.10 的对账都走它；
+变的只是「哪个目录是权威的」也跟着一起被返回出来了。
 
 原计划写的 `set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap()`
 暗示了一个流式 reader 类型——**MVP 不做流式**：分片本来就整份读进内存再解码，
@@ -4344,25 +4377,35 @@ PUT 把对象放在 `<bucket>/<key>/<data_dir>/meta.xl`，而 **GET 事先不知
    **跳过所有以 `.staging-` 开头的条目**——那些是写到一半、还没提交的目录。
    不跳的话，一个「6 块盘都写完了暂存 meta、没来得及提交」的现场会在 6 块盘上各得一票、
    直接越过 `read_quorum`，于是 GET 会把半成品当成正式版本读出来。推导见 Task 4.10。
-2. 候选为空 → `StoreError::NotFound`。
+2. 候选为空 → `Ok(Resolved::Absent)`。**不是 `NotFound`**——「有没有权威目录」与
+   「这个目录算不算有对象」是两个正交的问题，后者在 `get_object` 里由 `live()` 回答。
 3. 对**每个候选目录** `c`：收集 `Vec<Option<ObjectMeta>>`（盘 `d` 上存在 `c/meta.xl` 且能解码
    → `Some`，否则 `None`），跑 `resolve_metadata(&metas, parity)`。能过 quorum 的候选才算「成立」。
 4. 成立的候选可能有多个（覆盖写之后旧目录还没被 GC 掉，或 GC 中途崩溃）。取
    **最新版本 `header.mod_time` 最大**的那个；`mod_time` 相同（理论上不会）时取 `version_id` 大的。
-   一个都不成立 → `ReadQuorum`。
+   一个都不成立 → `ReadQuorum`。胜出的目录名与元数据一起包进 `Resolved::Version`。
 
   > 这条正是「崩溃后至少还能读到一个版本」的实现：旧版本只在少数盘上（多数盘已被覆盖），
   > 票数过不了 quorum，自然被淘汰；新版本在多数盘上，胜出。
   > 但也正因为如此，**PUT 必须给 header 写上 `mod_time`**（`SystemTime::now()` 的纳秒数）——
   > 全是 `None` 的话第 4 步就没有比较依据了。
 
-5. 胜出元数据的最新版本 `ty == VersionType::DeleteMarker` → `NotFound`。
+5. 胜出元数据的最新版本 `ty == VersionType::DeleteMarker` → **仍然返回
+   `Resolved::Version`**（目录就是那个删除标记目录）。「删除标记不算对象」这件事由
+   `live()` 统一判，`resolve_version` 不替调用方下这个结论——见上文「为什么必须带上 `dir`」。
 
 #### 读数据
 
 - **内联分支**：最新版本的 `flags` 含 `INLINE_DATA`（或 body 的 `meta_sys` 有
   `keys::INLINE_DATA`）→ 直接从 `meta.inline.get(<version key>)` 取数据返回，
   **一次都不碰 `part.*`**。版本键：无版本化桶是 `"null"`。
+
+  > 内联对象的 `etag` 只能**现算**：`put.rs` 的内联分支没把 etag 落进 meta
+  > （那条路径的 `parts` 是空 `Vec`，`etag_of` 只在返回 `PutOut` 时用过一次）。
+  > `etag_of(&data)` 与 PUT 当时算出的值逐字节相同，对客户端不可见；
+  > 代价只是每次读内联对象多一遍 MD5。MVP 接受这个代价——
+  > 要消掉它得让 4.5 把 etag 写进 body，属于另一处的改动。
+  > 分片对象不受影响，直接取 `body.parts[0].etag`。
 - **分片分支**：对每块盘读 `<winner_dir>/part.1`，得到该盘的整份分片明文
   （长度应等于 `expected_shard_len(size, data)`）；按 `block_size = shard_step(size, data)`
   切成 `n` 段，第 `k` 段是 `[k*step, min((k+1)*step, shard_len))`。
@@ -4573,7 +4616,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **DELETE** 写的是一个**删除标记版本**（`VersionType::DeleteMarker`，`size = 0`，
 不带 `USES_DATA_DIR`），走同样的暂存目录 + `commit`，quorum 用 `delete_quorum = N/2 + 1`。
 它不是「把文件删掉」，而是「写一个新的、更新的版本，而那个版本表示『没有对象』」。
-这么做的直接好处：`resolve_version`（4.7）发现最新版本是删除标记就返回「没有对象」，
+这么做的直接好处：`get_object` 的 `resolved.live()`（4.7）发现最新版本是删除标记就返回 `None`，
 于是**并发读**不会出现「一半盘上新数据已提交、一半盘上旧数据刚被删」这种谁都读不出来的窗口。
 
 #### GC 规则（一条，写死，别再加特例）
@@ -4589,6 +4632,11 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - GC 是 **best-effort**：删除失败只记日志，不上抛。残留由对账（4.10）兜底。
 - GC **幂等**：`remove_dir_all` 对不存在的目录返回 `Ok`（`fsx::remove_dir_all` 已经这么实现了）。
 - 顺序不可颠倒：**先让 `commit` 成功，再 GC**。反过来就是在删还没提交的数据。
+- GC 删的是胜出目录之外的**所有**条目，含 `.staging-*`。所以它**不是**一个可以随便
+  并发调用的清理器：理论上另一个针对同一个 key 的在写 PUT 的暂存目录也会被删掉，
+  那个 PUT 随后的 `rename` 会因为源目录不存在而失败（**失败得干净**，不会静默写坏）。
+  MVP 不做同 key 并发写的协调；真正安全地清理崩溃残留是 Task 4.10 的
+  `reclaim_orphans`（它明确声明不与写入并发运行）。
 
 ```rust
 impl ErasureSet {
@@ -4754,15 +4802,32 @@ mod tests {
         ));
     }
 
-    /// 空目录清理是幂等的：对一个已经被 GC 干净的 key 再跑一次 GC 不该报错。
-    /// （`fsx::remove_dir_all` 对不存在的路径返回 `Ok`，这条钉住这条约定没被改掉。）
+    /// GC 是幂等的：对一个已经被 GC 干净的 key 再跑一次 GC，既要安静地什么都不做，
+    /// 也不能把**胜出目录自己**删掉。光断言 `NotFound` 是抓不到后者的
+    /// （标记目录被删光以后对象照样是 `NotFound`），所以要直接看目录列表。
     #[tokio::test]
     async fn gc_is_idempotent() {
         let set = set_with_disks(6, 2).await;
         set.put_object(put_args("b", "k", vec![6u8; 1_000_000])).await.unwrap();
         set.delete_object("b", "k").await.unwrap();
-        // 再删一次会写新的删除标记并再跑一轮 GC。
+        // 再删一次会写一枚新的删除标记并再跑一轮 GC，把上一枚标记目录收掉。
         set.delete_object("b", "k").await.unwrap();
+        assert!(matches!(
+            set.get_object("b", "k", None).await,
+            Err(StoreError::NotFound)
+        ));
+
+        // 此时每块盘上只剩那一个删除标记目录：空跑一次 GC 必须原地不动。
+        for i in 0..6 {
+            let dirs = dirs_on(&set, i, "b/k").await;
+            assert_eq!(dirs.len(), 1, "disk {i}, got {dirs:?}");
+            gc_superseded(&set, "b", "k", &dirs[0]).await;
+            assert_eq!(
+                dirs_on(&set, i, "b/k").await,
+                dirs,
+                "disk {i}: 空跑 GC 改动了目录"
+            );
+        }
         assert!(matches!(
             set.get_object("b", "k", None).await,
             Err(StoreError::NotFound)
@@ -4791,16 +4856,82 @@ pub(crate) async fn gc_superseded(
 );
 ```
 
+#### 先解决 `put.rs` 里三个跨模块拿不到的东西
+
+`delete.rs` 与 `put.rs` 是**兄弟模块**，Rust 的私有项只对「本模块及其后代」可见，
+所以下面三个都得放宽到 `pub(crate)`（`put.rs` 本来就在本任务的 Files 清单里）：
+
+| 现有项 | 现状 | 改成 |
+| --- | --- | --- |
+| `fn now_nanos() -> u64`（`put.rs:86`） | 模块私有 | `pub(crate) fn now_nanos() -> u64` |
+| `impl ErasureSet { async fn write_meta_all(&self, staging, bytes) }`（`put.rs:228`） | 私有方法 | `pub(crate) async fn write_meta_all(...)` |
+| 删除标记的元数据构造 | **不存在** | 新增 `pub(crate) fn build_delete_meta(total: u8, version_id: Uuid) -> Result<ObjectMeta, StoreError>` |
+
+**不要**想着直接复用 `put.rs:95` 的 `build_meta`：
+
+- 它把 `ty` 硬编码成 `VersionType::Object`、把 `data_dir` 塞成 `Some(data_dir)`，改不动；
+- 它的参数已经是 7 个，再加一个 `ty` 就是 8 个，会撞上 `clippy::too_many_arguments`
+  （阈值 7，属于 `clippy::all`，而门禁是 `-D warnings`）。为它单开一个删除标记构造器
+  比把它拆成参数结构体风险小得多。
+
+`build_delete_meta` 就放在 `build_meta` 旁边，把「`mod_time` 必须写、不然 GET 的版本仲裁
+没有比较依据」这条不变量留在同一个文件里，别让它在 `delete.rs` 里重新推一遍：
+
+```rust
+/// 删除标记的元数据：**一个版本**，`ty = DeleteMarker`，`size = 0`，
+/// `data_dir = None`，`flags` 为空（不置 `USES_DATA_DIR`，它没有数据目录）。
+pub(crate) fn build_delete_meta(
+    total: u8,
+    version_id: Uuid,
+) -> Result<ObjectMeta, StoreError> {
+    let header = FileVersionHeader {
+        version_id: Some(version_id),
+        ty: VersionType::DeleteMarker,
+        size: 0,
+        // 同样必须写：`resolve_version` 靠它把这枚标记判成「最新」。
+        mod_time: Some(now_nanos()),
+        // 删除标记没有分片。这两个字段不参与任何判断——`Resolved::live()`
+        // 在解码 body **之前**就返回 `None` 了，分片分支根本走不到。
+        ec_m: 0,
+        ec_n: 0,
+        flags: Flags::empty(),
+        data_dir: None,
+    };
+    Ok(ObjectMeta {
+        versions: vec![ShallowVersion {
+            header,
+            body: encode_body(&ObjectBody {
+                id: None,
+                parts: Vec::new(),
+                ec_dist: Vec::new(),
+                checksum_algo: ChecksumAlgo::Crc32c,
+                storage_class: StorageClass::Standard,
+                meta_user: BTreeMap::new(),
+                meta_sys: BTreeMap::new(),
+            })?,
+        }],
+        inline: InlineData::new(),
+        meta_ver: 1,
+    })
+}
+```
+
+（参数里那个 `total` 在实现里暂时用不上——如果你确实一个字段都不用它，就把参数删掉，
+别留一个 `_total` 糊过去；关键是别把 `ec_m/ec_n` 填成 `data/total`，
+那会让一个没有分片的版本看起来像 4+2。）
+
 `delete_object` 流程：
 
 1. `txid = Uuid::new_v4()`、`marker_dir = Uuid::new_v4()`；
    `staging = format!("{bucket}/{key}/.staging-{txid}")`、
    `final_rel = format!("{bucket}/{key}/{marker_dir}")`。
    （`.staging-` 前缀见 Task 4.5 的布局说明：没有它，未提交的半成品目录会在仲裁里胜出。）
-2. 构造删除标记 `ObjectMeta`：一个版本，`header.ty = VersionType::DeleteMarker`、
-   `size = 0`、`flags` 为空（**不要**置 `USES_DATA_DIR`，没有数据目录）、
-   `data_dir = None`、`mod_time = Some(now_nanos)`（`resolve_version` 靠它比新旧）。
-3. `rstore_meta::encode` → 逐盘 `write_all("{staging}/meta.xl", &bytes)`。
+2. `let bytes = encode(&build_delete_meta(total, marker_version_id)?)?;`
+   ——构造细节见上文「先解决 `put.rs` 里三个跨模块拿不到的东西」。
+   `marker_version_id` 与 `marker_dir` **是两个各自独立的 `Uuid::new_v4()`**，
+   不要共用同一个。
+3. `self.write_meta_all(&staging, &bytes).await;`（复用 PUT 那条，
+   逐盘失败只忽略——最终 quorum 由 `commit` 的 rename 判定）。
 4. `commit(set, &staging, &final_rel, delete_quorum(total))`。
 5. 失败 → `WriteQuorum { achieved, required: delete_quorum }`（复用变体即可，
    `required` 字段本身就把数字说清楚了；为它单开一个变体只会让 M5 的错误映射多一个分支）。
@@ -4861,9 +4992,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 use rstore_disk::faulty::Fault;
 
 use crate::error::StoreError;
-use crate::get::ByteRange;
 use crate::put::PutArgs;
 use crate::testutil::{set_with_disks, TestSet};
+// 本文件不需要 `ByteRange`：矩阵只跑整对象读。别顺手 import 它——
+// `cargo clippy --all-targets -- -D warnings` 会把未使用的导入判成失败。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
@@ -4925,7 +5057,9 @@ async fn run_case(offline: usize, op: Op, expect: Expect) {
     match (expect, r) {
         (Expect::Ok, Ok(())) => {}
         (Expect::Ok, Err(e)) => panic!("offline={offline} {op:?}: 期望成功，got {e:?}"),
-        (Expect::Ok, _) => unreachable!(),
+        // 这里**不能**再补一个 `(Expect::Ok, _) => unreachable!()`：
+        // `Result` 只有 `Ok`/`Err` 两个变体，上面两条已经覆盖了 `Expect::Ok` 的全部，
+        // 那条通配臂会被 `unreachable_patterns` 判成警告，而门禁是 `-D warnings`。
         (Expect::ReadQuorum, Err(StoreError::ReadQuorum { .. })) => {}
         (Expect::WriteQuorum, Err(StoreError::WriteQuorum { .. })) => {}
         (expect, Err(e)) => panic!("offline={offline} {op:?}: 期望 {expect:?}，got {e:?}"),
@@ -5337,18 +5471,32 @@ Expected: 编译失败
 ```rust
 pub async fn scan_orphans(&self, bucket: &str) -> Result<Vec<String>, StoreError> {
     // 1. 列出 bucket 下的所有 key（每块盘各列一次，取并集——某块盘可能缺某些 key）。
-    // 2. 对每个 key 调 `get::resolve_version` 拿权威目录 `winner`。
-    // 3. 再列一次该 key 下的目录：`name != winner` 的一律是孤儿，
-    //    包含所有 `.staging-*`（它们永远不会是 winner，因为发现阶段就跳过了）。
-    // 4. 注意 `resolve_version` 返回 `Ok(None)`（删除了 / 从来没有过）时，
-    //    **该 key 下的所有目录都是孤儿**——这是 DELETE 之后 GC 没跑完的正常情形。
+    // 2. 对每个 key 调 `get::resolve_version`，**三态各有一种处理**：
+    //      Version { dir: w, .. } → 该 key 下 `name != w` 的一律是孤儿；
+    //                               删除标记目录**也是 w**，所以它自己不会被列成孤儿。
+    //      Absent                 → 发现阶段已排除了所有非 `.staging-` 条目，
+    //                               所以这个 key 下剩的全是 `.staging-*`，**全部是孤儿**。
+    //      Err(ReadQuorum)        → **跳过这个 key**（不列任何孤儿）并记日志。
+    //                               有候选目录却选不出权威版本，此刻删什么都不安全。
+    // 3. `resolve_version` 另外还会回 `Err(Disk(...))` 之类的硬错误——同样跳过该 key。
 }
 
 pub async fn reclaim_orphans(&self, bucket: &str) -> Result<(), StoreError> {
-    // 逐盘逐 key：只在这块盘**同时持有 winner 目录**时才删该盘上的非 winner 目录。
-    // 直接复用 `delete::gc_superseded`，不要再写一份判定。
+    // 逐盘逐 key，按同一个三态分派：
+    //   Version { dir: w, .. } → 只在这块盘**同时持有 w** 时才删该盘上的其余条目
+    //                            （直接复用 `delete::gc_superseded`，不要再写一份判定）；
+    //                            没拿到 w 的盘一个都不动——它上面那份旧分片仍是有效冗余。
+    //   Absent                 → 该 key 下只剩 `.staging-*`，逐盘 `remove_dir_all` 删掉即可
+    //                            （没有权威目录要保护，也没有任何东西读得出来）。
+    //   Err(ReadQuorum)        → 跳过该 key。
 }
 ```
+
+> **`Absent` 这一支不能顺手推广成「没有 winner 就删光一切」。** 它成立的前提是
+> 「发现阶段已把所有非 `.staging-` 条目排除掉了」——即 `Absent` **等价于**该 key 下
+> 只剩暂存目录。删除标记的情形**不是** `Absent`：它有权威目录（标记目录），走的是
+> `Version` 那一支。把两者混为一谈，就会出现「对账删掉标记目录 → 那些没拿到标记的盘上
+> 旧版本复活」，恰好违反本任务要钉住的不变量 2。
 
 > **`ok_count` 那个守卫不能省。** 参考 Task 4.4 的 `never_reports_success_below_quorum`——
 > 那里踩过的坑一模一样：缺了守卫，`Ok` 分支一次都没进，测试却是绿的。
