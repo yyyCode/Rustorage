@@ -3902,15 +3902,29 @@ mod tests {
         // 那样写根本编译不过）。
         assert!(matches!(r, Err(StoreError::WriteQuorum { .. })), "got {r:?}");
 
-        // 越界守卫：低于 quorum 时**一块盘都不该留下可见的最终目录**。
+        // 越界守卫：低于 quorum 时**一块盘都不该留下已提交的最终版本目录**。
+        //
+        // 断言的是 `b/k` 而**不是** `b`。暂存目录是 `b/k/.staging-<txid>`，
+        // 只要往某个 key 写过字节，`b` 下就必然有 `k` 这一层——`list_dir("b")`
+        // 永远返回 `["k"]`。原计划断言的正是 `b`，那条在「失败不清理」的实现下
+        // **不可能成立**（实现时实测：`disk 3 上残留了 ["k"]`）；
+        // 要让它成立只能删掉 `b/k`，而覆盖写场景下那会连**已提交的旧版本**一起删掉。
+        // 它真正想守的是「没有可见的最终版本目录」，所以把 `.staging-*` 排除掉再看。
         for i in 0..6 {
             let d = set.disks()[i].as_ref().unwrap();
-            let entries = if d.stat("b").await.ok().flatten().is_some() {
-                d.list_dir("b").await.unwrap_or_default()
-            } else {
-                Vec::new()
+            let entries = match d.list_dir("b/k").await {
+                Ok(v) => v,
+                Err(rstore_disk::DiskError::NotFound) => Vec::new(),
+                Err(e) => panic!("disk {i} list_dir 失败: {e:?}"),
             };
-            assert!(entries.is_empty(), "disk {i} 上残留了 {entries:?}");
+            let committed: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.starts_with(".staging-"))
+                .collect();
+            assert!(
+                committed.is_empty(),
+                "disk {i} 上出现了已提交的最终版本目录: {committed:?}"
+            );
         }
     }
 }
