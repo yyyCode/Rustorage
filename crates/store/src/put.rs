@@ -26,6 +26,7 @@ use rstore_meta::{
 use uuid::Uuid;
 
 use crate::commit::commit;
+use crate::delete::gc_superseded;
 use crate::error::StoreError;
 use crate::set::ErasureSet;
 use crate::writer::BitrotShardWriter;
@@ -83,7 +84,8 @@ pub(crate) fn etag_of(data: &[u8]) -> String {
 }
 
 /// 当前 unix 纳秒。GET 靠它在一个 key 存在多个版本目录时选出最新的那个（Task 4.7）。
-fn now_nanos() -> u64 {
+/// `pub(crate)`：Task 4.8 的删除标记构造器与写入路径共用同一个时钟。
+pub(crate) fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -116,6 +118,47 @@ fn build_meta(
         versions: vec![ShallowVersion {
             header,
             body: encode_body(&body)?,
+        }],
+        inline: InlineData::new(),
+        meta_ver: 1,
+    })
+}
+
+/// 删除标记的元数据：**一个版本**，`ty = DeleteMarker`，`size = 0`，
+/// `data_dir = None`，`flags` 为空（不置 `USES_DATA_DIR`，它没有数据目录）。
+///
+/// 放在 `build_meta` 旁边，是为了让「`mod_time` 必须写、否则 GET 的版本仲裁
+/// 没有比较依据」这条不变量留在同一个文件里，不在 `delete.rs` 里重新推一遍。
+///
+/// 不能复用 `build_meta`：它把 `ty` 硬编码成 `Object`、把 `data_dir` 塞成
+/// `Some(..)`，且参数已到 7 个（再加一个就撞 `clippy::too_many_arguments`）。
+pub(crate) fn build_delete_meta(version_id: Uuid) -> Result<ObjectMeta, StoreError> {
+    let header = FileVersionHeader {
+        version_id: Some(version_id),
+        ty: VersionType::DeleteMarker,
+        size: 0,
+        // 同样必须写：`resolve_version` 靠它把这枚标记判成「最新」。
+        mod_time: Some(now_nanos()),
+        // 删除标记没有分片。这两个字段不参与任何判断——`Resolved::live()`
+        // 在解码 body **之前**就返回 `None` 了，分片分支根本走不到。
+        // 尤其别填成 `data/total`：那会让一个没有分片的版本看起来像 4+2。
+        ec_m: 0,
+        ec_n: 0,
+        flags: Flags::empty(),
+        data_dir: None,
+    };
+    Ok(ObjectMeta {
+        versions: vec![ShallowVersion {
+            header,
+            body: encode_body(&ObjectBody {
+                id: None,
+                parts: Vec::new(),
+                ec_dist: Vec::new(),
+                checksum_algo: ChecksumAlgo::Crc32c,
+                storage_class: StorageClass::Standard,
+                meta_user: BTreeMap::new(),
+                meta_sys: BTreeMap::new(),
+            })?,
         }],
         inline: InlineData::new(),
         meta_ver: 1,
@@ -215,6 +258,11 @@ impl ErasureSet {
         // 它自己 rename 过去的那些目录。
         commit(self, &staging, &final_rel, write_quorum).await?;
 
+        // **先提交、后 GC，顺序不可颠倒**：反过来就是在删还没提交的数据。
+        // 这是覆盖写的收尾——本版本（`data_dir`）已胜出，旧目录才是待回收的。
+        // best-effort：GC 自身不上抛（见 `gc_superseded`）。
+        gc_superseded(self, &bucket, &key, &data_dir.to_string()).await;
+
         Ok(PutOut {
             size,
             etag,
@@ -225,7 +273,7 @@ impl ErasureSet {
 
     /// 把 meta.xl 写进每块可用盘的暂存目录。逐盘失败只忽略：最终的 quorum
     /// 由 `commit` 的 rename 判定，写不进去的盘自然拿不到票。
-    async fn write_meta_all(&self, staging: &str, bytes: &[u8]) {
+    pub(crate) async fn write_meta_all(&self, staging: &str, bytes: &[u8]) {
         let rel = format!("{staging}/meta.xl");
         for disk in self.disks().iter().flatten() {
             let _ = disk.write_all(&rel, bytes).await;
