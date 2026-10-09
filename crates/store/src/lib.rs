@@ -2,6 +2,7 @@
 
 pub mod commit;
 pub mod error;
+pub mod get;
 pub mod pool;
 pub mod put;
 pub mod quorum;
