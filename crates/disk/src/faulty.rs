@@ -99,9 +99,16 @@ impl FaultyDisk {
     ///
     /// **不重置调用计数器**：它是一块盘自构造以来的累计调用数（口径见
     /// [`Fault::FailAfter`]）。中途切到 `FailAfter` 时 `calls` 是与「构造以来」对齐的，
-    /// 不是与「切故障那一刻」对齐的——想从切换点起算，把已发生的调用数加进 `calls`。
+    /// 不是与「切故障那一刻」对齐的——想从切换点起算，把已发生的调用数加进 `calls`，
+    /// 或先调用 [`reset_call_count`](Self::reset_call_count)。
     pub fn set_fault(&self, fault: Fault) {
         *self.fault.lock().expect("fault mutex poisoned") = Some(fault);
+    }
+
+    /// 把调用计数归零，使 `FailAfter { calls: k }` 表示「从此刻起再放行 k 次」。
+    /// `set_fault` / `clear_fault` **都不**重置计数（计数是自构造以来累计的）。
+    pub fn reset_call_count(&self) {
+        self.calls.store(0, Ordering::SeqCst);
     }
 
     /// 清除故障，回到与内层盘完全一致的行为。

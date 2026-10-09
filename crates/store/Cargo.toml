@@ -18,6 +18,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `FaultyDisk` 在 rstore-disk 里由 `any(test, feature = "fault-injection")` 门控：
+# store 的测试是独立编译的 crate，rstore-disk 的 `cfg(test)` 在那里不生效，
+# 必须显式开这个 feature 才能看到故障注入盘。
+rstore-disk = { workspace = true, features = ["fault-injection"] }
 
 [lints]
 workspace = true
