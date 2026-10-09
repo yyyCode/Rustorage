@@ -3,6 +3,7 @@
 pub mod container;
 pub mod distribution;
 pub mod fileinfo;
+pub mod format;
 pub mod inline;
 pub mod keys;
 

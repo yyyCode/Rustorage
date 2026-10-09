@@ -672,6 +672,7 @@ dependencies = [
  "rstore-checksum",
  "rstore-common",
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
