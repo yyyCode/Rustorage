@@ -4,6 +4,7 @@
 //! `rstore-store`（allowlist 里 `rstore-s3` 只有 `rstore-common` 与 `rstore-api`），
 //! 于是它可以拿一个 mock `ObjectStore` 单独测试。
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -202,26 +203,97 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        // PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引。
+        // MVP 靠 `list_objects` 的全盘遍历（4.11）+ 本层过滤/分页，不是终态设计。
         let entries = self
             .store
             .list_objects(&req.input.bucket, req.input.prefix.as_deref())
             .await
             .map_err(to_s3_error)?;
-        // delimiter / max-keys / continuation-token 的翻页是 Task 5.5 的职责。
-        let contents = entries
-            .into_iter()
-            .map(|e| Object {
-                key: Some(e.key),
-                size: Some(e.size as i64),
-                e_tag: Some(ETag::Strong(e.etag)),
-                last_modified: Some(timestamp_of(e.mod_time)),
-                ..Default::default()
-            })
-            .collect();
+
+        let prefix = req.input.prefix.as_deref().unwrap_or("");
+        // 空字符串的 delimiter 等同没给（否则每个 key 都在开头「命中」空串）。
+        let delimiter = req.input.delimiter.as_deref().filter(|d| !d.is_empty());
+        // `max-keys` 缺省 1000（S3 默认页大小）；负数按 0 处理——「不要更多」。
+        let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
+        // 续传起点：**不解析 token 的内容，就当它是「上一个 key」**。S3 不规定 token
+        // 的形状，裸 key 是最小实现（少一个 base64 依赖与一次编解码来回）；代价是
+        // token 里能看到对象名，但本 API 本就把对象名给同一个调用方看，不算泄露。
+        let start_after = req.input
+            .continuation_token
+            .clone()
+            .or_else(|| req.input.start_after.clone());
+
+        let mut contents: Vec<Object> = Vec::new();
+        // `BTreeSet` 顺带保证共同前缀有序且天然去重（同一目录只出一次）。
+        let mut common_prefixes: BTreeSet<String> = BTreeSet::new();
+        let mut truncated = false;
+        // 「最后一条**返回过的**条目」的 key，作为下一页的游标。共同前缀也能当游标：
+        // `cp = "dir/"` 是 `"dir/x"` 的前缀，`key <= "dir/"` 恰好跳过整个 dir/ 子树。
+        let mut last_key: Option<String> = None;
+
+        for entry in entries {
+            // 游标必须最先应用：被跳过的条目不该占 max_keys 的额度，否则第二页会比
+            // 第一页短（且只在游标落在前缀内部时暴露）。字符串比较，不是下标。
+            if let Some(s) = &start_after {
+                if entry.key <= *s {
+                    continue;
+                }
+            }
+            // **先判容量，再处理本条**：max_keys=0 时在这里就 `break`，不会漏进循环体；
+            // 于是 `is_truncated` 恰好等于「循环因容量而中断」，不必事后猜还有没有剩余。
+            if contents.len() + common_prefixes.len() >= max_keys {
+                truncated = true;
+                break;
+            }
+            let rel = &entry.key[prefix.len()..];
+            match delimiter.and_then(|d| rel.find(d)) {
+                Some(rel_idx) => {
+                    // 下标是相对 `key` 全串的：相对切片的 rel_idx 必须加回 prefix.len()，
+                    // 否则前缀被吃掉，客户端按 "sub/" 列举一条都拿不到。
+                    let cp = entry.key[..prefix.len() + rel_idx + 1].to_string();
+                    common_prefixes.insert(cp.clone());
+                    last_key = Some(cp);
+                }
+                None => {
+                    contents.push(Object {
+                        key: Some(entry.key.clone()),
+                        size: Some(entry.size as i64),
+                        e_tag: Some(ETag::Strong(entry.etag)),
+                        last_modified: Some(timestamp_of(entry.mod_time)),
+                        storage_class: Some(ObjectStorageClass::from_static("STANDARD")),
+                        ..Default::default()
+                    });
+                    last_key = Some(entry.key);
+                }
+            }
+        }
+
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(req.input.bucket),
             prefix: req.input.prefix,
+            // 回显 max_keys 时用**生效值**：缺省时 1000，负数按 0。
+            max_keys: Some(max_keys as i32),
+            // S3 的 KeyCount 定义就是 contents 与 common prefixes 之和。
+            key_count: Some((contents.len() + common_prefixes.len()) as i32),
+            continuation_token: req.input.continuation_token,
+            // 这两个是 `Option`，`None` 会渲染成**缺失元素**，而客户端当必填读；
+            // 桶空时也必须是 `Some(false)`。
+            is_truncated: Some(truncated),
+            next_continuation_token: truncated.then_some(last_key).flatten(),
             contents: Some(contents),
+            common_prefixes: Some(
+                common_prefixes
+                    .into_iter()
+                    .map(|p| CommonPrefix { prefix: Some(p) })
+                    .collect(),
+            ),
+            delimiter: req.input.delimiter,
+            // encoding-type 刻意不做，两边都不做：请求 url 编码时，响应得把每个 key /
+            // prefix / delimiter / common-prefix 都百分号编码并回显 <EncodingType>url。
+            // MVP 既不编码也不回显（None），返回原始 key——客户端按**响应里**的
+            // EncodingType 决定要不要解码，我们回 None，它们就不解。只回显不编码才是坏的
+            // （客户端会把 "a b" 当 "a%20b" 去解）。代价是拿不到想要的编码结果，但不产生错数据。
             ..Default::default()
         }))
     }
@@ -261,6 +333,7 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -765,5 +838,216 @@ mod tests {
         assert_eq!(error_code(&body), "InvalidRange");
         // RFC 9110 §15.5.17 的 SHOULD：416 应带回整份长度，客户端据此判断对象没变短。
         assert_eq!(header(&headers, "content-range"), "bytes */26");
+    }
+
+    // ---- Task 5.5: ListObjectsV2 ----
+
+    /// 列出用例共用的 5 条 key，已按 key 升序（字节序）：顶层对象、一级子目录、
+    /// 二级子目录各覆盖到。注意 `dir/sub/z` 排在 `dir/x` 之前——升序是纯字典序，
+    /// 不把 `/` 当目录分隔符看待。
+    const LIST_KEYS: [&str; 5] = ["a.txt", "dir/sub/z", "dir/x", "dir/y", "z.txt"];
+
+    /// 备好 `test-bucket`，放入 `LIST_KEYS`（每条内容是它自己的 key，长度无关紧要）。
+    async fn seeded_store() -> Arc<MockStore> {
+        let store = Arc::new(MockStore::default());
+        for key in LIST_KEYS {
+            store
+                .put_object("test-bucket", key, key.as_bytes().to_vec())
+                .await
+                .expect("put object");
+        }
+        store
+    }
+
+    /// 打一个 `GET /test-bucket?list-type=2[&<query>]`，返回 (状态码, 响应体)。
+    async fn list(store: Arc<MockStore>, query: &str) -> (StatusCode, Bytes) {
+        let path = if query.is_empty() {
+            "/test-bucket?list-type=2".to_string()
+        } else {
+            format!("/test-bucket?list-type=2&{query}")
+        };
+        let (status, _headers, body) = call_on(mock_service(store), request("GET", &path, b"")).await;
+        (status, body)
+    }
+
+    /// 取出所有 `<tag>...</tag>` 的内层文本（同一标签出现多次时按响应顺序全给）。
+    fn blocks(body: &[u8], tag: &str) -> Vec<String> {
+        let xml = std::str::from_utf8(body).expect("xml body");
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut out = Vec::new();
+        let mut rest = xml;
+        while let Some(i) = rest.find(&open) {
+            let start = i + open.len();
+            let end = start + rest[start..].find(&close).expect("未闭合的标签");
+            out.push(rest[start..end].to_string());
+            rest = &rest[end + close.len()..];
+        }
+        out
+    }
+
+    /// 单个标量元素的内层文本，如 `<KeyCount>5</KeyCount>` → `"5"`；缺元素即 panic。
+    fn scalar(body: &[u8], tag: &str) -> String {
+        blocks(body, tag)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("响应缺少 <{tag}>"))
+    }
+
+    /// 响应里 `<Contents>` 的 key 列表（按响应顺序）。
+    fn content_keys(body: &[u8]) -> Vec<String> {
+        blocks(body, "Contents")
+            .iter()
+            .map(|c| {
+                blocks(c.as_bytes(), "Key")
+                    .into_iter()
+                    .next()
+                    .expect("Contents 缺少 Key")
+            })
+            .collect()
+    }
+
+    /// 响应里 `<CommonPrefixes>` 的 prefix 列表（按响应顺序）。
+    fn common_prefixes(body: &[u8]) -> Vec<String> {
+        blocks(body, "CommonPrefixes")
+            .iter()
+            .map(|c| {
+                blocks(c.as_bytes(), "Prefix")
+                    .into_iter()
+                    .next()
+                    .expect("CommonPrefixes 缺少 Prefix")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lists_all_sorted() {
+        let (status, body) = list(seeded_store().await, "").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(content_keys(&body), LIST_KEYS);
+        assert_eq!(scalar(&body, "KeyCount"), "5");
+        assert_eq!(scalar(&body, "IsTruncated"), "false");
+    }
+
+    #[tokio::test]
+    async fn prefix_filters() {
+        let (status, body) = list(seeded_store().await, "prefix=dir/").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(content_keys(&body), ["dir/sub/z", "dir/x", "dir/y"]);
+    }
+
+    #[tokio::test]
+    async fn delimiter_rolls_up_common_prefixes() {
+        let (status, body) = list(seeded_store().await, "delimiter=/").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(content_keys(&body), ["a.txt", "z.txt"]);
+        // `dir/` 下所有 key 归并成**一条**共同前缀，而不是 dir/x、dir/y、dir/sub 三条。
+        assert_eq!(common_prefixes(&body), ["dir/"]);
+        assert_eq!(scalar(&body, "KeyCount"), "3");
+    }
+
+    #[tokio::test]
+    async fn prefix_and_delimiter_together_keep_the_prefix() {
+        let (status, body) = list(seeded_store().await, "prefix=dir/&delimiter=/").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(content_keys(&body), ["dir/x", "dir/y"]);
+        // 共同前缀必须保留请求前缀：切出 "sub/" 会让客户端按 "sub/" 列举一条都拿不到。
+        assert_eq!(common_prefixes(&body), ["dir/sub/"]);
+    }
+
+    #[tokio::test]
+    async fn max_keys_zero_returns_empty_and_truncated() {
+        let (status, body) = list(seeded_store().await, "max-keys=0").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(content_keys(&body).is_empty(), "max-keys=0 不应返回任何对象");
+        assert_eq!(scalar(&body, "KeyCount"), "0");
+        // 桶里还有 5 条没返回——`is_truncated` 表示「还有没返回完的条目」。
+        assert_eq!(scalar(&body, "IsTruncated"), "true");
+    }
+
+    #[tokio::test]
+    async fn max_keys_truncates_and_sets_is_truncated() {
+        let (status, body) = list(seeded_store().await, "max-keys=2").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(content_keys(&body), ["a.txt", "dir/sub/z"]);
+        assert_eq!(scalar(&body, "KeyCount"), "2");
+        assert_eq!(scalar(&body, "IsTruncated"), "true");
+        assert!(
+            !scalar(&body, "NextContinuationToken").is_empty(),
+            "截断时应给出续传 token"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_token_resumes_without_gap_or_dup() {
+        let store = seeded_store().await;
+        let (status, page1) = list(store.clone(), "max-keys=2").await;
+        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page1));
+        let token = scalar(&page1, "NextContinuationToken");
+
+        // 第二页不设 max-keys，把剩下的全取回。
+        let (status, page2) = list(store, &format!("continuation-token={token}")).await;
+        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page2));
+
+        let first = content_keys(&page1);
+        let second = content_keys(&page2);
+        assert_eq!(second, ["dir/x", "dir/y", "z.txt"], "第二页应无缺口地接着第一页");
+        // 核心断言：并集 == 全集、交集为空。`rclone sync` 依赖它——漏一条会被当成
+        // 远端文件不存在而**删除**；重一条则目录里出现重复条目。
+        let mut union: BTreeSet<String> = first.iter().cloned().collect();
+        union.extend(second.iter().cloned());
+        let expected: BTreeSet<String> = LIST_KEYS.iter().map(|k| k.to_string()).collect();
+        assert_eq!(union, expected, "两页并集必须等于全集");
+        let overlap: Vec<&String> = first.iter().filter(|k| second.contains(k)).collect();
+        assert!(overlap.is_empty(), "两页不应有重叠: {overlap:?}");
+    }
+
+    #[tokio::test]
+    async fn exactly_full_last_page_is_not_truncated() {
+        let store = Arc::new(MockStore::default());
+        for key in ["a", "b", "c", "d"] {
+            store
+                .put_object("test-bucket", key, key.as_bytes().to_vec())
+                .await
+                .expect("put object");
+        }
+        // 4 条、max-keys=2：页一截断，用它的 token 取页二。
+        let (_, page1) = list(store.clone(), "max-keys=2").await;
+        let token = scalar(&page1, "NextContinuationToken");
+        let (status, page2) = list(store, &format!("max-keys=2&continuation-token={token}")).await;
+        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&page2));
+        assert_eq!(content_keys(&page2), ["c", "d"]);
+        // 恰好填满且已到底：必须 false，否则客户端会再多翻一页空页（循环不收敛）。
+        assert_eq!(scalar(&page2, "IsTruncated"), "false");
     }
 }
