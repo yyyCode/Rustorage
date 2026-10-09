@@ -2038,12 +2038,56 @@ git commit -m "feat(meta): inline data framing with size thresholds"
 - Create: `crates/common/src/disk_id.rs`（`DiskId`——**必须放 common**）
 - Create: `crates/disk/src/lib.rs`
 - Modify: `crates/common/src/lib.rs`（加 `pub mod disk_id;`）
+- Modify: `crates/common/src/error.rs`（把 `DiskError` 补全为 DESIGN §17 的四个变体）
 - Modify: `crates/disk/Cargo.toml`（`tokio`/`async-trait`/`thiserror` 已在 `[dependencies]`；
   需加 `[dev-dependencies] tempfile.workspace = true`）
 
 > `DiskId` 定义在 **`rstore-common`** 而不是 disk：Task 3.3 的 `meta::format` 也要用它，
 > 而 meta 只允许依赖 common/checksum（护栏方向 `disk → meta`）。
 > `FileStat` 只有 disk 层用，直接定义在 `crates/disk/src/lib.rs`。
+
+**先把 `DiskError` 补全**——Task 2.1 出于 `#[non_exhaustive]` 只定义了
+`NotFound` / `Corrupt`，但 Task 3.2 立刻要用到 `Transient` 和 `Fatal`
+（短读、路径逃逸）。补到 `crates/common/src/error.rs`：
+
+```rust
+/// 瞬时故障：重试有意义，**不计入损坏统计**（DESIGN §17）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransientKind {
+    #[error("io error")]
+    Io,
+    #[error("timeout")]
+    Timeout,
+    #[error("short read")]
+    ShortRead,
+}
+
+/// 致命故障：需要人工介入，重试无意义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FatalKind {
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("read-only disk")]
+    ReadOnly,
+    #[error("path escapes disk root")]
+    PathEscape,
+    #[error("no space left")]
+    NoSpace,
+}
+```
+
+并在 `DiskError` 上加：
+
+```rust
+    #[error("transient: {0}")]
+    Transient(TransientKind),
+    #[error("fatal: {0}")]
+    Fatal(FatalKind),
+```
+
+> 用无载荷的 `Kind` 枚举而不是塞进 `io::Error`：`DiskError` 要能 `PartialEq`
+> （quorum 投票、测试断言都依赖它），而 `io::Error` 不是 `PartialEq`。
+> 具体错误细节走日志，不走错误值。
 
 - [ ] **Step 1: 定义 trait（这是契约）**
 
@@ -2280,12 +2324,8 @@ mod tests {
 }
 ```
 
-> `Transient` / `TransientKind` 是 M3 才引入的 `DiskError` 变体（Task 2.1 里
-> `#[non_exhaustive]` 留的口子）。**在本任务把 `DiskError::Transient(TransientKind)`、
-> `TransientKind::Timeout`、以及 `DiskError::Fatal(FatalKind)` 一并定义到
-> `crates/common/src/error.rs`**——磁盘层从 Task 3.2 起就会返回它们，现在补比以后再改好。
-> `TransientKind` 至少要有 `Io` / `Timeout` / `ShortRead`；`FatalKind` 至少要有
-> `PermissionDenied` / `ReadOnly` / `PathEscape` / `NoSpace`。
+> `Transient` / `TransientKind` / `Fatal` / `FatalKind` 已在 **Task 3.1** 补进
+> `crates/common/src/error.rs`——磁盘层从 Task 3.2 起就返回它们了，不能等到这里。
 
 ```rust
 /// 拓扑协商失败。
@@ -2334,7 +2374,10 @@ git commit -m "feat(meta): format.json with shared identity quorum and strict in
 **Files:**
 - Create: `crates/disk/src/faulty.rs`
 - Create: `crates/disk/tests/faulty_disk.rs`
-- Modify: `crates/disk/Cargo.toml`（新增 `[features] fault-injection = []`）
+- Modify: `crates/disk/src/lib.rs`（`pub use local::LocalDisk;`、`pub use error::DiskError;`
+  等 re-export，以及下面说的门控模块声明）
+- Modify: `crates/disk/Cargo.toml`（新增 `[features] fault-injection = []`；
+  `[dev-dependencies]` 需要 `tokio.workspace = true`、`tempfile.workspace = true`）
 
 > **为什么要 feature**：`FaultyDisk` 必须能被 `rstore-store` 的集成测试用到，
 > 而集成测试是**独立编译的 crate**，`#[cfg(test)]` 在那里不生效。
@@ -2344,8 +2387,9 @@ git commit -m "feat(meta): format.json with shared identity quorum and strict in
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-use rstore_disk::faulty::{FaultyDisk, Fault};
-use rstore_disk::{DiskAPI, LocalDisk};
+use rstore_common::disk_id::DiskId;
+use rstore_disk::faulty::{Fault, FaultKind, FaultyDisk};
+use rstore_disk::{DiskAPI, DiskError, LocalDisk};
 
 #[tokio::test]
 async fn can_drop_writes() {
@@ -2353,7 +2397,7 @@ async fn can_drop_writes() {
     let inner = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
     let d = FaultyDisk::wrap(inner).with(Fault::DropWrites);
     d.write_all("f", b"x").await.unwrap();       // 对外报成功
-    assert!(matches!(d.read_exact_at("f", 0, 1).await, Err(DiskError::NotFound(_))));
+    assert!(matches!(d.read_exact_at("f", 0, 1).await, Err(DiskError::NotFound)));
 }
 
 #[tokio::test]
@@ -2387,10 +2431,52 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-`FaultyDisk` 用 `AtomicUsize` 计调用次数、`Mutex<Option<Fault>>` 存当前故障。
-必须支持 DESIGN §19.2 列出的全部故障类型：`DropWrites`、`PartialWrite`、`CorruptBytes`、
-`Truncate`、`FailAfter { calls, kind }`（`kind: FaultKind::{Transient, Corrupt, NotFound}`）、
-`Offline`。
+`FaultyDisk` 用 `AtomicUsize` 计调用次数、`Mutex<Option<Fault>>` 存当前故障
+（默认 `None`，即行为与内层盘完全一致）。
+
+```rust
+/// 注入的故障。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// 写调用对外报成功，但数据不落盘（模拟丢失 fsync）。
+    DropWrites,
+    /// 只写入前一半字节（模拟撕裂写）。
+    PartialWrite,
+    /// 写入时在偏移 `at` 处按 `mask` 异或——**静默损坏**：不报任何错，读回来的字节就是错的。
+    CorruptBytes { at: usize, mask: u8 },
+    /// 写入后把文件截断到 `len` 字节。
+    Truncate { len: usize },
+    /// 第 `calls` 次调用起，一律返回 `kind` 对应的错误。
+    FailAfter { calls: usize, kind: FaultKind },
+    /// 所有调用都返回 `Transient`（模拟盘离线）。
+    Offline,
+}
+
+/// `FailAfter` / `Offline` 要伪造的错误种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    Transient,
+    Corrupt,
+    NotFound,
+}
+
+impl DiskAPI for FaultyDisk { /* 每个方法先看故障，再委托给内层 */ }
+
+impl FaultyDisk {
+    /// 包一层。初始无故障。
+    pub fn wrap(inner: impl DiskAPI + 'static) -> Self;
+
+    /// builder 风格：消耗并返回，用于构造后立即设一次故障。
+    pub fn with(self, fault: Fault) -> Self;
+
+    /// 原地改故障（测试中途切换用）。`&self` —— 内部靠 `Mutex` 提供可变性，
+    /// 所以测试里的 `let d = ...` 不需要 `mut`。
+    pub fn set_fault(&self, fault: Fault);
+}
+```
+
+`CorruptBytes` / `Truncate` 都对**写入**生效；读路径只负责把已经损坏的字节原样交出去，
+不额外校验——否则就模拟不出「静默损坏」了。
 
 **要求：`FaultyDisk` 必须通过 `contract_tests`（无故障注入时行为与 `LocalDisk` 完全一致）**，
 否则它测出来的问题可能是它自己引入的。
