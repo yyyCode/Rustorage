@@ -8,8 +8,27 @@ publish.workspace = true
 [dependencies]
 rstore-api.workspace = true
 rstore-common.workspace = true
+s3s.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures.workspace = true
+# `S3Response::with_status` 要 `http::StatusCode`；s3s 不公开 re-export 它
+# （`s3s::http` 是私有模块），所以 S3 实现层需要这个依赖。
+http.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true
+# 时间戳：认证测试要用「当前 UTC 时间」签 SigV4（默认时钟偏移容忍 900s），
+# 手工做 civil-date 换算没有必要。jiff 已经是 s3s-sigv4 的依赖。
+jiff.workspace = true
+# SigV4 签名工具（`s3s` 的直接依赖，但**没有**公开 re-export；
+# s3s 只 re-export 了 `AmzDate` 与 `AuthorizationV4` 的 fuzzing 门控项）。
+# 认证测试需要它来**生成**请求——用被测代码的不同一条路径签字，才算真的在测校验。
+s3s-sigv4 = "0.17"
 
 [lints]
 workspace = true

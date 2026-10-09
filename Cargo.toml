@@ -40,6 +40,12 @@ tempfile = "3"
 futures = "0.3"
 async-trait = "0.1"
 lru = "0.12"
+s3s = "0.17"
+# 测试要用的 HTTP/tower 工具（examples 与集成测试里直接用 oneshot 打请求）。
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+http-body-util = "0.1"
+jiff = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
