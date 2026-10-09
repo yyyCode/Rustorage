@@ -14,3 +14,7 @@ Thumbs.db
 
 # 本地测试产物
 /tmp/
+
+# Python
+__pycache__/
+*.pyc

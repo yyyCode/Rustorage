@@ -3,6 +3,7 @@ name = "rstore-server"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 rstore-common.workspace = true

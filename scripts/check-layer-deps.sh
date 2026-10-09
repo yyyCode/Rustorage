@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 校验 DESIGN §5 的依赖方向规则（R1–R4）。
-# 白名单语义：只允许表中列出的内部依赖边。表已按传递闭包补齐。
+# 校验 DESIGN §5 的依赖方向规则（R1–R4）。策略在 check_layer_deps.py。
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 解释器探测：必须真正执行一段程序并核对输出，退出码不可信。
 # Windows 上 python3 可能是 Store/MSIX 别名：`python3 --version` 正常、
@@ -20,48 +21,14 @@ if [ -z "$PYTHON" ]; then
     exit 2
 fi
 
-# 注意：这里必须写成 "$PYTHON" -c "$(cat <<'PY' ... PY)"。
-# 不能写成 `cargo metadata ... | python3 - <<'PY'`——管道虽先绑定 fd 0，
-# 但同一条命令上的 heredoc 重定向会覆盖它，于是 python 从 heredoc 读"程序"，
-# 而 json.load(sys.stdin) 读到 EOF。这是 shell 重定向语义，与平台无关。
-cargo metadata --format-version 1 --no-deps | "$PYTHON" -c "$(cat <<'PY'
-import json, sys
-
-ALLOWED = {
-    "rstore-common":    set(),
-    "rstore-checksum":  {"rstore-common"},
-    "rstore-erasure":   {"rstore-common"},
-    "rstore-meta":      {"rstore-common", "rstore-checksum"},
-    "rstore-disk":      {"rstore-common", "rstore-meta", "rstore-checksum"},
-    "rstore-store":     {"rstore-common", "rstore-checksum", "rstore-erasure",
-                         "rstore-meta", "rstore-disk"},
-    "rstore-api":       {"rstore-common"},
-    "rstore-s3":        {"rstore-common", "rstore-api"},
-    "rstore-s3-compat": {"rstore-common"},
-    # 组合根：允许看见全部（DESIGN §5 R4 规定绑定实现只在这里发生）
-    "rstore-server":    {"rstore-common", "rstore-checksum", "rstore-erasure",
-                         "rstore-meta", "rstore-disk", "rstore-store",
-                         "rstore-api", "rstore-s3", "rstore-s3-compat"},
-}
-
-meta = json.load(sys.stdin)
-fail = False
-
-for pkg in meta["packages"]:
-    name = pkg["name"]
-    if name not in ALLOWED:
-        print(f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖")
-        fail = True
-        continue
-    for dep in pkg["dependencies"]:
-        dep_name = dep["name"]
-        if not dep_name.startswith("rstore-"):
-            continue                      # 只约束内部 crate
-        if dep_name not in ALLOWED[name]:
-            kind = dep.get("kind") or "normal"
-            print(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
-            fail = True
-
-sys.exit(1 if fail else 0)
-PY
-)"
+# 注意：管道右侧的命令绝不能带 heredoc 重定向。
+# `cargo metadata ... | python3 - <<'PY'` 是错的——管道虽先绑定 fd 0，
+# 但同一条命令上的 heredoc 会覆盖它，于是 python 读到的是程序而非 JSON。
+# `set -o pipefail` 让 cargo 失败时整条管道失败；检查器的 2 号退出码
+# 再把「护栏自身跑不起来」与「发现违规」区分开。
+#
+# 左侧保持在工作区根目录执行（cargo 需要它）。右侧把 SCRIPT_DIR 作为参数
+# 传给原生 python 时，Git Bash 会做 POSIX→Windows 路径转换，
+# 因此 Windows 上也能跑通。若日后报 “No such file”，
+# 说明该转换失效，改用 `(cd "$SCRIPT_DIR" && "$PYTHON" ./check_layer_deps.py)`。
+cargo metadata --format-version 1 --no-deps | "$PYTHON" "$SCRIPT_DIR/check_layer_deps.py"
