@@ -6494,7 +6494,15 @@ Ok(S3Response::new(GetObjectOutput {
 
 #### Task 5.4: Range
 
-**Files:** Modify `crates/s3/src/impl_s3.rs`
+**Files:** Modify `crates/s3/src/impl_s3.rs`、Modify `crates/s3/src/errors.rs`
+
+> `errors.rs` 在这个 Task 的列表里，是因为 `ApiError::InvalidRange` 目前**没有**映射行
+> （只有 5.2 的桶错误与 5.3 的 `NoSuchKey`），会掉进 `_` 兜底变成
+> `500 InternalError "unmapped api error: invalid range"`。所以要加
+> `ApiError::InvalidRange => s3s::s3_error!(InvalidRange)`，并在
+> `object_operation_errors_map_to_their_s3_codes` 里补一行
+> `assert_code(ApiError::InvalidRange, "InvalidRange", 416)`。
+> 这是 5.3 改 `errors.rs` 的同一模式：**每个 Task 补自己用到的行**，5.8 收口。
 
 **不写 `bytes=` 解析器**——`req.input.range` 已经是 `Option<Range>`（见本节表）。
 这一步只做三件事：把 `Range` 解成闭区间、查对象长度、越界时回 `416`。
@@ -6575,21 +6583,38 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 > ```rust
 > // resolve_range 保持纯函数（返回 Result<ByteRange, ApiError>），
 > // 由调用点补头——只有调用点手里有 info.size。
-> let br = match resolve_range(range, info.size) {
->     Ok(br) => br,
->     Err(ApiError::InvalidRange) => {
->         let mut err = s3s::s3_error!(InvalidRange);
->         let mut headers = http::HeaderMap::new();
->         headers.insert(
->             "content-range",
->             format!("bytes */{}", info.size).parse().expect("ascii"),
->         );
->         err.set_headers(headers);
->         return Err(err);
->     }
->     Err(e) => return Err(to_s3_error(e)),
+> //
+> // 注意 req.input.range 是 Option<Range>，解出来的也是 Option<ByteRange>：
+> // 无 Range 的请求必须继续走 `None`（即整份），不能硬凑成 0..size-1——
+> // 那样会让 5.3 那条「无 Range → 200 而非 206」的路径悄悄变成 206。
+> let resolved = match req.input.range {
+>     Some(r) => Some(match resolve_range(r, info.size) {
+>         Ok(br) => br,
+>         Err(ApiError::InvalidRange) => {
+>             let mut err = s3s::s3_error!(InvalidRange);
+>             let mut headers = http::HeaderMap::new();
+>             headers.insert(
+>                 "content-range",
+>                 format!("bytes */{}", info.size).parse().expect("ascii"),
+>             );
+>             err.set_headers(headers);
+>             return Err(err);
+>         }
+>         Err(e) => return Err(to_s3_error(e)),
+>     }),
+>     None => None,
 > };
+> let out = self.store.get_object(&bucket, &key, resolved).await?;
+> // 有 Range 时 Content-Length 是切片长度，无 Range 时才是整份长度。
+> let content_length = match resolved {
+>     Some(br) => (br.end - br.start + 1) as i64,
+>     None => out.size as i64,
+> };
+> let content_range = resolved.map(|br| format!("bytes {}-{}/{}", br.start, br.end, out.size));
 > ```
+>
+> `resolved` 先算出来再复用于 `content_length` 与 `content_range`，别在两处各解一遍
+> ——那正是「一个分支改了、另一个没改」的来源。
 >
 > 补一条断言 `Content-Range == "bytes */26"` 的测试。**别把 `resolve_range` 改成
 > 返回带头的错误**——那会让一个纯区间计算函数去知道 HTTP 头，也让它没法脱离
