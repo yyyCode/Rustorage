@@ -134,7 +134,10 @@ impl ErasureSet {
     /// 某块盘缺这个目录（`NotFound`）或读不到（其它错误）都按「这块盘没贡献条目」处理：
     /// 对账是 best-effort，够不着某块盘不该让整次扫描失败。key 列表与 key 下的目录
     /// 列表都走这一条——各盘的持有集合本来就不必相同（落后盘、部分提交都会造成差异）。
-    async fn entries_under(&self, rel: &str) -> Vec<String> {
+    ///
+    /// `pub(crate)`：LIST（Task 4.11）的候选目录发现直接复用这一条，**不重写第二遍**
+    /// 「某块盘读不到怎么办」——对账与列举对这件事的答案必须相同。
+    pub(crate) async fn entries_under(&self, rel: &str) -> Vec<String> {
         let mut union: BTreeSet<String> = BTreeSet::new();
         for slot in self.disks().iter().flatten() {
             if let Ok(entries) = slot.list_dir(rel).await {

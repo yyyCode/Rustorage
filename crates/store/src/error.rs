@@ -19,6 +19,11 @@ pub enum StoreError {
     /// 「真的没有」和「读不出来」了。
     #[error("not found")]
     NotFound,
+    /// 桶里还有**活对象**，不能删（Task 4.11）。只有删除标记与孤儿目录的桶算空桶。
+    ///
+    /// 单独一个变体：5.8 的错误映射表把它映射成 409，与「桶不存在」的 404 不同类。
+    #[error("bucket not empty")]
+    BucketNotEmpty,
     #[error("bad shard layout: {0}")]
     ShardLayout(String),
     #[error("internal error: {0}")]

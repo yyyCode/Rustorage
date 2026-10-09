@@ -35,10 +35,44 @@ pub struct GetOut {
 
 /// 一个 `ObjectMeta` 里「最新」的那个版本：先比 `mod_time`，相同再比 `version_id`。
 /// PUT 每个版本都会写 `mod_time`（纳秒），版本仲裁完全依赖它。
-fn latest_version(meta: &ObjectMeta) -> Option<&ShallowVersion> {
+///
+/// `pub(crate)`：`Resolved::live()` 用它判「最新版本是不是删除标记」，LIST（Task 4.11）
+/// 也要从权威元数据里取最新版本的 `size` / `mod_time`——「哪个版本最新」只能有一处答案。
+pub(crate) fn latest_version(meta: &ObjectMeta) -> Option<&ShallowVersion> {
     meta.versions
         .iter()
         .max_by_key(|v| (v.header.mod_time.unwrap_or(0), v.header.version_id))
+}
+
+/// 取一个权威版本（`meta`）的 etag。
+///
+/// **etag 只能有一处算法**：GET（`get_object`）与 LIST（`ObjectEntry`）都走这里，
+/// 否则「HEAD 的 ETag 与 LIST 的不一样」会让 `rclone check` 这类客户端报校验失败。
+///
+/// 分片对象直接读 `parts[0].etag`；内联对象现算 `etag_of(inline)`——内联对象的 etag
+/// **没落进 meta**（Task 4.5 的内联分支 `parts` 为空），只能从 `meta.inline` 现算。
+///
+/// `parts` 为空且不是内联 → `Internal`：元数据自相矛盾，报错比猜一个 etag 强。
+/// （这不影响 GET 的正常路径：内联对象走内联分支，分片对象必有 `parts`。）
+pub(crate) fn etag_of_meta(meta: &ObjectMeta) -> Result<String, StoreError> {
+    let latest = latest_version(meta)
+        .ok_or_else(|| StoreError::Internal("metadata has no versions".into()))?;
+    let body = decode_body(&latest.body)?;
+    let is_inline = latest.header.flags.contains(Flags::INLINE_DATA)
+        || body.meta_sys.contains_key(keys::INLINE_DATA);
+    if is_inline {
+        let full = meta.inline.get("null").ok_or_else(|| {
+            StoreError::Internal("version marked inline but holds no inline data".into())
+        })?;
+        Ok(etag_of(full))
+    } else {
+        match body.parts.first() {
+            Some(p) => Ok(p.etag.clone()),
+            None => Err(StoreError::Internal(
+                "version has neither inline data nor parts".into(),
+            )),
+        }
+    }
 }
 
 /// 读一块盘上的 `meta.xl`：不存在、读失败或解码失败都返回 `None`。
@@ -375,7 +409,8 @@ impl ErasureSet {
             let data_dir = header.data_dir.ok_or_else(|| {
                 StoreError::Internal(format!("inline version of {key_rel} has no data_dir"))
             })?;
-            let etag = etag_of(&full);
+            // etag 与 LIST 共用同一处算法（见 `etag_of_meta`）。
+            let etag = etag_of_meta(meta)?;
             let data = apply_range(full, size, range)?;
             return Ok(GetOut {
                 data,
@@ -387,11 +422,8 @@ impl ErasureSet {
 
         // 分片分支。
         let full = read_shards(self, &key_rel, winner_dir, &header, &body).await?;
-        let etag = body
-            .parts
-            .first()
-            .map(|p| p.etag.clone())
-            .unwrap_or_else(|| etag_of(&full));
+        // etag 与 LIST 共用同一处算法（见 `etag_of_meta`）；`parts` 为空时它报 `Internal`。
+        let etag = etag_of_meta(meta)?;
         let data_dir = header
             .data_dir
             .or(body.id)
