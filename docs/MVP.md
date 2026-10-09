@@ -5480,6 +5480,14 @@ mod tests {
 }
 ```
 
+> **要有第四条测试：`reclaim_keeps_the_delete_marker_as_authority`。**
+> 上面三条覆盖了 PUT 中断、GC 中断、暂存目录不可见，但**没有一条**盯住
+> 「删除标记必须走 `Version` 分支而不是 `Absent` 分支」——而这正是三态契约存在的
+> 全部理由。构造：先 PUT，再 DELETE，让删除标记只落到 4 块盘（其余 2 块仍留旧目录）；
+> 对账**前后逐盘 `list_dir` 必须完全相同**，且 `get` 仍是 `NotFound`。
+> 若误走 `Absent` 的「全删」分支，那 2 块盘的旧目录会被清掉，两侧列表不再相等，
+> 断言变红。这一条是 4.10 的核心不变量，不能省。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p rstore-store reconcile`
@@ -6327,6 +6335,23 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 > multipart 上传，而 MVP 对 multipart 返回 501（见 Task 5.6）。脚本里的
 > `head -c 1048576` 是刻意的；**不要**为了「测得更充分」把它调大，
 > 那会让冒烟脚本以「测到 multipart 的 501」的形式失败，而那个失败不是 compat 层能修的。
+
+> **本任务的实际执行顺序在 Task 6.3 之后。** 三个脚本都打 `http://127.0.0.1:9000`，
+> 需要一个**已经跑起来的服务**——而「启动编排 + `--volumes/--port` 命令行」是
+> Task 6.3 才做的（`crates/server/src/main.rs` 由它创建）。也就是说这是本计划里
+> **唯一一处 M5 依赖 M6 的地方**：先把 6.1~6.3 做完，再回来跑这里的脚本。
+> 别在 5.9 里临时写一个一次性 main 来绕过——那就是在 M6 之前先把 M6 做一半。
+> 启动命令见 Task 6.4 的验收脚本（`cargo run -p rstore-server -- --volumes … --port 9000`）。
+
+> **凭据要与服务端的默认值一致。** 脚本里硬编码的
+> `rustorage` / `rustorage-secret` 必须就是 Task 6.3 默认配置里那一对
+> （服务端走 `SimpleAuth::from_single`，见 5.1）。两边不一致的表现是三个脚本
+> 齐刷刷 403 `SignatureDoesNotMatch`，而错误信息不会告诉你这是配置对不上。
+> 把这对值记在 Task 6.3 的默认配置里，并在这里引用同一个来源。
+
+> **前置检查写进脚本开头**：`command -v aws >/dev/null || { echo "aws CLI 未安装" >&2; exit 1; }`
+> （`mc.sh` / `rclone.sh` 同理）。没有这一段时，缺一个客户端会以
+> 「command not found」的形式失败，看起来像是服务端的问题。
 
 - [ ] **Step 1: 先跑冒烟脚本，找出真实的不兼容点**
 
