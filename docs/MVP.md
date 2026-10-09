@@ -2284,6 +2284,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_embedded_path_escape() {
+        // `../escape` 用字符串前缀检查也能拦下；这个不行——它证明检查是逐段做的。
+        let tmp = TempDir::new().unwrap();
+        let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        let r = d.write_all("a/../../escape", b"x").await;
+        assert!(matches!(r, Err(DiskError::Fatal(_))), "a/../../escape 逃出了盘根");
+
+        // 绝对路径也必须拒绝（Windows 上也包括盘符前缀）。
+        assert!(matches!(
+            d.write_all("/etc/passwd", b"x").await,
+            Err(DiskError::Fatal(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn passes_shared_contract_suite() {
         let tmp = TempDir::new().unwrap();
         let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
@@ -2333,6 +2348,16 @@ spawn_blocking(move || fsx::write_all_fsync(&root, &rel_path, data))
 - `sync_file_and_parent` 必须先 fsync 文件再 fsync 父目录（顺序不可颠倒，否则 rename 可能不持久）；
 - `error_map.rs`：`NotFound` → `DiskError::NotFound`；`UnexpectedEof`/`WouldBlock`/`TimedOut`
   → `Transient`；权限/只读挂载 → `Fatal`；**其余默认 `Transient`**（宁可重试，不误判为损坏）。
+  **IO 层永远不产生 `Corrupt`**——DESIGN §17 规定 heal 的触发条件是「观察到 `Corrupt`」，
+  由 IO 层猜出来的损坏会去修健康数据。`Corrupt` 只能由 meta 层的校验产生。
+
+**三个语义细节，测试会检验（原计划未写明）：**
+
+- `write_all` 要**自动创建父目录**——测试写的是 `"a/b.txt"`，而 `a/` 不存在；
+- `stat` 对不存在的路径返回 **`Ok(None)`**，不是 `Err(NotFound)`（签名的返回类型就是
+  `Result<Option<FileStat>, DiskError>`）；
+- `remove_dir_all` **幂等**：路径不存在时返回 `Ok(())`（契约套件用它做清理）。
+  M4 若需要区分「删了」与「本来就没有」，先 `stat` 再删。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -2378,6 +2403,17 @@ mod tests {
         let mut b = a.clone();
         b.erasure.sets[0][1] = DiskId::new_v4();
         assert_ne!(a.shared_identity(), b.shared_identity());
+    }
+
+    #[test]
+    fn shared_identity_excludes_disk_info() {
+        // `disk_info.free` 每块盘必然不同。若把它算进 identity，同一 pool 的盘
+        // 永远凑不出多数派，quorum 协商整体失效——这是设计文档里一处真实的错
+        // （DESIGN §7 原文写「除 this 之外的全部字段」），必须由测试钉住。
+        let a = FormatV1::sample(DiskId::new_v4());
+        let mut b = a.clone();
+        b.disk_info = DiskInfo { total: 999, free: 123 };
+        assert_eq!(a.shared_identity(), b.shared_identity());
     }
 
     #[test]
@@ -2456,15 +2492,51 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-按 DESIGN §7 定义 `FormatV1` / `FormatErasureV1` / `DiskInfo`，以及：
+形状（照 DESIGN §7 的 JSON 逐字段对应；原计划只说「按 §7 定义」而没给字段，
+实现者无从下手）：
 
-- `shared_identity()` → 除 `this` 外的全部字段的哈希；
-- `validate()` → `format == "erasure"`、`distribution_algo` 已识别、
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FormatV1 {
+    pub version: String,        // "1"（DESIGN §7 用的是字符串，不是数字）
+    pub format: String,         // "erasure"
+    pub id: String,             // deployment uuid
+    pub erasure: FormatErasureV1,
+    pub disk_info: DiskInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FormatErasureV1 {
+    pub version: String,        // "1"
+    pub this: DiskId,
+    pub sets: Vec<Vec<DiskId>>,
+    pub distribution_algo: String,   // 本项目只认 "crc32c-rot-v1"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskInfo { pub total: u64, pub free: u64 }
+```
+
+另需一个测试辅助 `impl FormatV1 { pub fn sample(this: DiskId) -> Self }`——
+测试全靠它构造样本（至少 1 个 set、每 set ≥2 块盘，让 `sets[0][1]` 可寻址）。
+
+**`crates/meta/Cargo.toml` 要加 `serde_json.workspace = true`**（format.json 是 JSON；
+workspace 依赖表里已有它，meta 目前没引用）。原计划的 Files 清单漏了这条。
+
+按 DESIGN §7 实现：
+
+- `shared_identity()` → 返回**逻辑拓扑**的全部字段，即**除 `this` 与 `disk_info` 之外**
+  的一切。返回类型取 `Vec<u8>`（规范化的确定性编码）—— `Vec<u8>` 天然
+  `PartialEq + Debug`，且是**精确比对而非指纹**，没有哈希碰撞的语义问题。
+  > **`disk_info` 必须排除**：它含 `free`，每块盘必然不同。算进去的话，
+  > 同一 pool 的盘永远凑不出多数派，quorum 协商整体失效。
+  > **DESIGN §7 原文写的是「除 `this` 之外的全部字段」——那是错的，已改。**
+- `validate()` → `format == "erasure"`、`distribution_algo == "crc32c-rot-v1"`、
   所有 set 长度一致且 `2..=16`；
 - `select_authoritative(formats: &[FormatV1]) -> Result<FormatV1, FormatError>`：
-  按 `shared_identity()` 分组计票，未达 quorum 报错；
+  按 `shared_identity()` 分组计票，**多数派 = `总数 / 2 + 1`**，未达 quorum 报错；
 - `should_initialize(errs: &[DiskError]) -> bool`：**仅当所有盘都返回 `NotFound` 时**为真
-  （对应 DESIGN §7「网络不可达的盘绝不被当作新拓扑的证据」）。
+  （对应 DESIGN §7「网络不可达的盘绝不被当作新拓扑的证据」；空切片为 false）。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -2472,8 +2544,10 @@ Run: `cargo test -p rstore-meta format`
 Expected: PASS
 
 ```bash
-git add crates/meta/src/format.rs
-git commit -m "feat(meta): format.json with shared identity quorum and strict init gate"
+git add crates/meta/
+git commit -m "feat(meta): format.json with shared identity quorum and strict init gate
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -2496,6 +2570,12 @@ git commit -m "feat(meta): format.json with shared identity quorum and strict in
 - [ ] **Step 1: 写失败测试**
 
 ```rust
+// `faulty` 模块由 feature 门控，而集成测试是**独立编译**的 crate，
+// 不带 `--features fault-injection` 时 `rstore_disk::faulty` 根本不存在。
+// 没有这一行，`cargo test --workspace`（不带 feature）会**编译失败**——
+// 门禁命令就会红，而红的原因跟被测代码毫无关系。
+#![cfg(feature = "fault-injection")]
+
 use rstore_common::disk_id::DiskId;
 use rstore_disk::faulty::{Fault, FaultKind, FaultyDisk};
 use rstore_disk::{DiskAPI, DiskError, LocalDisk};
@@ -2555,7 +2635,9 @@ pub enum Fault {
     CorruptBytes { at: usize, mask: u8 },
     /// 写入后把文件截断到 `len` 字节。
     Truncate { len: usize },
-    /// 第 `calls` 次调用起，一律返回 `kind` 对应的错误。
+    /// **前 `calls` 次调用正常**，第 `calls + 1` 次起一律返回 `kind` 对应的错误。
+    /// （原文写的是「第 `calls` 次调用起」，与 `can_fail_after_n_calls` 的期望
+    /// 「写 1、2 成功，写 3 失败」以及测试名 `fail_after_n_calls` 都矛盾。）
     FailAfter { calls: usize, kind: FaultKind },
     /// 所有调用都返回 `Transient`（模拟盘离线）。
     Offline,
@@ -2568,6 +2650,18 @@ pub enum FaultKind {
     Corrupt,
     NotFound,
 }
+```
+
+`FaultKind` 到 `DiskError` 的映射（原计划只说「返回 `kind` 对应的错误」，
+没定 `Corrupt` 具体是哪种——`Corrupt` 带载荷 `CorruptKind`，必须挑一个）：
+
+| `FaultKind` | `DiskError` |
+|---|---|
+| `Transient` | `Transient(TransientKind::Io)` |
+| `Corrupt` | `Corrupt(CorruptKind::BitrotMismatch)` —— 模拟 bitrot，这是 M4 的 heal 路径最关心的种类 |
+| `NotFound` | `NotFound` |
+
+```rust
 
 impl DiskAPI for FaultyDisk { /* 每个方法先看故障，再委托给内层 */ }
 
@@ -2590,6 +2684,29 @@ impl FaultyDisk {
 **要求：`FaultyDisk` 必须通过 `contract_tests`（无故障注入时行为与 `LocalDisk` 完全一致）**，
 否则它测出来的问题可能是它自己引入的。
 
+> 原计划只写了这条要求却没给测试——「要求」没有测试兜着就等于没有。在
+> `crates/disk/src/faulty.rs` 里补上（crate 内单测，与 `LocalDisk` 的调用点写法一致）：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstore_common::disk_id::DiskId;
+
+    #[tokio::test]
+    async fn passes_shared_contract_suite_when_healthy() {
+        // `FaultyDisk` 自身的正确性门禁：无故障注入时它必须与 LocalDisk 行为一致。
+        // 否则 M4 里「FaultyDisk 测出来的故障」可能根本是它自己引入的。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = crate::local::LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+        crate::contract_tests::run_all(&FaultyDisk::wrap(inner)).await;
+    }
+}
+```
+
+（`tempfile` 已在 Task 3.1 加进 `[dev-dependencies]`。若 `LocalDisk` 的路径不是
+`crate::local::LocalDisk`，按 Task 3.2 的实际布局调整。）
+
 - [ ] **Step 4: 跑测试确认通过并提交**
 
 Run: `cargo test -p rstore-disk --features fault-injection --test faulty_disk`
@@ -2597,8 +2714,18 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/disk/
-git commit -m "test(disk): FaultyDisk fault injection harness"
+git commit -m "test(disk): FaultyDisk fault injection harness
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+> **两个 feature 组合都要过**（原计划只给了带 feature 的那条命令）：
+> ```bash
+> cargo test -p rstore-disk                              # 不带 feature：集成测试编译成空
+> cargo test -p rstore-disk --features fault-injection   # 带 feature：全部用例
+> cargo clippy --workspace --all-targets --locked -- -D warnings
+> ```
+> 不带 feature 的那条若红，说明 `tests/faulty_disk.rs` 的 `#![cfg(...)]` 门控没写对。
 
 ---
 

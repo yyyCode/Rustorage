@@ -251,7 +251,7 @@ rstore-server        二进制入口，唯一的装配点
     "sets": [
       ["<disk-uuid>", "<disk-uuid>", "..."]
     ],
-    "distribution_algo": "sipmod-v1"
+    "distribution_algo": "crc32c-rot-v1"
   },
   "disk_info": { "total": 0, "free": 0 }
 }
@@ -260,10 +260,18 @@ rstore-server        二进制入口，唯一的装配点
 要点：
 
 - **盘 → set 的归属不是运行时算出来的**，而是格式化时一次性生成 UUID 表并持久化到每块盘。运行时只做查表（`find_disk_index_by_disk_id`）。哈希**只用于对象 → set 的路由**。
-- `shared_identity()` 返回除 `this` 之外的全部字段。**同一 pool 内所有盘必须一致**，不一致时拒绝启动。
-- **版本仲裁**：多盘 `format.json` 按 quorum 选权威版本。
-- **全新初始化要求所有盘都报 `UnformattedDisk`** —— 网络不可达的盘绝不被当作「新拓扑」的证据。这比 quorum 更严格，是刻意为之。
-- `distribution_algo` 从第一版就存在。本项目只用 `sipmod-v1`，但字段保留以便未来更换而不致旧数据不可读。
+- `shared_identity()` 返回**逻辑拓扑**的全部字段——即除 `this` 和 `disk_info` 之外的一切。
+  **同一 pool 内所有盘必须一致**，不一致时拒绝启动。
+  > `disk_info` **必须排除**：它含 `free`（剩余空间），每块盘必然不同。
+  > 若把它算进 identity，同一 pool 的盘永远凑不出多数派，quorum 协商会整体失效。
+  > `this` 同理——它是「本盘」，天然各不相同。
+- **版本仲裁**：多盘 `format.json` 按 quorum 选权威版本（多数派 = `总数 / 2 + 1`）。
+- **全新初始化要求所有盘都「未格式化」** —— 网络不可达的盘绝不被当作「新拓扑」的证据。
+  这比 quorum 更严格，是刻意为之。
+  > 在错误模型里「未格式化」表现为 `DiskError::NotFound`（读不到 `format.json`），
+  > 没有独立的 `UnformattedDisk` 变体——DESIGN §17 的 `DiskError` 是唯一的错误词汇表。
+- `distribution_algo` 从第一版就存在。本项目只用 `crc32c-rot-v1`（即 §9.3 的
+  CRC32C 旋转，**不是** MinIO 的 `sipmod`），但字段保留以便未来更换而不致旧数据不可读。
 
 ---
 
