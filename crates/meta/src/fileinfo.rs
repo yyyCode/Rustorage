@@ -61,7 +61,13 @@ pub enum StorageClass {
 }
 
 /// 已解析的版本 header。LIST / HEAD 只看它就够，无需解析 body。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// 序列化经 `HeaderWire` 桥接（`from` / `into`），**不是**直接 derive——否则
+/// `Option<u64>` 的 `None` 会编成 msgpack nil 而非约定的 0，uuid 也会走
+/// `is_human_readable()` 分流。容器端因此可以对一个 `&mut Read` 直接
+/// `rmp_serde::from_read`，并用 `position()` 拿记录边界。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(from = "HeaderWire", into = "HeaderWire")]
 pub struct FileVersionHeader {
     /// 版本 id。**nil UUID 与 `None` 语义不同**，编码时必须保留区别。
     pub version_id: Option<Uuid>,
@@ -94,11 +100,12 @@ impl FileVersionHeader {
     }
 }
 
-/// 私有 wire 表示——**`FileVersionHeader` 不直接 derive serde**。
+/// 私有 wire 表示。`FileVersionHeader` 经它桥接做 serde。
 ///
-/// 直接 derive 会踩两个坑：`Option<u64>` 的 `None` 会被编成 msgpack nil 而非
-/// 约定的 0；uuid crate 的 serde 走 `is_human_readable()` 分流，可能编成带连字符的
-/// 字符串。这里把两者显式落到定长字节 / 整数上，让线格式确定。
+/// 内存侧有两个「坑」，都由这里的字段类型抹平：`Option<u64>` 的 `None` 若直接
+/// derive 会编成 msgpack nil 而非约定的 0；uuid crate 的 serde 走
+/// `is_human_readable()` 分流，可能编成带连字符的字符串。落到定长 `[u8; 16]` /
+/// 整数上后，线格式就确定了。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HeaderWire {
     /// 空 = `None`；否则原始 16 字节（定长 array，不含连字符）。
@@ -113,41 +120,51 @@ struct HeaderWire {
     data_dir: Option<[u8; 16]>,
 }
 
-/// header 的 msgpack 编码。`Option` ↔ 线格式的映射**只发生在这一处**。
+impl From<FileVersionHeader> for HeaderWire {
+    fn from(h: FileVersionHeader) -> Self {
+        HeaderWire {
+            version_id: h.version_id.map(|u| *u.as_bytes()),
+            ty: h.ty,
+            size: h.size,
+            mod_time: h.mod_time.unwrap_or(0),
+            ec_m: h.ec_m,
+            ec_n: h.ec_n,
+            flags: h.flags,
+            data_dir: h.data_dir.map(|u| *u.as_bytes()),
+        }
+    }
+}
+
+impl From<HeaderWire> for FileVersionHeader {
+    fn from(wire: HeaderWire) -> Self {
+        FileVersionHeader {
+            version_id: wire.version_id.map(Uuid::from_bytes),
+            ty: wire.ty,
+            size: wire.size,
+            // 线格式的 0 还原为「未设置」；epoch 被折叠为 None（见字段文档）。
+            mod_time: if wire.mod_time == 0 {
+                None
+            } else {
+                Some(wire.mod_time)
+            },
+            ec_m: wire.ec_m,
+            ec_n: wire.ec_n,
+            flags: wire.flags,
+            data_dir: wire.data_dir.map(Uuid::from_bytes),
+        }
+    }
+}
+
+/// header 的 msgpack 编码。`Option` ↔ 线格式的映射**只发生在 `HeaderWire` 的
+/// `From` 实现里**；这里只是薄包装。
 pub fn encode_header(h: &FileVersionHeader) -> Result<Vec<u8>, DiskError> {
-    let wire = HeaderWire {
-        version_id: h.version_id.map(|u| *u.as_bytes()),
-        ty: h.ty,
-        size: h.size,
-        mod_time: h.mod_time.unwrap_or(0),
-        ec_m: h.ec_m,
-        ec_n: h.ec_n,
-        flags: h.flags,
-        data_dir: h.data_dir.map(|u| *u.as_bytes()),
-    };
-    rmp_serde::to_vec(&wire).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
+    rmp_serde::to_vec(h).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
 }
 
 /// header 的 msgpack 解码。缺字段 / 长度不符 / 畸形输入一律映射为
 /// `MalformedHeader`（msgpack 解码失败统一走这条路）。
 pub fn decode_header(bytes: &[u8]) -> Result<FileVersionHeader, DiskError> {
-    let wire: HeaderWire = rmp_serde::from_slice(bytes)
-        .map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))?;
-    Ok(FileVersionHeader {
-        version_id: wire.version_id.map(Uuid::from_bytes),
-        ty: wire.ty,
-        size: wire.size,
-        // 线格式的 0 还原为「未设置」；epoch 被折叠为 None（见字段文档）。
-        mod_time: if wire.mod_time == 0 {
-            None
-        } else {
-            Some(wire.mod_time)
-        },
-        ec_m: wire.ec_m,
-        ec_n: wire.ec_n,
-        flags: wire.flags,
-        data_dir: wire.data_dir.map(Uuid::from_bytes),
-    })
+    rmp_serde::from_slice(bytes).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
 }
 
 /// 内联数据帧：version-key -> 原始字节（DESIGN §8.4）。
@@ -266,5 +283,77 @@ mod tests {
         };
         assert_eq!(h.data_shards(), 4);
         assert_eq!(h.total_shards(), 6);
+    }
+
+    #[test]
+    fn two_headers_roundtrip_back_to_back() {
+        // 单条 roundtrip 无法暴露记录边界问题：把两个**不同**的 header 拼在一起，
+        // 依次读回必须各自相等，否则改动会悄悄破坏边界。
+        let a = FileVersionHeader {
+            version_id: Some(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            ty: VersionType::Object,
+            size: 1234,
+            mod_time: Some(1_700_000_000_000_000_000),
+            ec_m: 4,
+            ec_n: 6,
+            ..Default::default()
+        };
+        let b = FileVersionHeader {
+            version_id: None,
+            ty: VersionType::DeleteMarker,
+            mod_time: None,
+            ec_m: 4,
+            ec_n: 6,
+            ..Default::default()
+        };
+        let mut buf = encode_header(&a).unwrap();
+        buf.extend_from_slice(&encode_header(&b).unwrap());
+        let (head, tail) = buf.split_at(encode_header(&a).unwrap().len());
+        assert_eq!(decode_header(head).unwrap(), a);
+        assert_eq!(decode_header(tail).unwrap(), b);
+    }
+
+    #[test]
+    fn msgpack_does_not_overread_on_a_cursor() {
+        use std::io::{Cursor, Read};
+
+        // 容器格式的地基：容器靠「读完 header 后 cursor 的位置」定位随后的
+        // body_len u32 BE。若 rmp_serde 预读，位置就会跑过头——而单条 roundtrip
+        // 测试发现不了，所以必须在这里钉住。
+        let h = FileVersionHeader {
+            version_id: Some(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            mod_time: Some(1_700_000_000_000_000_000),
+            ec_m: 4,
+            ec_n: 6,
+            ..Default::default()
+        };
+        let enc = encode_header(&h).unwrap();
+
+        // 在一个 cursor 里连续放两条记录 + 一个哨兵字节。
+        let mut buf = enc.clone();
+        buf.extend_from_slice(&enc);
+        buf.push(0xAB);
+        let mut cursor = Cursor::new(buf.as_slice());
+
+        // 读第一条，位置必须正好停在第一条的末尾。
+        let a: FileVersionHeader = rmp_serde::from_read(&mut cursor).expect("first header");
+        assert_eq!(a, h);
+        assert_eq!(
+            cursor.position() as usize,
+            enc.len(),
+            "msgpack 读了 {} 字节，header 只有 {} 字节——存在预读，容器格式不成立",
+            cursor.position(),
+            enc.len()
+        );
+
+        // 第二条也必须能读出来。
+        let b: FileVersionHeader = rmp_serde::from_read(&mut cursor).expect("second header");
+        assert_eq!(b, h);
+        assert_eq!(cursor.position() as usize, enc.len() * 2);
+
+        // 且哨兵字节原封不动地留在后面。
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, vec![0xAB]);
     }
 }
