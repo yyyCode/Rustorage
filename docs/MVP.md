@@ -384,20 +384,58 @@ def table_errors(table):
     return errors
 
 
+class MetadataShapeError(Exception):
+    """cargo metadata 的结构和预期不符。
+
+    单独定义一个类型，是为了让 main() 能精确接住"输入不是我们以为的东西"。
+    靠枚举 KeyError/TypeError/AttributeError……是在猜自己已知的坏法，而契约
+    要求的是**任何**坏法都归 2。check() 里所有结构断言统一抛它，main() 里再
+    加一层 except Exception 兜底，这样"意外异常以 1 逃逸"在结构上不可能发生。
+    """
+
+
+def require(cond, what):
+    """结构断言。不成立就抛 MetadataShapeError，由 main() 转成退出码 2。"""
+    if not cond:
+        raise MetadataShapeError(what)
+
+
 def check(meta):
-    """返回违规消息列表。空列表表示合规。"""
+    """返回违规消息列表。空列表表示合规。
+
+    结构不符时抛 MetadataShapeError，而不是返回违规——「cargo 的输出看不懂」
+    和「架构违规」必须分开报，前者是护栏故障（2），后者才是发现违规（1）。
+
+    路径依赖（带 path 字段）一律按下内部依赖约束：这类依赖必然来自本仓库或
+    本地目录，名字不带 rstore- 并不代表它不在图里。只按前缀过滤的话，一个放在
+    crates/ 之外、名字又没前缀的内部 crate 会同时漏掉 UNKNOWN CRATE 和这条边。
+    """
+    require(isinstance(meta, dict), f"顶层不是对象：{type(meta).__name__}")
+    packages = meta.get("packages")
+    require(isinstance(packages, list), f"packages 不是列表：{type(packages).__name__}")
+    require(packages, "packages 为空——workspace 里应当有 crate")
+
     violations = []
-    for pkg in meta["packages"]:
-        name = pkg["name"]
+    for pkg in packages:
+        require(isinstance(pkg, dict), "packages 的元素不是对象")
+        name = pkg.get("name")
+        require(isinstance(name, str), f"包的 name 不是字符串：{name!r}")
+
         if name not in ALLOWED:
             violations.append(
                 f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖"
             )
             continue
-        for dep in pkg["dependencies"]:
-            dep_name = dep["name"]
-            if not dep_name.startswith("rstore-"):
-                continue                      # 只约束内部 crate
+
+        deps = pkg.get("dependencies")
+        require(isinstance(deps, list), f"{name} 的 dependencies 不是列表")
+        for dep in deps:
+            require(isinstance(dep, dict), f"{name} 的依赖项不是对象")
+            dep_name = dep.get("name")
+            require(isinstance(dep_name, str), f"{name} 的依赖名不是字符串：{dep_name!r}")
+
+            if dep.get("path") is None and not dep_name.startswith("rstore-"):
+                continue                      # 注册表依赖：不受内部层次约束
             if dep_name not in ALLOWED[name]:
                 kind = dep.get("kind") or "normal"
                 violations.append(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
@@ -429,11 +467,19 @@ def main():
         return 2
 
     # 合法 JSON 不等于预期的结构。cargo 若改了输出格式，这里必须落回 2
-    # （护栏故障），而不是让 KeyError/TypeError 冒出去变成 1。
+    # （护栏故障），而不是让异常冒出去变成 1。
+    #
+    # 第二层 except Exception 是兜底，不是冗余：check() 内部已经用 require()
+    # 显式断言了结构，但那段代码将来会长出新的字段访问。契约是"除真正的违规
+    # 之外一律不返回 1"，能表达这个契约的只有"接住一切"——枚举异常类型永远
+    # 慢一步，而漏掉的那种会以"发现违规"的假象出现在 CI 里。
     try:
         violations = check(meta)
-    except (KeyError, TypeError) as e:
-        print(f"ERROR: cargo metadata 结构不符合预期：{e!r}", file=sys.stderr)
+    except MetadataShapeError as e:
+        print(f"ERROR: cargo metadata 结构不符合预期：{e}", file=sys.stderr)
+        return 2
+    except Exception as e:                    # noqa: BLE001
+        print(f"ERROR: 检查元数据时发生意外异常：{type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
     for v in violations:
@@ -518,6 +564,14 @@ CASES = [
         pkg("rstore-scratch"),
         pkg("rstore-api", "rstore-store"),
     ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
+
+    # 路径依赖带着 path 字段，即使名字没有 rstore- 前缀也必须被约束。
+    # 不能写成 pkg(...)：那个辅助函数只造 {"name": ...}，造不出 path 字段，
+    # 而 path 字段正是这条用例要验的东西。
+    ("路径依赖绕过前缀过滤", {"packages": [
+        {"name": "rstore-server", "dependencies": [
+            {"name": "evilhelper", "path": "../tools/evilhelper"}]},
+    ]}, 1, "FORBIDDEN EDGE: rstore-server -> evilhelper"),
 ]
 
 
@@ -561,12 +615,46 @@ def run_fixture_cases():
 def test_fixture_cases():
     """pytest 入口。
 
-    这 6 个 fixture 用例原本直接写在 main() 里，那样 `pytest` 只会收集到
-    几个 test_* 函数，子进程用例一条都不跑——测试看着全绿，实测只覆盖了
-    一小部分。整进一个 test_* 函数后，两种跑法覆盖同一批用例。
+    fixture 用例原本直接写在 main() 里，那样 `pytest` 只会收集到几个 test_*
+    函数，子进程用例一条都不跑——测试看着全绿，实测只覆盖了一小部分。
+    整进一个 test_* 函数后，两种跑法覆盖同一批用例。
     """
     failures = run_fixture_cases()
     assert not failures, "\n".join(failures)
+
+
+def test_metadata_shape_errors_exit_2():
+    """结构不符必须一律归 2，逐条钉住。
+
+    这些形状在真实 cargo 输出里不该出现，所以它们的作用是"cargo 改格式时
+    及时报警"。关键在于报警方式：必须报成"护栏故障"(2)，不能报成
+    "发现违规"(1)——后者会让人去翻 manifest，而真正出问题的是护栏自己。
+
+    第一版只 except 了 (KeyError, TypeError)，漏掉了 dep name 非字符串时
+    `int.startswith` 抛的 AttributeError——它带着完整 traceback 以 1 逃逸。
+    所以现在 check() 用 require() 显式断言结构，main() 再加 except Exception
+    兜底，两层各自独立成立。
+    """
+    shapes = [
+        {},                                                    # 没有 packages
+        {"packages": None},                                    # 类型不对
+        {"packages": []},                                      # 空 workspace
+        {"packages": [{}]},                                    # 包没有 name
+        {"packages": [{"name": 123}]},                         # name 不是字符串
+        {"packages": [{"name": "rstore-common"}]},             # 没有 dependencies
+        {"packages": [{"name": "rstore-common",
+                       "dependencies": [{"name": 123}]}]},     # 依赖名不是字符串
+        {"packages": [{"name": "rstore-common",
+                       "dependencies": [123]}]},               # 依赖项不是对象
+    ]
+    for shape in shapes:
+        proc = run_checker(shape)
+        assert proc.returncode == 2, (
+            f"{shape} 期望退出码 2，实际 {proc.returncode}；stderr={proc.stderr!r}"
+        )
+        assert (proc.stdout or "").strip() == "", (
+            f"{shape} 的诊断不该出现在 stdout：{proc.stdout!r}"
+        )
 
 
 def test_invalid_json_reports_on_stderr_only():
@@ -637,15 +725,17 @@ def test_dangling_reference_is_a_table_error():
 def main():
     failures = run_fixture_cases()
 
-    # 刻意不含 test_fixture_cases——它只是 run_fixture_cases 的 pytest 包装，
-    # 放进来会把同一批 fixture 用例跑两遍、并重复计数。
-    unit_tests = (
-        test_invalid_json_reports_on_stderr_only,
-        test_non_closed_table_makes_main_exit_2,
-        test_real_table_is_closed,
-        test_closure_check_catches_non_closed_table,
-        test_dangling_reference_is_a_table_error,
-    )
+    # 按 test_ 前缀**自动发现**，不手写清单。脚本方式才是 CI 的入口，手写清单
+    # 漏掉一个测试就等于 CI 静默跳过它——而"被跳过"和"通过"在日志里长得一模
+    # 一样，这正是最难发现的失败。skip 里只放那些已知会被重复执行的包装函数。
+    #
+    # test_fixture_cases 只是 run_fixture_cases 的 pytest 包装，放进来会把同一批
+    # fixture 用例跑两遍、并让计数重复。它是唯一需要排除的。
+    skip = {"test_fixture_cases"}
+    unit_tests = [
+        fn for nm, fn in sorted(globals().items())
+        if nm.startswith("test_") and callable(fn) and nm not in skip
+    ]
     for fn in unit_tests:
         try:
             fn()
@@ -663,7 +753,7 @@ if __name__ == "__main__":
 ```
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: 全部通过（`11 项通过，0 项失败`），退出码 0
+Expected: 全部通过（`13 项通过，0 项失败`），退出码 0
 
 - [ ] **Step 3b: 端到端确认——真仓库上护栏仍能抓到违规**
 
@@ -794,7 +884,7 @@ Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: `11 项通过，0 项失败`，退出码 0
+Expected: `13 项通过，0 项失败`，退出码 0
 
 - [ ] **Step 7: 提交**
 
@@ -879,19 +969,22 @@ jobs:
       - name: 格式
         run: cargo fmt --all -- --check
 
+      # --locked 不能省：Cargo.lock 是提交进仓库的，缓存键也按它算。不带它的话
+      # cargo 会在锁文件与 manifest 不一致时默默重新解析依赖，CI 照样绿——
+      # 于是"锁定依赖"这件事在 CI 里从未被真正验证过。
       - name: 构建
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: 测试
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 ```
 
 - [ ] **Step 3: 本地预演，避免推上去才发现 CI 红**
 
-Run: `bash scripts/check-layer-deps.sh && python3 scripts/tests/test_check_layer_deps.py && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
+Run: `bash scripts/check-layer-deps.sh && python3 scripts/tests/test_check_layer_deps.py && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
 Expected: 全部退出码 0
 
 YAML 语法本地校验（只解析，不执行）：
@@ -911,6 +1004,12 @@ git commit -m "ci: run layer guard, lint, and tests on every push and PR"
 > **本任务的边界**：护栏只能校验 crate 之间的依赖边。DESIGN §5 规则 R4 还有一半是
 > 文件级约定（实现绑定只允许出现在 `rstore-server/src/wiring.rs`），
 > 依赖图看不出这一点——那一半仍然靠 review。别把这个脚本当成 R4 的完整保险。
+
+> **一处想清楚后留下的取舍**：解释器探测在两个地方各写了一遍
+> （`scripts/check-layer-deps.sh` 与 `ci.yml` 的自测步骤）。抽成
+> `scripts/find-python.sh` 再 source 能消除重复，但会多一个文件、多一处
+> source 路径假设。两份拷贝漂移的代价不对称：写坏的是本机，而 CI 跑在
+> ubuntu-latest 上 `python3` 必然存在，不会因此变红。等第三处需要它时再抽。
 
 ---
 
