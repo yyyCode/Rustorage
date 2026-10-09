@@ -8234,15 +8234,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   **注意 `main.rs` 不是 lib 的一部分**，它是独立的 crate root，要用
   `use rstore_server::...` 而不是 `use crate::...`）
 - Modify `crates/server/Cargo.toml`（加 **`async-trait`**、**`serde_json`**、`clap`、`tokio-util`、
-  **`hyper`**（features `["server", "http1"]`）、**`hyper-util`**（features `["tokio"]`）；
-  另加 `[dev-dependencies] tempfile`）
+  **`hyper`**（features `["server", "http1"]`）、**`hyper-util`**（features `["tokio"]`）、
+  **`s3s`**；另加 `[dev-dependencies] tempfile`）
 - Modify `crates/store/src/get.rs`（加 `HeadOut` 与 `ErasureSet::head_object`；`GetOut` 加 `mod_time`）
 - Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`、`hyper`、`hyper-util`）
 
 > 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
 > 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
 >
-> **依赖要加六个，且都不在 `crates/server/Cargo.toml` 里**：
+> **依赖要加七个，且都不在 `crates/server/Cargo.toml` 里**：
 >
 > - **`async-trait`**（`async-trait.workspace = true`）——`wiring.rs` 要写
 >   `#[async_trait] impl ObjectStore for Wiring`。它已经在根 `Cargo.toml` 的
@@ -8262,6 +8262,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 >   ——**`s3s` 不自带 HTTP 服务器、也不 re-export `hyper`**，没有这两条边根本起不了服务。
 >   详细配方见下面「`bind` 怎么把 s3s 跑起来」一节；这两条**只对 `hyper-util` 会新增
 >   `Cargo.lock` 条目**（`hyper 1.12.0` 早已在锁里，因为它是 `s3s` 的非可选依赖）。
+> - **`s3s`**（`s3s.workspace = true`）——下面那段的代码要**命名** `s3s::Body` /
+>   `s3s::HttpError` / `s3s::service::S3Service`，而 `rstore-s3` 与 `rstore-s3-compat`
+>   **都没有 re-export `s3s`**（`rstore-s3` 只导出 `RstoreFs` 与 `build_service`）。
+>   `s3s` 早已在根 `[workspace.dependencies]` 里，所以**只在 `crates/server/Cargo.toml`
+>   加一条边，不新增锁条目**——但漏了它这条边，`Cargo.toml` 里的代码一行都编不过。
+>   （根 `Cargo.toml` 因为这一条**不需要**任何改动。）
 
 #### 启动契约（原计划完全没有这一段）
 
@@ -8337,10 +8343,28 @@ cargo run -p rstore-server -- \
 - `select_authoritative(&[FormatV1]) -> Result<FormatV1, FormatError>` —— 已经实现了
   「按 `shared_identity()` 分组计票、不一致时报错」。注意它**拿到的是已经读出来的
   `FormatV1` 列表**：读盘失败（`NotFound`）的盘**不进这个列表**，走下面那条路径。
-- `should_initialize(&[DiskError]) -> bool` —— 已经实现了「**仅当所有盘都返回
-  `NotFound`**（即一块盘都读不到 `format.json`）时才允许初始化」这条闸门。
-  它正是 `refuses_to_reformat_reachable_disks` 要测的东西：一盘有数据、一盘空白时，
-  错误列表里不全都是 `NotFound`，于是返回 `false`，启动必须**拒绝**。
+  **`shared_identity()` 包含** `version` / `format` / `id` / `erasure.version` /
+  `erasure.distribution_algo` / `sets`，**明确排除**每盘各自的 `erasure.this` 与
+  `disk_info`（`format.rs:100`，测试 `shared_identity_excludes_this_disk` 钉着）。
+  所以要造「两盘不一致」的测试数据，改的必须是**参与身份**的字段——改 `format.id`
+  （部署 id）最直接；**改 `erasure.this` 一点用都没有**，那正是「每盘独有」的东西，
+  改完两份 identity 仍然相等，测试会以「本该拒绝却成功了」的形式失败。
+- `should_initialize(&[DiskError]) -> bool` —— 已经实现了「**失败列表非空且全是
+  `NotFound`** 时才允许初始化」这条闸门（`format.rs:195`：`!errs.is_empty() &&
+  errs.iter().all(|e| matches!(e, DiskError::NotFound))`）。
+  **它单独用是不够的，别照抄上面那句「所有盘」的字面意思。** 它的入参**只有失败列表**，
+  看不见成功读到的盘：一盘有 `format.json`、一盘空白时，失败列表是 `[NotFound]`——
+  全是 `NotFound`，于是**返回 `true`**。所以调用点的条件必须写成
+
+  ```rust
+  // `should_initialize` 只看失败列表，「一盘有格式、一盘 NotFound」时它照样回 true。
+  // 必须再要求「一块盘都没读到」，才是真正的「全部缺失」。
+  if formats.is_empty() && should_initialize(&disk_errs) { /* 初始化 */ }
+  ```
+
+  这正是 `refuses_to_reformat_reachable_disks` 要测的东西：一盘有数据、一盘空白时
+  必须**拒绝**。（Task 2.1 那句「仅当所有盘都返回 `NotFound`」描述的是**调用者**的
+  不变量，不是这个函数的语义——签名里没有「成功的盘」这一路，函数给不出来。）
 
 这两个函数在 Task 2.x 就写好了并有测试，6.3 只是调用者。
 
@@ -8368,7 +8392,9 @@ cargo run -p rstore-server -- \
      （投票只会把它当异构盘投掉，然后启动成功，而那块盘从此参数不一致）。
    - `Err(e)` → `map_io(e)` 得到 `DiskError`，push 进 `errs`。
 2. 看 `errs` 与成功的 `formats`：
-   - `should_initialize(&errs)` 为真（**所有盘都是 `NotFound`**）→ 初始化（见第 3 步）。
+   - **`formats.is_empty() && should_initialize(&errs)`** 为真 → 初始化（见第 3 步）。
+     两个条件**缺一不可**，理由见上面那条（`should_initialize` 只看失败列表，
+     「有盘读到了、有盘 `NotFound`」时它照样回 `true`）。
    - **否则只要出现「有盘读到了、有盘 `NotFound`」就必须拒绝启动**——这正是
      `refuses_to_reformat_reachable_disks`：一盘有数据、一盘空白时，把空白那块也
      格式化成同一拓扑 = 悄悄把一个「新盘」认成老成员。错误信息里要列出**空盘的路径**。
@@ -8378,7 +8404,14 @@ cargo run -p rstore-server -- \
    逐盘 `LocalDisk::open(volume, id)` 之后用 **`DiskAPI`** 写两个文件：
    `format.json` 与 `.rstore.sys/disk_id`，每个都跟着 `sync_file_and_parent`。
    `disk_info` 填 `DiskInfo::default()` 之类的零值即可（它不参与一致性）。
-4. 非初始化路径：`id` 取权威 `format.erasure.this`，`LocalDisk::open(volume, id)`。
+4. **非初始化路径的盘序不能按 `--volumes` 走**：先「每盘自己的 `erasure.this` → 该盘路径」
+   建一张表，再**按权威 `format.sets` 的顺序**（`Vec<Vec<DiskId>>`，MVP 只有一个 set）
+   逐 id 取出路径来 `LocalDisk::open(volume, this_id)`。
+   `this` 是**每盘各自的值**，不是权威拓扑里的单一值——把它读成「所有盘都用权威的那一个 id」
+   会让 `LocalDisk` 全部指向同一个（错的）身份；而按 `--volumes` 顺序建盘，会让
+   **重启时交换了盘序的部署把分片下标接错**，后果是读出来的数据静默错位。
+   权威 `sets` 里某个 id 这轮没读到盘（`Transient` 之类）→ 该槽位留 `None`，
+   由纠错码按「该盘缺失」处理（`ErasureSet::new` 的入参就是 `Vec<Option<Arc<dyn DiskAPI>>>`）。
 5. `ErasureSet::new(disks, parity)`，盘序按权威 `format.sets` 走。
 
 > **`DiskAPI::disk_id()` 目前没有任何消费者**（全仓库 grep `disk_id()` 只在 `crates/disk`
@@ -8386,9 +8419,11 @@ cargo run -p rstore-server -- \
 > 按上面的来：`LocalDisk::open` 的 `disk_id` 参数是 DESIGN 承诺的盘标识，将来
 > `find_disk_index_by_disk_id` 一旦落地，第一件事就是读它。
 >
-> **`validate()` 要求每个 set 长度 `2..=16`**，所以 `--volumes` 至少要两块盘。
-> 只给一块时要报一句人话（「一个 set 至少要 2 块盘」），别让它变成一个
-> 来自 `FormatError::Inconsistent` 的、看不出是参数问题的错误。
+> **`validate()` 要求每个 set 长度 `2..=16`**，所以 `--volumes` 的盘数要落在 `2..=16`。
+> **两端都要报一句人话**（「一个 set 至少要 2 块、最多 16 块，当前给了 n 块」），
+> 别让它变成一个来自 `FormatError::Inconsistent` 的、看不出是参数问题的错误。
+> 上界同样是参数问题：`--volumes` 给 20 块盘时，`ErasureSet` 的 `u8` 宽度与
+> `2..=16` 的纠删码约束都撑不住。
 
 #### 组合根：`crates/server/src/wiring.rs`
 
@@ -8475,6 +8510,17 @@ impl ErasureSet {
 > 文件里，且都是本 crate 可见的**；这一节只是把它们串起来，**没有任何新算法**。
 > `etag_of_meta` 必须复用——否则 HEAD 与 LIST 的 ETag 会分叉，
 > 而 `rclone check` 恰恰是比对这两处的 ETag。
+
+> **`PutOut` 里没有 `mod_time`**（真实字段是 `{ size, etag, data_dir, version_id }`），
+> 所以 `Wiring::put_object` 填给 `ObjectInfo.mod_time` 的只能是 `0`。这**无害**：
+> S3 的 PUT 响应只消费 `ETag`，不看 `Last-Modified`。将来若 PUT 响应要带
+> `Last-Modified`（或者 `CopyObject` 之类要回 `mod_time`），先给 `PutOut` 补一个字段，
+> 取法与 `GetOut` 的 `header.mod_time.unwrap_or(0)` 同一处。
+>
+> `Wiring` 里的 `StoreError → ApiError` 两个入口**只差「不存在」那两行**，其余逐行相同。
+> 不要把两份 `match` 合并成一个「带 op 参数」的函数：那会让「新增一个 `StoreError`
+> 变体时两个入口都要重新想一遍」这件事变成「只在一个地方加一行」，而两个入口的差别
+> 恰恰是最容易搞错的地方（桶操作回了 `NoSuchKey` 这种）。
 
 #### `FormatError` **不带盘路径**，路径得由 6.3 自己加
 
@@ -8689,9 +8735,13 @@ let loop_handle = tokio::spawn(async move {
                             ),
                             "/ready" => Ok(ready.ready_response().map(Body::from)),
                             "/metrics" => Ok(metrics.metrics_response().map(Body::from)),
-                            // `Service::call(&self, ..)`——hyper 那个 trait，`&self` 签名，
-                            // 所以 `s3` 不必是 `mut`。
-                            _ => s3.call(req).await,
+                            // **必须写全限定语法。** `S3Service` 自己有一个同名的固有方法
+                            // `S3Service::call(&self, req: http::Request<s3s::Body>)`
+                            // （`service.rs:654`），它会遮蔽 hyper trait 的那个
+                            // `Service::call(&self, req: http::Request<Incoming>)`。
+                            // 写成 `s3.call(req)` 会因为入参是 `Incoming` 而不是 `Body` 编译不过，
+                            // 而报错信息（method not found / type mismatch）不会提到「遮蔽」。
+                            _ => Service::call(&s3, req).await,
                         }
                     }
                 }),
@@ -8705,7 +8755,7 @@ let loop_handle = tokio::spawn(async move {
 ```
 
 > **`Ok::<_, s3s::HttpError>` 那个标注别省**：三个 `Ok(...)` 的错误类型要靠它统一。
-> 只在一个分支写 `Ok(...)`、另一个分支是 `s3.call(req).await` 时，编译器有时能从后者
+> 只在一个分支写 `Ok(...)`、另一个分支是 `Service::call(&s3, req).await` 时，编译器有时能从后者
 > 推出来，但那属于「碰巧能推」——把三行都写成显式标注，改一个分支不会引发一串推断错误。
 >
 > `health_response()` 是**关联函数**（Task 6.1 里它不接 `&self`），`ready_response()` /
