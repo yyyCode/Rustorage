@@ -31,7 +31,7 @@ bucket 创建、对象 CRUD、Range 读取、Multipart 上传与列出；拔掉�
 | **M1** | 基础原语：校验和、分布排列、纠删码 | 三个纯函数 crate，属性测试通过 | M0 |
 | **M2** | 元数据容器 `meta.xl` | 编码/解码 + 损坏防御 | M1 |
 | **M3** | 盘抽象 | `DiskAPI` + `LocalDisk` + `FaultyDisk` | M2 |
-| **M4** | 存储引擎核心 | PUT/GET/DELETE + quorum + 提交协议 | M3 |
+| **M4** | 存储引擎核心 | 对象 PUT/GET/DELETE + **桶操作与对象列举** + quorum + 提交协议 | M3 |
 | **M5** | S3 接入 | s3s 的 `S3` trait 实现 + 兼容层 | M4 |
 | **M6** | 运维面与验收 | readiness、metrics、启动编排、端到端 | M5 |
 
@@ -90,21 +90,27 @@ crates/store/
   src/writer.rs                     # BitrotShardWriter / MultiWriter
   src/reader.rs                     # BitrotShardReader / ParallelReader
   src/put.rs                        # PUT 路径
-  src/get.rs                        # GET 路径
-  src/delete.rs                     # DELETE 路径
+  src/get.rs                        # GET 路径（含 resolve_version / Resolved）
+  src/delete.rs                     # DELETE 路径 + gc_superseded
   src/commit.rs                     # rename 提交协议
   src/quorum.rs                     # quorum 规则与元数据仲裁
-  src/errs.rs                       # reduce_errs 错误归约
+  src/error.rs                      # StoreError（**不是** errs.rs，也**不是** reduce_errs）
+  src/bucket.rs                     # 桶操作（Task 4.11）
+  src/list.rs                       # 对象列举（Task 4.11）
+  src/reconcile.rs                  # 对账（Task 4.10）
+  src/quorum_boundaries.rs          # quorum 边界矩阵（Task 4.9，#[cfg(test)]）
+  src/testutil.rs                   # 测试夹具（#[cfg(test)]）
 
 crates/api/
-  src/lib.rs                        # ObjectStore trait、领域错误、boundary 别名
+  src/lib.rs                        # ObjectStore trait + 传输类型（ByteRange / ObjectInfo / …）
+  src/error.rs                      # ApiError
 
 crates/s3/
   src/lib.rs                        # s3s S3Service 装配（构造时接收 Arc<dyn ObjectStore>，见 DESIGN §5 R4）
   src/impl_s3.rs                    # impl S3 for RstoreFs —— 只持有 api trait，不依赖 rstore-store
-  src/auth.rs                       # 静态 root 凭证的 AuthProvider
-  src/errors.rs                     # 领域错误 → S3 错误码
-  src/validate.rs                   # 桶名 / 对象 key 校验（Task 5.7）
+  src/errors.rs                     # ApiError → S3 错误码
+  src/validate.rs                   # 对象 key 保留前缀校验（Task 5.7）
+  # 没有 auth.rs：凭证走 s3s::auth::SimpleAuth::from_single，见 Task 5.1
 
 crates/s3-compat/
   src/lib.rs                        # compat 中间件栈（按 §DESIGN 15.3 准入）
@@ -122,11 +128,13 @@ crates/server/
 # 根 tests/ 不会被 cargo 编译。根 tests/ 只放 shell 脚本。
 crates/disk/tests/
   faulty_disk.rs                    # Task 3.4
-crates/store/tests/
-  quorum_boundaries.rs              # Task 4.9
-  commit_crash.rs                   # Task 4.10
 crates/s3/tests/
   compat_smoke.rs                   # Task 5.9 的 Rust 侧冒烟
+
+# **store 没有 tests/ 目录**：Task 4.9 / 4.10 原计划把用例放在
+# crates/store/tests/ 下，但集成测试是独立编译的 crate，看不到内部的
+# #[cfg(test)] mod testutil。两者都改成了 src/ 内的 #[cfg(test)] 模块
+# （quorum_boundaries.rs / reconcile.rs），见各自开头的说明。
 tests/acceptance.sh                 # 仓库根，M6 的端到端验收驱动
 tests/compat/                       # 仓库根，仅 shell 脚本，不参与 cargo 编译
   aws_cli.sh
@@ -5524,14 +5532,352 @@ git commit -m "test(store): interruption-point invariants and orphan reconciliat
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
+### Task 4.11: 桶操作与对象列举
+
+**Files:**
+- Create: `crates/store/src/bucket.rs`、`crates/store/src/list.rs`
+- Modify: `crates/store/src/error.rs`（加 `BucketNotEmpty`）
+- Modify: `crates/store/src/get.rs`（把「取一个权威版本的 etag」抽成 `pub(crate)` 复用）
+- Modify: `crates/store/src/lib.rs`（加 `pub mod bucket;`、`pub mod list;`）
+
+> **为什么会有这一节。** M5 的 5.2（`CreateBucket` / `DeleteBucket` / `HeadBucket` /
+> `ListBuckets`）与 5.5（`ListObjectsV2`）都假定存储层已经有桶操作与对象列举——
+> 但 M4 的 4.1~4.10 从头到尾只实现了**对象级**的 PUT / GET / DELETE。
+> 全篇 grep `create_bucket` / `list_objects` 只在 5.7 与 5.5 的描述里各出现一次，
+> 没有任何一个 Task 实现它们。不补这一节，5.2 与 5.5 是**写不出来**的：
+> 适配器那一层只有 `Arc<dyn ObjectStore>`，不可能自己去遍历盘。
+
+#### 桶怎么表示（MVP 的一条规则）
+
+**桶存在 ⟺ 该桶目录下有 `.rstore.sys/bucket.meta`。** 这跟 DESIGN §6.2 给桶级元数据
+留的 `.rstore.sys/` 是同一个位置；MVP 只在里面放一个空标记文件（内容是 `{}`，
+不解析、不演进——DESIGN 把 policy / versioning / usage 都划在后续阶段）。
+
+为什么要标记文件而不是「有目录就算有桶」：`delete_bucket` 会把整个桶目录删掉，
+之后任何残留的空目录都会让「桶还在不在」这个判断失真。标记文件是显式的。
+
+`DiskAPI` 没有 `mkdir`，但 `write_all` 会创建父目录（LocalDisk 就是这条路），
+所以 `create_bucket` 写 `"<bucket>/.rstore.sys/bucket.meta"` 一步就够了。
+
+#### 桶级元数据的 quorum
+
+桶级元数据**没有纠删码**（它不是对象数据），所以不能套用 `read_quorum` / `write_quorum`
+那两个针对分片的定义。这里只需要一个语义：**多数派可见**。复用已经有定义的那个数——
+`delete_quorum(total) = total / 2 + 1`（严格多数）——并把它当作「桶级操作的门槛」：
+
+- `create_bucket`：逐盘写标记，成功盘数 ≥ 严格多数 → `Ok`；否则
+  `Err(StoreError::WriteQuorum { achieved, required: 严格多数 })`。
+- `bucket_exists`：标记在 **≥ 严格多数** 的盘上存在 → `true`。
+- `delete_bucket`：逐盘 `remove_dir_all("<bucket>")`，成功盘数 ≥ 严格多数 → `Ok`。
+
+用同一个数是为了避免再造一个新常量；写进注释说明它是「桶级元数据的多数派门槛」，
+**不是** `delete_quorum` 在语义上被挪用——两者恰好都是「严格多数」而已。
+
+> 这条规则保证的是**单调性**：不会出现「一半盘认为桶在、一半认为不在」，于是连续两次
+> `HeadBucket` 得到相反的答案。这是放弃纠删码之后能拿到的最弱但足够的不变量。
+
+#### 契约
+
+```rust
+/// LIST 返回的一行。**只包含仍然活着的对象**——删除标记与纯孤儿都不出现。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// `header.mod_time`；`None` 时按 0 处理（PUT 总会写它，见 4.5）。
+    pub mod_time: u64,
+}
+
+impl ErasureSet {
+    /// 幂等：桶已存在也返回 `Ok`（S3 的 `BucketAlreadyOwnedByYou` 不在 MVP 范围内，
+    /// 而 `aws s3 mb` 的重复调用不该让冒烟脚本失败）。
+    pub async fn create_bucket(&self, bucket: &str) -> Result<(), StoreError>;
+
+    /// 桶里有**活对象**（即 `list_objects(bucket, None)` 非空）→ `BucketNotEmpty`。
+    /// 只有删除标记与孤儿目录的桶算空桶，可以删。
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<(), StoreError>;
+
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, StoreError>;
+
+    /// 所有盘的桶名并集（已排序）。**跳过以 `.` 开头的条目**——
+    /// 盘根下有 `.rstore.sys/`（DESIGN §6.2），它不是一个桶。
+    pub async fn list_buckets(&self) -> Result<Vec<String>, StoreError>;
+
+    /// `bucket` 下所有活对象，按 key 升序。`prefix` 为 `None` 时返回全部。
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectEntry>, StoreError>;
+}
+```
+
+`StoreError` 加一个变体（其余不动）：
+
+```rust
+#[error("bucket not empty")]
+BucketNotEmpty,
+```
+
+#### 对象列举怎么走（递归 + 复用 `resolve_version`）
+
+`list_dir` 只返回**条目名**、不区分文件与目录（`fsx::list_dir` 就是这么实现的），
+所以递归时每个条目要补一次 `stat` 看 `is_dir`。规则：
+
+1. 逐盘从 `<bucket>` 开始递归，收集候选 key，**取所有盘的并集**
+   （某块盘可能缺某些 key）。对当前目录 `D`（相对 bucket 的路径为 `p`，根为 `""`）：
+   - `list_dir(D)` 包含 `meta.xl` → `D` 是一个**版本目录**，它的父路径 `p` 就是一个 key，
+     记入候选并**停止往下递归**；
+   - 否则对每个条目 `name`：
+     - 跳过 `name.starts_with(".staging-")`（未提交的暂存目录，4.10）；
+     - **`p` 为空（bucket 根）时**，再跳过 `name.starts_with(".rstore")`——
+       那是系统目录（`.rstore.sys`、将来的 `.rstore.uploads`）。用户 key 的首段
+       不可能是这个前缀（DESIGN §6.3 / Task 5.7 保证），所以这个跳过不会藏掉用户数据；
+       更深层的段**不跳**（`a/.rstore/x` 是合法 key，跳过它就是「GET 得到、LIST 看不到」
+       这种最难查的不一致）；
+     - `stat(D/name).is_dir` 为真才递归进去。
+2. 对每个候选 key：`resolve_version(set, bucket, key)`，只有 `live()` 是 `Some` 才收录。
+   删除标记与「只剩暂存目录」的 key 因此自然消失——**与 GET 用的是同一处判断**，
+   不会有「GET 说没有、LIST 说有」。
+3. 按 key 升序排序（并集来自多块盘，顺序不保证）。
+4. `prefix` 过滤在最后做一次 `key.starts_with(prefix)`。
+
+**性能**：MVP 是全盘遍历 + 每 key 一次元数据仲裁，`// PERF: 见 DESIGN §1.2 与 §20
+Phase 2 — 命名空间索引` 的挂钩注释留在这里（5.5 还要再留一次）。不要试图在 MVP 里
+做前缀剪枝：`prefix` 是按 key 的字符串前缀，而 key 的目录切分与它并不对齐
+（`prefix = "a/b"` 可能落在 `a/b` 或 `a/bc` 两个目录下），剪枝剪错就是静默丢结果。
+
+#### etag 只能有一处算法
+
+`GetOut` 要 etag，`ObjectEntry` 也要 etag，而内联对象的 etag **没落进 meta**
+（4.5 的内联分支 `parts` 是空的，见 Task 4.7 的说明）。所以把「从一个权威版本取出 etag」
+抽成 `get.rs` 里的 `pub(crate) fn`，让 GET 与 LIST 共用：
+
+```rust
+/// 取 `bucket/key` 权威版本的 etag。
+/// 分片对象直接读 `parts[0].etag`；内联对象现算 `etag_of(inline)`。
+pub(crate) fn etag_of_meta(meta: &rstore_meta::ObjectMeta) -> Result<String, StoreError>;
+```
+
+**别在 `list.rs` 里再写一份**——两处算法分叉的表现是「HEAD 的 ETag 与 LIST 的不一样」，
+而 S3 客户端（`rclone check`）会拿它当校验依据。
+
+> **PUT 的用户元数据（`x-amz-meta-*`）在 MVP 里不落盘**：`ObjectBody::meta_user` 恒为空
+> `BTreeMap`。PUT / HEAD / GET 都不会转发它。这是已知限制，不是 bug——
+> 要支持得先让 `PutArgs` 带上元数据、`build_meta` 写进 body、GET 再从 `decode_body` 取出来。
+> 同理，**分片对象也不返回 `x-amz-meta-mtime` 之类**。M5 不要为此去改 store 层。
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use rstore_disk::faulty::Fault;
+
+    use super::*;
+    use crate::error::StoreError;
+    use crate::put::PutArgs;
+    use crate::testutil::{set_with_disks, TestSet};
+
+    fn put_args(bucket: &str, key: &str, n: usize) -> PutArgs {
+        PutArgs { bucket: bucket.into(), key: key.into(), data: vec![7u8; n] }
+    }
+
+    #[tokio::test]
+    async fn create_then_exists_and_recreate_is_ok() {
+        let set = set_with_disks(6, 2).await;
+        assert!(!set.bucket_exists("data").await.unwrap());
+
+        set.create_bucket("data").await.unwrap();
+        assert!(set.bucket_exists("data").await.unwrap());
+
+        // 幂等：重复建桶不该失败（`aws s3 mb` 会无条件调用它）。
+        set.create_bucket("data").await.unwrap();
+        assert!(set.bucket_exists("data").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_rejects_non_empty_then_succeeds_when_empty() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("data").await.unwrap();
+        set.put_object(put_args("data", "k", 1_000_000)).await.unwrap();
+
+        let r = set.delete_bucket("data").await;
+        assert!(matches!(r, Err(StoreError::BucketNotEmpty)), "got {r:?}");
+        assert!(set.bucket_exists("data").await.unwrap(), "拒绝之后桶必须原样在");
+
+        // 删掉对象（写的是删除标记）之后桶就算空了：墓碑与孤儿都不算「非空」。
+        set.delete_object("data", "k").await.unwrap();
+        set.delete_bucket("data").await.unwrap();
+        assert!(!set.bucket_exists("data").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_objects_skips_delete_markers_and_uncommitted_staging() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("data").await.unwrap();
+        set.put_object(put_args("data", "keep", 1_000_000)).await.unwrap();
+        set.put_object(put_args("data", "gone", 1_000_000)).await.unwrap();
+        set.delete_object("data", "gone").await.unwrap();
+
+        // 手工造一个「写完 meta、没提交」的现场：它绝不能被 LIST 当成一个对象。
+        for i in 0..6 {
+            set.disks()[i]
+                .as_ref()
+                .unwrap()
+                .write_all("data/ghost/.staging-00000000-0000-0000-0000-000000000002/meta.xl", b"x")
+                .await
+                .unwrap();
+        }
+
+        let entries = set.list_objects("data", None).await.unwrap();
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["keep"], "got {entries:?}");
+        assert_eq!(entries[0].size, 1_000_000);
+        // etag 必须是 32 位小写十六进制的 MD5（与 PUT 的 PutOut.etag 同源）。
+        assert_eq!(entries[0].etag.len(), 32, "etag={}", entries[0].etag);
+        assert!(entries[0].etag.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// 前缀过滤 + 嵌套 key。**特别钉住 `a/.rstore/x` 这种深层保留名**：
+    /// 它首段是 `a`，是合法 key（5.7 只禁首段），GET 能读到它就说明 LIST 也必须列出来。
+    #[tokio::test]
+    async fn list_objects_walks_nested_keys_and_filters_prefix() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("data").await.unwrap();
+        for key in ["a", "dir/b", "dir/c/d", "a/.rstore/x"] {
+            set.put_object(put_args("data", key, 200_000)).await.unwrap();
+        }
+
+        let all: Vec<String> = set
+            .list_objects("data", None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(all, vec!["a", "a/.rstore/x", "dir/b", "dir/c/d"], "必须按 key 升序");
+
+        let dir: Vec<String> = set
+            .list_objects("data", Some("dir/"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(dir, vec!["dir/b", "dir/c/d"]);
+    }
+
+    /// 掉线 4 块盘（只剩 2 块）时列举必须**失败**，而不是返回一个缺了内容的列表：
+    /// 只剩 2 份元数据过不了 read_quorum，此时「列不全」与「列错」无法区分。
+    #[tokio::test]
+    async fn list_objects_fails_rather_than_truncates_below_quorum() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("data").await.unwrap();
+        set.put_object(put_args("data", "k", 1_000_000)).await.unwrap();
+
+        for i in 0..4 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        let r = set.list_objects("data", None).await;
+        assert!(
+            matches!(r, Err(StoreError::ReadQuorum { .. })),
+            "低于 quorum 时必须报错，不能返回残缺列表: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_buckets_skips_system_dirs() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("alpha").await.unwrap();
+        set.create_bucket("beta").await.unwrap();
+
+        // 盘根下的盘级系统目录（DESIGN §6.2 的 `<disk>/.rstore.sys/disk_id`）不是桶。
+        for i in 0..6 {
+            set.disks()[i]
+                .as_ref()
+                .unwrap()
+                .write_all(".rstore.sys/disk_id", b"not-a-bucket")
+                .await
+                .unwrap();
+        }
+
+        let buckets = set.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_needs_a_strict_majority() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("data").await.unwrap();
+
+        // 严格多数 = 6/2+1 = 4；3 块可用 < 4。
+        for i in 0..3 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        let r = set.delete_bucket("data").await;
+        assert!(
+            matches!(r, Err(StoreError::WriteQuorum { .. })),
+            "got {r:?}"
+        );
+    }
+}
+```
+
+> 最后一条测试里的 `3` 与 `4` 是按**定义**算的（严格多数 = `total / 2 + 1` = 4），
+> 不要照抄注释；任务 4.9 已经因为同一类错误返工过一次。
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test -p rstore-store bucket`
+Expected: 编译失败（`no method named create_bucket`）
+
+- [ ] **Step 3: 实现**
+
+按上面的契约实现。几处要点：
+
+- `create_bucket` / `delete_bucket` / `bucket_exists` 里的「逐盘」用
+  `self.disks().iter().flatten()`；掉线的盘与 `None` 槽位都只算「没成功」，
+  不像错误一样上抛（除非成功盘数不达标）。
+- `delete_bucket` 必须先判空再删：反过来就是「先删了再发现不该删」。
+- `list_objects` 的递归深度用 bucket 内 key 的层数封顶没有意义（key 可以任意深），
+  但要注意**不要跟着符号链接走**——`stat` 给的是 `fs::metadata`，会跟随链接；
+  MVP 的数据目录由本程序自己创建，不产生链接，这条只作为注释记下。
+- `list.rs` 与 `bucket.rs` 都 `use crate::get::resolve_version`（已是 `pub(crate)`）。
+
+- [ ] **Step 4: 跑测试确认通过并提交**
+
+Run: `cargo test -p rstore-store bucket`
+Expected: PASS
+
+```bash
+git add crates/store/
+git commit -m "feat(store): bucket operations and object listing
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
 ## M5 — S3 接入
 
 ### Task 5.1: s3s 骨架与认证
 
 **Files:**
-- Create: `crates/api/src/lib.rs`
-- Create: `crates/s3/src/lib.rs`、`crates/s3/src/auth.rs`
+- **Modify** `crates/api/src/lib.rs`（**已存在**，M0 的骨架只有一行 doc 注释）
+- Create: `crates/api/src/error.rs`
+- Modify: `crates/api/Cargo.toml`（加 `async-trait`）
+- **Modify** `crates/s3/src/lib.rs`（**已存在**的骨架）
 - Create: `crates/s3/src/impl_s3.rs`
+- Modify: `crates/s3/Cargo.toml`（加 `s3s` / `async-trait` / `serde_json`）
+- Modify: 根 `Cargo.toml` 的 `[workspace.dependencies]`（加 `s3s = "0.17"`，测试要用的
+  `tower` 与 `http` 也一并加进去）
+
+> **不需要 `crates/s3/src/auth.rs`。** 原计划要自己写一个 `AuthProvider`，但 s3s 已经
+> 提供了正好是 MVP 需要的那一个：`s3s::auth::SimpleAuth::from_single(access_key, secret_key)`
+> （单条静态 root 凭证）。自己再包一层只是把 20 行的东西变成 60 行。
+>
+> **版本**：`s3s` 最新是 **0.17.0**，MSRV `1.96.0`；本仓库 `rust-toolchain.toml` 锁的是
+> `1.97.1`，够用（`cargo info s3s` 可复核）。别用 `0.18.0-alpha`。
 
 > **先看护栏脚本的 allowlist**（`scripts/check_layer_deps.py`）：
 > ```python
@@ -5619,35 +5965,167 @@ impl ObjectStore for EngineAdapter {   // trait 外部、类型本地 → 合法
 构造参数注入：
 
 ```rust
+#[derive(Clone)]
 pub struct RstoreFs {
-    store: Arc<dyn ObjectStore>,   // 不是 Arc<ECStore> —— s3 看不到引擎类型
-    auth:  Arc<dyn AuthProvider>,
+    /// 不是 `Arc<ECStore>`——s3 看不到引擎类型（allowlist 里没有那条边）。
+    /// 于是它可以拿一个 mock `ObjectStore` 单独测试。
+    store: Arc<dyn ObjectStore>,
 }
 ```
 
-- [ ] **Step 2: 写集成测试（用 s3s 的测试工具或直接打 HTTP）**
+凭证不走这个结构体：它是 `S3ServiceBuilder` 的一个参数（见 Step 3）。
+
+- [ ] **Step 1: 定义 `rstore-api` 的契约**
+
+原计划**没有这一步**，只有一句「api 定义 `ObjectStore` trait」——trait 的方法集合从头到尾
+没有出现过。而 5.2~5.6 全都是「拿 `ObjectStore` 实现 s3s 的 `S3`」，没有契约就没法开工。
+下面是完整定义（`crates/api/src/lib.rs` + `crates/api/src/error.rs`）：
 
 ```rust
-#[tokio::test]
-async fn rejects_bad_signature() {
-    // 启动服务 → 发一个错误的 Authorization → 期望 403 SignatureDoesNotMatch
+// crates/api/src/lib.rs
+//! 存储契约 trait，供上层消费。不得反向依赖任何实现 crate。
+pub mod error;
+
+pub use error::ApiError;
+
+use async_trait::async_trait;
+
+/// S3 层能对引擎提出的全部问题。**刻意不含 multipart**——MVP 一律返回 501，
+/// 所以 trait 上根本没有对应方法，编译期就堵死了「不小心实现了半个 multipart」。
+///
+/// 所有方法返回 [`ApiError`] 而**不是** `rstore_store::StoreError`：`rstore-api` 与
+/// `rstore-store` 是兄弟，allowlist 里没有这条边（`scripts/tests/test_check_layer_deps.py`
+/// 把 `rstore-api -> rstore-store` 钉成 FORBIDDEN EDGE）。`StoreError -> ApiError`
+/// 的映射写在组合根 `rstore-server/src/wiring.rs`。
+#[async_trait]
+pub trait ObjectStore: Send + Sync + 'static {
+    async fn create_bucket(&self, bucket: &str) -> Result<(), ApiError>;
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), ApiError>;
+    async fn head_bucket(&self, bucket: &str) -> Result<(), ApiError>;
+    async fn list_buckets(&self) -> Result<Vec<String>, ApiError>;
+
+    async fn put_object(&self, bucket: &str, key: &str, data: Vec<u8>)
+        -> Result<ObjectInfo, ApiError>;
+    async fn get_object(&self, bucket: &str, key: &str, range: Option<ByteRange>)
+        -> Result<ObjectData, ApiError>;
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo, ApiError>;
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ApiError>;
+
+    /// MVP 是**全盘遍历**（见 Task 4.11），返回已按 key 升序。
+    async fn list_objects(&self, bucket: &str, prefix: Option<&str>)
+        -> Result<Vec<ObjectEntry>, ApiError>;
 }
 
-#[tokio::test]
-async fn accepts_valid_sigv4() {
-    // 用 aws-sigv4 生成正确签名 → 期望 200
+/// 闭区间 `[start, end]`。**不复用 `rstore_store::ByteRange`**（那条边不存在）——
+/// 两边各定一份，由组合根转换。把 `bytes=a-b` / `bytes=a-` / `bytes=-n` 解析并裁剪成
+/// 闭区间是 S3 层的职责（Task 5.4），到这里必须已经是越界检查过的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub size: u64,
+    pub etag: String,
+    /// Unix 纳秒。`rstore_meta` 里是 `Option<u64>`；本层统一成 `u64`
+    /// （PUT 总会写它，见 4.5），组合根负责 `unwrap_or(0)`。
+    pub mod_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectData {
+    /// **请求范围内**的字节（`range` 为 `None` 时是整份）。
+    pub data: Vec<u8>,
+    /// 整个对象的原始长度（`Content-Range` 要它）。
+    pub size: u64,
+    pub etag: String,
+    pub mod_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    pub mod_time: u64,
 }
 ```
+
+**MVP 不做流式**，所以 `data: Vec<u8>`：分片本来就整份读进内存再解码，再包一层
+`AsyncRead` 只是给同一块内存加一层接口（理由同 Task 4.7）。配合 8 MiB 的载荷上限
+（multipart 未实现，见 5.6），内存占用是有界的。
+
+- [ ] **Step 2: 写集成测试**
+
+原计划这两条测试**只有注释、没有一行代码**，而且「启动服务」在单元测试里意味着绑端口——
+那是 flaky 的根源。`S3Service` 是 hyper + tower 的 service，直接用
+`tower::ServiceExt::oneshot` 打进去，**零端口、零等待**：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use s3s::auth::SimpleAuth;
+    use s3s::service::S3ServiceBuilder;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// 一个什么都没做的 ObjectStore：本节只测认证，不测业务。
+    struct NopStore;
+    #[async_trait::async_trait]
+    impl ObjectStore for NopStore {
+        async fn list_buckets(&self) -> Result<Vec<String>, ApiError> { Ok(Vec::new()) }
+        // 其余方法一律 `Err(ApiError::Internal("nop".into()))`。
+        // **写出来，别用 `todo!()`**：`unsafe_code = "forbid"` 不拦它，但 panic
+        // 会污染测试输出，而且一个 panic 的桩会让「测试绿了」这件事失去意义。
+    }
+
+    fn service() -> s3s::service::S3Service {
+        let mut b = S3ServiceBuilder::new(RstoreFs { store: Arc::new(NopStore) });
+        b.set_auth(SimpleAuth::from_single("testkey", "testsecret"));
+        b.build()
+    }
+
+    async fn status_of(req: Request<Vec<u8>>) -> StatusCode { /* oneshot + parse */ }
+
+    #[tokio::test]
+    async fn rejects_bad_signature() {
+        // 错误密钥签出来的 Authorization → 403，且响应体的 <Code> 是 SignatureDoesNotMatch
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_sigv4() {
+        // 用 s3s 自带的 sigv4 工具（`s3s::crypto` / `s3s_sigv4`）签一个 ListBuckets → 200
+    }
+}
+```
+
+**不必自己实现签名算法**：`s3s` 依赖里已经带了 `s3s-sigv4`（`s3s::crypto` 下也有现成的
+签名工具）。用被测代码**不同一条路径**的签名实现来生成请求，才是真的在测「服务端的校验」。
 
 - [ ] **Step 3: 实现**
 
-用 `s3s::S3ServiceBuilder` 组装，`set_auth` 传入一个静态 root 凭证的 `AuthProvider`
-（MVP 单用户，从配置文件读 access_key / secret_key）。
+```rust
+let mut builder = S3ServiceBuilder::new(RstoreFs { store });
+builder.set_auth(SimpleAuth::from_single(&access_key, &secret_key));
+let service = builder.build();
+```
+
+`access_key` / `secret_key` 由调用方（Task 6.3 的配置加载）传进来，5.1 不读文件。
+`RstoreFs` 实现 `s3s::S3`，每个方法把 `ObjectStore` 的结果译成 `S3Response`；
+**multipart 的六个方法一律 `Err(s3s::s3_error!(NotImplemented))`**（见 5.6）。
+
+> `S3ServiceBuilder` 默认带 `AwsNameValidation`（桶名规则）。**5.7 因此不再重复实现
+> 桶名校验**——见那里的说明。
 
 - [ ] **Step 4: 提交**
 
 ```bash
-git add crates/api/ crates/s3/
+git add Cargo.toml crates/api/ crates/s3/
 git commit -m "feat(s3): s3s service skeleton with single root credential auth
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -5686,7 +6164,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 5.7: 命名校验（保留名规则）
 
-**Files:** Create `crates/s3/src/validate.rs`
+**Files:** Create `crates/s3/src/validate.rs`；Modify `crates/common/src/consts.rs`、`crates/s3/src/impl_s3.rs`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -5701,15 +6179,6 @@ fn rejects_object_key_with_reserved_first_segment() {
     assert!(validate_object_key("a/.rstore/x").is_ok());
     assert!(validate_object_key("normal/key").is_ok());
     assert!(validate_object_key("").is_err());
-}
-
-#[test]
-fn rejects_bucket_names_violating_s3_rules() {
-    assert!(validate_bucket_name(".hidden").is_err());    // 不能以 '.' 开头
-    assert!(validate_bucket_name("OK-Bucket").is_err());  // 不能有大写
-    assert!(validate_bucket_name("-leading").is_err());
-    assert!(validate_bucket_name("ok-bucket").is_ok());
-    assert!(validate_bucket_name("ok.bucket.123").is_ok());
 }
 
 #[test]
@@ -5730,14 +6199,20 @@ Expected: 编译失败
 /// 对象 key 校验。返回 `ApiError::InvalidObjectName`。
 /// 只检查第一段；深层段允许出现 `.rstore`（DESIGN §6.3）。
 pub fn validate_object_key(key: &str) -> Result<(), ApiError>;
-
-/// 桶名校验。S3 规则：3–63 字符、小写字母或数字开头、仅含 `a-z0-9.-`。
-/// 返回 `ApiError::InvalidBucketName`。
-pub fn validate_bucket_name(name: &str) -> Result<(), ApiError>;
 ```
 
 在 **`crates/common/src/consts.rs`** 中定义 `pub const RESERVED_PREFIX: &str = ".rstore";`，
-两处校验都引用它，**不得内联字面量**。
+校验引用它，**不得内联字面量**。
+
+> **不要写 `validate_bucket_name`。** 原计划里有一个，连同它的四条断言
+> （`.hidden` / `OK-Bucket` / `-leading` 拒绝，`ok-bucket` / `ok.bucket.123` 通过）——
+> 但那套规则 **s3s 已经在做了**：`S3ServiceBuilder` 默认挂 `AwsNameValidation`，
+> 它调 `s3s::path::check_bucket_name`，检查 3–63 字符、`a-z0-9.-`、首尾必须是字母数字、
+> 不含 `..`、不是 IP 字面量、不以 `xn--` 开头。
+> 自己再写一份的结果是**两个校验器会分叉**：`192.168.1.1` 这类名字 s3s 会拒、手写的那份会放行，
+> 而「到底哪个在生效」取决于这行代码今天挂在哪——这种不一致比少一个校验难查得多。
+> 桶名交给 s3s；本任务只补它**没有**的钩子（保留前缀，`NameValidation` trait 只有
+> `validate_bucket_name` 一个方法，没有对象 key 的钩子，所以只能在 `impl_s3.rs` 入口做）。
 
 > **常量必须落在 `rstore-common`，不能落在 `rstore-meta`。** 原计划写的是
 > `crates/meta/src/keys.rs`，而校验代码在 `crates/s3` 里——但护栏 allowlist
@@ -5750,10 +6225,13 @@ pub fn validate_bucket_name(name: &str) -> Result<(), ApiError>;
 
 - [ ] **Step 4: 在请求入口接入**
 
-在 `impl_s3.rs` 的 `put_object` 与 `create_bucket` 入口调用校验
-（`get` / `head` / `delete` 对不合法的名字同样是 400，但那是**先校验再查**还是
-**查到 404** 都可以，S3 客户端两种都接受——只在 PUT 与建桶这两个**写入**入口强制）。
+只在 `impl_s3.rs` 的 **`put_object`** 入口调 `validate_object_key`——
+**建桶不调**（桶名交给 s3s 的 `AwsNameValidation`，见 Step 3 的说明）。
+`get` / `head` / `delete` 对不合法的 key 同样是 400，但那是「先校验再查」还是
+「查到 404」都可以，S3 客户端两种都接受；只在**写入**入口强制。
+
 补一个 HTTP 层测试：对 `.rstore.sys/x` 发 PUT，期望 `400` + `InvalidObjectName`。
+（用 5.1 那套 `tower::ServiceExt::oneshot`，别绑端口。）
 
 - [ ] **Step 5: 提交**
 
@@ -5809,13 +6287,22 @@ fn maps_api_errors_to_s3_codes() {
 
 | `StoreError` | `ApiError` | 说明 |
 |---|---|---|
-| `NotFound` | `NoSuchKey` | Task 4.7 已加这个变体 |
+| `NotFound` | `NoSuchKey` | Task 4.7 加了变体；`head_bucket` / `delete_bucket` 要映成 `NoSuchBucket`，见下 |
+| `BucketNotEmpty` | `BucketNotEmpty` | 409；Task 4.11 加这个变体。这是 `DeleteBucket` 唯一的非 404 失败 |
 | `ReadQuorum { .. }` / `WriteQuorum { .. }` | `Unavailable` | 503 + `Retry-After`；这是**暂时**不可用，不是 500 |
 | `ShardLayout(_)` | `Internal` | 布局坏了是本实现自己的 bug，必须显式暴露 |
 | `Internal(_)` | `Internal` | |
 | `Disk(DiskError::NotFound)` | `NoSuchKey` | 单盘缺失通常已被上层吸收成 slot=None，走到这里说明是整体缺失 |
 | `Disk(_)` 其余 | `Internal` | |
 | `_`（`#[non_exhaustive]` 的兜底） | `Internal` | `StoreError` 是 `#[non_exhaustive]`，必须有兜底分支 |
+
+**`NotFound` 那一行要在适配器里按方法分岔**：`StoreError::NotFound` 本身分不清
+「对象不在」与「桶不在」，而 `EngineAdapter` 知道自己在实现哪个方法——
+`head_bucket` / `delete_bucket` 把它映成 `NoSuchBucket`（404），
+`get_object` / `head_object` / `delete_object` 映成 `NoSuchKey`（404）。
+这正是 `ApiError` 把这两个码分开（而不是合并成一个 `NotFound`）的原因；
+把分岔放在适配器里而不是在 `StoreError` 上再加一个变体，是因为**只有适配器同时知道
+「是哪次调用」**，`StoreError` 加变体反而要把这个信息从调用点一路传下来。
 
 **不引入 `DiskFull` / `SlowDown`**：`StoreError`、`DiskError` 里都没有能区分出它们的变体，
 凭空加两个 S3 错误码只会得到「永远返回不到」的死分支。真需要时先在
@@ -6151,6 +6638,10 @@ MVP 交付时必须全部为真：
 - [ ] `rstore-s3-compat` 中每个中间件都有对应的冒烟测试，且注释指明来源客户端
 - [ ] DESIGN §1.2 的非目标清单中，没有任何一项被意外实现（范围不蔓延）
 - [ ] 六个 multipart 操作各自返回 `501 NotImplemented`（MVP 明确推迟，见 Task 5.6）
+- [ ] 桶操作可用：建桶幂等、非空桶删返回 409、`ListBuckets` 不把系统目录当桶
+      （Task 4.11）
+- [ ] `ListObjectsV2` 不列出删除标记、不列出未提交的 `.staging-*` 目录，
+      且掉盘低于 quorum 时报错而不是返回残缺列表（Task 4.11 / 5.5）
 
 ---
 
