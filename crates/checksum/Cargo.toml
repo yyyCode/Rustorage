@@ -9,5 +9,8 @@ publish.workspace = true
 rstore-common.workspace = true
 blake3.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

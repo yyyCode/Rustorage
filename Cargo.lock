@@ -625,6 +625,7 @@ name = "rstore-checksum"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "proptest",
  "rstore-common",
 ]
 
