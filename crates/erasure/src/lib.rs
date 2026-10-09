@@ -1,7 +1,9 @@
 //! 纠删码门面与编解码器缓存。只依赖 common。
 
+pub mod cache;
 pub mod error;
 
+pub use cache::CodecCache;
 pub use error::{ErasureConstructionError, ErasureError};
 
 /// 纠删码门面。对应 DESIGN §10。
