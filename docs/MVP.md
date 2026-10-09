@@ -259,6 +259,7 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 - Create: `scripts/check_layer_deps.py`
 - Create: `scripts/tests/test_check_layer_deps.py`
 - Create: `.gitattributes`
+- Modify: `.gitignore`（忽略 `__pycache__/`、`*.pyc`）
 - Modify: `Cargo.toml`（`[workspace.package]` 加 `publish = false`；新增 `[workspace.lints]`）
 - Modify: 10 × `crates/*/Cargo.toml`（各加 `[lints] workspace = true` 与 `publish.workspace = true`）
 - Modify: `rust-toolchain.toml`（固定版本）
@@ -351,15 +352,29 @@ ALLOWED = {
 
 
 def table_errors(table):
-    """白名单必须按传递闭包补齐。
+    """白名单必须自洽：按传递闭包补齐，且不引用未登记的名字。
 
-    否则 `api → X → store` 这类绕道违规会溜过去：api 只直接依赖 X，看似合规，
-    但 X 依赖 store，实际传递依赖已经越界。这条不变量必须机器化检查，
-    不能指望 review 时有人拿手算一遍。
+    闭包：否则 `api → X → store` 这类绕道违规会溜过去——api 只直接依赖 X，
+    看似合规，但 X 依赖 store，实际传递依赖已经越界。
+
+    悬空引用：`ALLOWED[c]` 里出现了表中不存在条目。正常表里每个内部 crate
+    都是键，所以这多半是拼写错误（`rstore-meta` 写成 `rstore-metaa`）。
+    这种情况绝不能静默当叶子节点放过——那等于把一条依赖边从图上抹掉，
+    护栏会转而"证明"一个不存在的结论。
+
+    返回错误列表，空列表表示自洽。这里刻意不抛异常：任何未捕获的异常都会以
+    退出码 1 结束，而 1 在本脚本里表示"发现违规"，正好是 docstring 警告的
+    那种混淆。
     """
     errors = []
     for crate, deps in table.items():
         for reachable in deps:
+            if reachable not in table:
+                errors.append(
+                    f"白名单引用了未登记的 crate：{crate} → {reachable}；"
+                    f"表里没有 {reachable} 这一项（拼写错误？）"
+                )
+                continue
             extra = table[reachable] - deps
             if extra:
                 errors.append(
@@ -438,6 +453,7 @@ Expected: 退出码 0，无输出
 运行：python3 scripts/tests/test_check_layer_deps.py
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -487,22 +503,54 @@ CASES = [
 
 
 def run_checker(payload):
+    """跑一次检查器，返回 CompletedProcess。
+
+    编码必须两端都钉死成 UTF-8。`text=True` 只让 Python 用**区域编码**解码子进程
+    输出——Windows 上是 GBK。子进程若按另一种编码写，父进程解码失败后
+    `proc.stdout` 会静默变成 `None`，测试随即以 `TypeError: argument of type
+    'NoneType' is not iterable` 崩掉，看不出真正原因。这里的断言比对的是中文消息，
+    所以编码必须确定，而不是碰巧两边一致。
+    """
     stdin = "" if payload is None else json.dumps(payload)
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     return subprocess.run(
         [sys.executable, str(CHECKER)],
         input=stdin, capture_output=True, text=True,
+        encoding="utf-8", env=env,
     )
 
 
 def test_real_table_is_closed():
-    """真实白名单必须闭包——这是「绕道违规不可能」这条论证的全部依据。"""
+    """真实白名单必须自洽——这是「绕道违规不可能」这条论证的全部依据。"""
     assert chk.table_errors(chk.ALLOWED) == []
 
 
 def test_closure_check_catches_non_closed_table():
-    """未闭包的表必须被检出，否则检查器形同虚设。"""
-    bad = {"rstore-api": {"rstore-mid"}, "rstore-mid": {"rstore-store"}}
+    """未闭包的表必须被检出，否则检查器形同虚设。
+
+    api → mid → store 是一条绕道：api 只直接依赖 mid，但 mid 依赖 store，
+    实际传递依赖已经越界。三个名字都在表中登记，所以这是纯粹的闭包违规，
+    不掺杂悬空引用。
+    """
+    bad = {
+        "rstore-api": {"rstore-mid"},
+        "rstore-mid": {"rstore-store"},
+        "rstore-store": set(),
+    }
     assert chk.table_errors(bad) != []
+
+
+def test_dangling_reference_is_a_table_error():
+    """允许集合里出现表中没有的名字，必须报错，既不能崩也不能放过。
+
+    崩（KeyError）会以退出码 1 结束，被误读成「发现违规」；
+    静默当叶子节点放过，等于把一条依赖边从图上抹掉，
+    护栏会转而"证明"一个不存在的结论。
+    """
+    bad = {"rstore-api": {"rstore-typo"}}
+    errs = chk.table_errors(bad)
+    assert errs != [], "悬空引用必须被检出"
+    assert any("rstore-typo" in e for e in errs), f"错误信息应指出该名字：{errs}"
 
 
 def main():
@@ -519,7 +567,12 @@ def main():
             problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
         failures += [f"{label}: {p}" for p in problems]
 
-    for fn in (test_real_table_is_closed, test_closure_check_catches_non_closed_table):
+    unit_tests = (
+        test_real_table_is_closed,
+        test_closure_check_catches_non_closed_table,
+        test_dangling_reference_is_a_table_error,
+    )
+    for fn in unit_tests:
         try:
             fn()
         except AssertionError as e:
@@ -527,7 +580,7 @@ def main():
 
     for f in failures:
         print(f"FAIL {f}")
-    print(f"\n{len(CASES) + 2 - len(failures)} 项通过，{len(failures)} 项失败")
+    print(f"\n{len(CASES) + len(unit_tests) - len(failures)} 项通过，{len(failures)} 项失败")
     return 1 if failures else 0
 
 
@@ -536,18 +589,26 @@ if __name__ == "__main__":
 ```
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: 全部通过（`9 项通过，0 项失败`），退出码 0
+Expected: 全部通过（`10 项通过，0 项失败`），退出码 0
 
 - [ ] **Step 3b: 端到端确认——真仓库上护栏仍能抓到违规**
 
 fixtures 测的是检查器；这一步测的是"包装脚本 + 真 cargo metadata"这条链路。
-用例 A —— 临时给 `crates/api/Cargo.toml` 加 `rstore-store.workspace = true`：
+
+**注意改动位置**：必须把 `rstore-store.workspace = true` 加进对应清单的 `[dependencies]`
+**表内**。这几个文件末尾现在是 `[lints]`，直接追加到文件尾会落进错误的表，
+cargo 会报 `invalid type: boolean 'true', expected a string or map`。
+
+**另注意**：撤销时不要用 `git checkout -- <文件>`——如果工作区还有本任务未提交的
+`publish.workspace = true` 改动，那会把它们一并丢掉。手工删掉那一行。
+
+用例 A —— 临时给 `crates/api/Cargo.toml` 的 `[dependencies]` 加 `rstore-store.workspace = true`：
 
 Run: `bash scripts/check-layer-deps.sh`
 Expected: `FORBIDDEN EDGE: rstore-api -> rstore-store  (kind=normal)`，退出码 1
 
-**撤销**（确认 `git diff` 干净）后，用例 B —— 临时给 `crates/s3-compat/Cargo.toml` 加
-`rstore-store.workspace = true`：
+**撤销**（确认 `git diff` 只剩 `publish` 那几行的预期改动）后，用例 B —— 临时给
+`crates/s3-compat/Cargo.toml` 的 `[dependencies]` 加 `rstore-store.workspace = true`：
 
 Run: `bash scripts/check-layer-deps.sh`
 Expected: `FORBIDDEN EDGE: rstore-s3-compat -> rstore-store  (kind=normal)`，退出码 1
@@ -637,6 +698,16 @@ components = ["rustfmt", "clippy"]
 Run: `file scripts/check-layer-deps.sh`
 Expected: 输出中不含 `CRLF`
 
+在 `.gitignore` 里补上 Python 字节码缓存：
+
+```
+__pycache__/
+*.pyc
+```
+
+自测脚本会 `import check_layer_deps`，Python 随即在 `scripts/` 下生成
+`__pycache__/`。不忽略的话，一条 `git add scripts/` 就会把编译缓存提交进去。
+
 - [ ] **Step 6: 验证加固后仍然全绿**
 
 Run: `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings`
@@ -649,12 +720,12 @@ Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
 
 Run: `python3 scripts/tests/test_check_layer_deps.py`
-Expected: `9 项通过，0 项失败`，退出码 0
+Expected: `10 项通过，0 项失败`，退出码 0
 
 - [ ] **Step 7: 提交**
 
 ```bash
-git add scripts/ .gitattributes Cargo.toml rust-toolchain.toml crates/
+git add scripts/ .gitattributes .gitignore Cargo.toml rust-toolchain.toml crates/
 git commit -m "chore: allowlist-based layer guard and workspace lint hardening"
 ```
 
@@ -735,8 +806,10 @@ Expected: 全部退出码 0
 
 YAML 语法本地校验（只解析，不执行）：
 
-Run: `python3 -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('.github/workflows/ci.yml').read_text()); print('yaml ok')"`
+Run: `python3 -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8')); print('yaml ok')"`
 Expected: `yaml ok`。若本机没有 PyYAML，跳过并在提交信息里注明未做语法校验，不要为此装依赖。
+（`encoding='utf-8'` 不能省：Windows 上 `read_text()` 默认用区域编码 GBK，
+读含中文注释的文件会抛 `UnicodeDecodeError`。）
 
 - [ ] **Step 4: 提交**
 
