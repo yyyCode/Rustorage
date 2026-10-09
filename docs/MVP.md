@@ -4005,9 +4005,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Create: `crates/store/src/quorum.rs`
 - Modify: `crates/store/src/lib.rs`（加 `pub mod quorum;`）
-- Modify: `crates/store/Cargo.toml`（`[dev-dependencies]` 加 `rmp-serde.workspace = true`；
-  测试要自己拼 `ObjectBody` 造样本，而 store 的 `[dependencies]` 里没有 rmp-serde）
 - Test: 同文件 `#[cfg(test)]`
+
+> **不需要给 store 加 `rmp-serde` 依赖**（原计划的 Files 清单里有这条）。
+> Task 4.5 已经把 `rstore_meta::encode_body` / `decode_body` 加了出来——
+> 测试用它们造样本，和生产代码走的是同一条路径，比测试自己调 `rmp_serde` 更贴近真实。
+> 顺带也就不用把「body 是 msgpack」这个事实引进 store 的依赖图。
 
 #### 身份判定：直接比元数据的**线格式字节**
 
@@ -4084,7 +4087,7 @@ mod tests {
             meta_user: [("tag".to_string(), tag.to_string())].into_iter().collect(),
             meta_sys: Default::default(),
         };
-        let body_bytes = rmp_serde::to_vec(&body).unwrap();
+        let body_bytes = rstore_meta::encode_body(&body).unwrap();
         ObjectMeta {
             versions: vec![ShallowVersion { header, body: body_bytes }],
             inline: Default::default(),
@@ -4148,9 +4151,9 @@ mod tests {
     #[test]
     fn meta_sys_differences_split_the_vote() {
         let mut healing = meta_with_tag("a");
-        let mut body: ObjectBody = rmp_serde::from_slice(&healing.versions[0].body).unwrap();
+        let mut body = rstore_meta::decode_body(&healing.versions[0].body).unwrap();
         body.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
-        healing.versions[0].body = rmp_serde::to_vec(&body).unwrap();
+        healing.versions[0].body = rstore_meta::encode_body(&body).unwrap();
 
         let metas = vec![
             meta_with_tag("a"), meta_with_tag("a"), meta_with_tag("a"),
@@ -4167,9 +4170,9 @@ mod tests {
         }
         for _ in 0..3 {
             let mut m = meta_with_tag("a");
-            let mut b: ObjectBody = rmp_serde::from_slice(&m.versions[0].body).unwrap();
+            let mut b = rstore_meta::decode_body(&m.versions[0].body).unwrap();
             b.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
-            m.versions[0].body = rmp_serde::to_vec(&b).unwrap();
+            m.versions[0].body = rstore_meta::encode_body(&b).unwrap();
             all_diff.push(m);
         }
         assert!(matches!(
@@ -5255,7 +5258,7 @@ mod tests {
                     ec_n: 6,
                     ..Default::default()
                 },
-                body: rmp_serde::to_vec(&rstore_meta::ObjectBody {
+                body: rstore_meta::encode_body(&rstore_meta::ObjectBody {
                     id: None,
                     parts: Vec::new(),
                     ec_dist: vec![1, 2, 3, 4, 5, 6],
