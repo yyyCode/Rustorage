@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 固定了 1.97.1；rustup 会按它自动装好工具链。
+      # 显式调一次让"装工具链"这一步在日志里可见，而不是混在 build 里。
+      - name: 安装固定工具链
+        run: rustup show
+
+      - name: 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 护栏排在最前：架构违规要第一条报出来，不要等 build 跑完。
+      # 注意本任务假定 CI 镜像里有 python3。ubuntu-latest 自带；
+      # 若日后换成 slim 镜像，这一步会以退出码 2 硬失败。
+      - name: 架构护栏（依赖方向）
+        run: bash scripts/check-layer-deps.sh
+
+      - name: 护栏自测
+        run: python3 scripts/tests/test_check_layer_deps.py
+
+      - name: 格式
+        run: cargo fmt --all -- --check
+
+      - name: 构建
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace
