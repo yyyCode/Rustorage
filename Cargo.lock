@@ -655,6 +655,7 @@ name = "rstore-erasure"
 version = "0.1.0"
 dependencies = [
  "lru",
+ "proptest",
  "reed-solomon-simd",
  "rstore-common",
  "thiserror",
