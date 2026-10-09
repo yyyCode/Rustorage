@@ -6266,7 +6266,7 @@ fn error_code(body: &[u8]) -> String;
 
 #### Task 5.2: 桶操作
 
-**Files:** Modify `crates/s3/src/impl_s3.rs`、Create `crates/s3/src/mock.rs`、Modify `crates/s3/src/lib.rs`、Modify `crates/s3/Cargo.toml`
+**Files:** Modify `crates/s3/src/impl_s3.rs`、Create `crates/s3/src/mock.rs`、Create `crates/s3/src/errors.rs`、Modify `crates/s3/src/lib.rs`、Modify `crates/s3/Cargo.toml`
 
 - [ ] **Step 1: 写测试**（`MockStore` 按上面的 Step 1 建好）
 
@@ -6319,9 +6319,16 @@ Ok(S3Response::new(ListBucketsOutput {
 > `creation_date: None` 是**有意的**：桶的创建时间在设计里根本没存
 > （`.rstore.sys/bucket.meta` 的内容就是 `{}`）。补一个假时间戳会骗客户端。
 
-**`ApiError → S3 错误` 的映射**由 5.8 统一提供（那时才写 `impl`）；
-本 Task 先按 5.8 的表把 `NoSuchBucket` / `BucketNotEmpty` 这两条落进去，
-免得 5.2 的测试要等 5.8 才能跑。**5.8 只补齐剩下的行，不重写这两条。**
+**`ApiError → S3 错误` 的映射在 `crates/s3/src/errors.rs` 里。**
+本 Task **先建这个文件**，只放 `NoSuchBucket` / `BucketNotEmpty` / `Internal` 三条
+（够 5.2 的测试跑起来）；5.3~5.6 各自用到哪条就补哪条；**Task 5.8 收尾时把它补齐成完整一张表**，
+并加上那份 `assert_code` 矩阵测试。这样安排是为了不让 5.2 的测试干等 5.8——
+但 5.8 必须**核对**前面的实现确实用了这张表，而不是各自手搓了几处
+`s3_error!(NoSuchBucket)` 散落在 `impl_s3.rs` 里。散落的那种写法会在
+「同一个错误码两处实现、改一处漏一处」上翻车。
+
+`errors.rs` 因此要出现在 5.2 的 Files 列表里（Create），
+5.8 只是 Modify 它。`assert_code` 测试工具也先在 5.2 建。
 
 - [ ] **Step 3: 三道门禁 + 提交**（`cargo test -p rstore-s3`、`clippy`、`check-layer-deps.sh`）
 
@@ -6654,7 +6661,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 5.8: 错误映射
 
-**Files:** Create `crates/s3/src/errors.rs`
+**Files:** Modify `crates/s3/src/errors.rs`（**已在 5.2 建好，这里补齐成完整表**）、Modify `crates/s3/src/impl_s3.rs`（把散落的错误构造收敛到一处）
 
 - [ ] **Step 1: 写测试**
 
@@ -6712,7 +6719,7 @@ fn maps_api_errors_to_s3_codes() {
 `rstore_common::error::FatalKind` 里加变体，再回来补这一行——那时它才是有依据的。
 
 ```bash
-git add crates/s3/src/errors.rs
+git add crates/s3/
 git commit -m "feat(s3): domain error to S3 error code mapping
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
