@@ -646,6 +646,7 @@ dependencies = [
  "rstore-checksum",
  "rstore-common",
  "rstore-meta",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

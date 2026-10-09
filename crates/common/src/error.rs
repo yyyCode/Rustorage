@@ -27,6 +27,30 @@ pub enum CorruptKind {
     InvalidDistribution,
 }
 
+/// 瞬时故障：重试有意义，**不计入损坏统计**（DESIGN §17）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransientKind {
+    #[error("io error")]
+    Io,
+    #[error("timeout")]
+    Timeout,
+    #[error("short read")]
+    ShortRead,
+}
+
+/// 致命故障：需要人工介入，重试无意义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FatalKind {
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("read-only disk")]
+    ReadOnly,
+    #[error("path escapes disk root")]
+    PathEscape,
+    #[error("no space left")]
+    NoSpace,
+}
+
 /// 磁盘/存储层错误。`#[non_exhaustive]`：`Transient` / `Fatal` 两个变体
 /// 在 M3 引入，届时属于非破坏性变更（DESIGN §17）。
 ///
@@ -41,4 +65,10 @@ pub enum DiskError {
     /// 确定性损坏。重试无意义，应触发 repair。
     #[error("corrupt: {0}")]
     Corrupt(CorruptKind),
+    /// 瞬时故障：重试有意义，不计入损坏统计。
+    #[error("transient: {0}")]
+    Transient(TransientKind),
+    /// 致命故障：需要人工介入，重试无意义。
+    #[error("fatal: {0}")]
+    Fatal(FatalKind),
 }

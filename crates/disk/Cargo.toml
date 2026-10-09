@@ -13,5 +13,8 @@ tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
