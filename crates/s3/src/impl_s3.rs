@@ -242,6 +242,10 @@ impl S3 for RstoreFs {
             .delete_object(&req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
+        // 204 **不是这句 `with_status` 给的**：s3s 0.17 的生成 operation 在成功路径上
+        // 不读 `S3Response.status`（详见 `not_modified` 的说明），真正定状态的是
+        // `DeleteObject::serialize_http` 里写死的 `NO_CONTENT`。这里保留它只是无害的
+        // 显式表达，不要据此以为「删掉这行会变成 200」。
         Ok(S3Response::with_status(
             DeleteObjectOutput::default(),
             StatusCode::NO_CONTENT,

@@ -12,8 +12,10 @@ s3s.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
-# `S3Response::with_status` 要 `http::StatusCode`；s3s 不公开 re-export 它
-# （`s3s::http` 是私有模块），所以 S3 实现层需要这个依赖。
+# s3s 不公开 re-export `http`（`s3s::http` 是私有模块），而实现层要自己造响应头：
+# 416 的 `Content-Range`、503 的 `Retry-After`、304 的 `ETag`/`Last-Modified`
+# 都是用 `http::HeaderMap` / `HeaderValue` 经 `S3Error::set_headers` 挂上去的。
+# （**不是因为 `S3Response::with_status`**——那条路径上它是空操作，见 Task 5.10。）
 http.workspace = true
 
 [dev-dependencies]

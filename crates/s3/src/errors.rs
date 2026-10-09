@@ -38,11 +38,12 @@ pub(crate) fn to_s3_error(err: ApiError) -> S3Error {
             err
         }
         ApiError::Internal(msg) => s3s::s3_error!(InternalError, "internal error: {msg}"),
-        // 兜底：未来 `ApiError` 新增变体而这里漏加行时，一律变成 500 而不是静默变成
-        // 别的码；`assert_code` 矩阵会把新变体抓出来。当前九个变体都已显式覆盖，
-        // 这个分支是**故意**留的前向兼容护栏，因此允许「不可达」。
-        #[allow(unreachable_patterns)]
-        other => s3s::s3_error!(InternalError, "unmapped api error: {other}"),
+        // **不写兜底 `_ =>` 分支**：九个变体已全部显式覆盖，多一个兜底只会让
+        // 「将来新增变体却忘了在这里加行」**静默**落进 500，而那时 `-D warnings`
+        // 下的 `unreachable_patterns` 还得靠 `#[allow]` 压掉——等于亲手关掉了
+        // 唯一能抓住这种遗漏的机制。不加兜底时，新增一个 `ApiError` 变体
+        // 会直接**编译不过**，这才是护栏。（`ApiError` 没有 `#[non_exhaustive]`，
+        // 所以穷举匹配是合法的。）
     }
 }
 

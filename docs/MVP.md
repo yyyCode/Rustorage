@@ -6263,7 +6263,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 | `GetObjectOutput.content_range` 为 `Some` 时，序列化器**自动把状态码设成 206** | 5.4 不需要自己设 status，只要算出 `content_range` 字符串 |
 | `GetObjectInput.range` 已经被 s3s 解析成 `Range::Int { first, last: Option<u64> }` / `Range::Suffix { length: u64 }`（`Range::parse` 内部做） | **5.4 不写 `bytes=` 解析器**。s3s 只做到「语法解析」，它不知道对象多大，所以**闭合区间与越界检查仍是我们的活** |
 | `StreamingBlob::from_bytes(Bytes)`；`StreamingBlob` 实现 `Stream<Item = Result<Bytes, StdError>>` | 读请求体用 `futures::TryStreamExt::try_collect::<Vec<Bytes>>()` 再 `.concat()`——**`try_concat()` 用不了**，它要求 `Bytes: Extend<u8>`，而 `Bytes` 不满足。造响应体用 `StreamingBlob::from_bytes` |
-| `http` 与 `http-body-util` **没有被 s3s 公开 re-export**（`s3s::http` 是私有模块） | 两者都要进 `crates/s3/Cargo.toml` 的 **`[dependencies]`**——不只是 dev-dependencies：`S3Response::with_status` 要 `http::StatusCode`，5.6 的测试要 `http_body_util::Full` |
+| `http` 与 `http-body-util` **没有被 s3s 公开 re-export**（`s3s::http` 是私有模块） | 两者都要进 `crates/s3/Cargo.toml`。`http` 是 **`[dependencies]`**（不只是 dev）：5.4/5.8/5.10 要给 `S3Error` 挂响应头（`http::HeaderMap` / `HeaderValue` / `header::ETAG`），416 的 `Content-Range` 与 503 的 `Retry-After` 都走它；`http-body-util` 只在测试里用，留在 `[dev-dependencies]`。**注意 `S3Response::with_status` 不是理由**——它在该路径上是空操作，见 Task 5.10 |
 | `s3s-sigv4` 也**没有**被 s3s 完整 re-export（只公开了 `AmzDate`，`AuthorizationV4` 在 fuzzing cfg 后面） | 测试要自己签名时，把 `s3s-sigv4 = "0.17"` 显式加进 `[dev-dependencies]`。另外 `Payload::empty()` 是 `#[cfg(test)]` 的，用不了——用公开的 `EMPTY_STRING_SHA256_HASH` + `Payload::SingleChunk(..)` |
 | `S3ServiceBuilder` 默认容忍 **900 秒**时钟偏移 | 签名测试必须用**当前 UTC 时间**；credential scope 里的日期是 **`YYYYMMDD`（8 位）**，不是完整 ISO8601——写错会被判 `Authorization` malformed |
 | 测试请求体**不能**是 `Request<Vec<u8>>` | `Vec<u8>` 不实现 `http_body::Body`，而 `S3Service` 要求 `B: Body<Data = Bytes>`。测试里用 `http_body_util::Full<Bytes>` |
@@ -6487,6 +6487,10 @@ Ok(S3Response::new(GetObjectOutput {
 否则 HEAD 会把整份对象读进内存再丢掉。
 
 `delete_object` → `S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT)`。
+**注意 204 不是这句给的**：`DeleteObject::serialize_http` 把状态写死成 `NO_CONTENT`，
+而这个路径上 `S3Response::with_status(..)` 是个**静默空操作**
+（s3s 的生成 operation 不读 `S3Response.status`，详见 Task 5.10 里那段说明）。
+写成 `S3Response::new(..)` 结果一样——**别以为「删掉这句会变成 200」**。
 
 - [ ] **Step 3: 三道门禁 + 提交**
 
@@ -7537,8 +7541,11 @@ mod tests {
 async fn get_with_if_none_match_hit_is_304_and_has_no_body() {
     // PUT /b/k → 记下响应头里的 ETag
     // 再 GET /b/k 带 `If-None-Match: <那个 ETag>` → **304**，且响应体为空
-    // （额外断言响应头里仍有 ETag —— RFC 9110 §15.4.5 要求 304 带验证器，
-    //  少了它客户端的缓存条目会失效）
+    // 且**没有 `Content-Length`**：304 属于 RFC 9110 §6.4.1 的 bodyless 状态，
+    //  带上长度却没有 body 会被一些客户端当成截断。（s3s 的 `serialize_error`
+    //  对 bodyless 状态会移除它，这条把这个行为钉住。）
+    // 额外断言响应头里**仍有 ETag** —— RFC 9110 §15.4.5 要求 304 带验证器，
+    //  少了它客户端的缓存条目会失效。
 }
 
 #[tokio::test]
@@ -7710,28 +7717,58 @@ match conditional::evaluate(conditional::Conditions {
     if_unmodified_since: input.if_unmodified_since.as_ref(),
 }, &info) {
     Verdict::PreconditionFailed => return Err(s3s::s3_error!(PreconditionFailed)),
-    Verdict::NotModified => {
-        // 304 **不带 body**。`content_length` 也留 None：s3s 会把
-        // `content_length` 无条件写进响应头，而带 Content-Length 却没有 body
-        // 容易被客户端当成截断。ETag 与 Last-Modified 必须带
-        // （RFC 9110 §15.4.5：304 要携带能更新缓存条目的验证器）。
-        return Ok(S3Response::with_status(
-            GetObjectOutput {
-                e_tag: Some(ETag::Strong(info.etag.clone())),
-                last_modified: Some(conditional::last_modified(&info)),
-                ..Default::default()
-            },
-            StatusCode::NOT_MODIFIED,
-        ));
-    }
+    Verdict::NotModified => return Err(not_modified(&info)),
     Verdict::Proceed => {}
 }
 // 3. 以下照 5.4 的流程走：resolve_range(&input.range, info.size)，再 get_object。
 
 // ---- head_object ----
-// 同形，只是没有 Range 那一步；304 分支构造 `HeadObjectOutput
-// { e_tag, last_modified, ..Default::default() }` 后同样 `with_status(NOT_MODIFIED)`。
+// 同形，只是没有 Range 那一步；304 分支同样 `return Err(not_modified(&info))`。
 ```
+
+304 走**错误通道**——`not_modified()` 返回一个 `S3Error`：
+
+```rust
+fn not_modified(info: &ObjectInfo) -> S3Error {
+    let mut err = s3s::s3_error!(NotModified); // 这个码的 HTTP 状态就是 304
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ETAG,
+        ETag::Strong(info.etag.clone())
+            .to_http_header()
+            .expect("etag 是合法 header 值"),
+    );
+    let mut buf = Vec::new();
+    conditional::last_modified(info)
+        .format(TimestampFormat::HttpDate, &mut buf)
+        .expect("timestamp 可格式化为 HTTP-date");
+    headers.insert(
+        http::header::LAST_MODIFIED,
+        http::HeaderValue::from_bytes(&buf).expect("HTTP-date 是 ASCII"),
+    );
+    err.set_headers(headers);
+    err
+}
+```
+
+> **`S3Response::with_status(_, NOT_MODIFIED)` 不管用，必须是上面这个形状。**
+> s3s 0.17 的生成 operation 在成功路径上**根本不读** `S3Response.status`：
+> `GetObject::call` 只取 `s3_resp.output` / `.headers` / `.extensions`
+> （`src/ops/generated/get_object.rs:158-170`），状态由 `serialize_http` 写死
+> （默认 200，`content_range.is_some()` 才 206）。全库两百多个生成操作里，
+> 唯一读过 `S3Response.status` 的地方是 `CustomRoute` 那条分支
+> （`src/ops/mod.rs:467`）——也就是说**只有自定义路由能改状态码**，
+> `S3` trait 路径上的 `with_status` 是个**静默空操作**。
+> （Task 5.3 的 `delete_object` 里那句 `S3Response::with_status(_, NO_CONTENT)`
+> 同样是空操作，只是 `DeleteObject::serialize_http` 本来就把状态写死成 204，
+> 结果是对的——但别把它当成「204 是靠那句 with_status 来的」。）
+>
+> 走错误通道实际是对的语义：`S3ErrorCode::NotModified` 的 `status_code()`
+> 就是 `Some(NOT_MODIFIED)`（`src/error/generated.rs:3807`），而 `serialize_error`
+> 对 bodyless 状态（304/204/205/1xx）会**跳过 XML body**、并移除
+> `content-length` / `content-type`（`src/ops/mod.rs:119-144`）——正好是 304 要的形状。
+> 关键是 `e.take_headers()` 在剥离**之前**应用，所以 `set_headers` 挂上的
+> ETag / Last-Modified 会留下（RFC 9110 §15.4.5 要求 304 携带能更新缓存的验证器）。
 
 > **不要试图把条件求值塞进 `ObjectStore::get_object`。** 那要给它加一个
 > 「条件」参数，于是 `rstore-api` 就得知道 `ETagCondition`（s3s 的类型），
@@ -8559,6 +8596,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **无并发锁** | DESIGN §16.1 的按 `(bucket, key)` 分片 `RwLock` **在 M1~M5 全篇没有任何任务实现它**（`crates/store/src/` 下 `grep -rn "RwLock\|Mutex"` 只命中 `testutil.rs` 的一句注释）。PUT/GET 并发目前由文件系统语义兜底：`.staging-*` + rename 提交保证了「看不到半成品」，但**不保证同一 key 上两个并发 PUT 的先后** | — | Phase 2。连同「heal 与写共用同一把锁」那条约束一起推迟——那条约束在 heal 存在之前没有意义 |
 | **无背压** | DESIGN §16.3 的信号量 + 有界降级通道 + `{Primary, Degraded, Unbounded, Rejected}` 准入**同样在计划里没有任何任务**（`背压` / `Semaphore` 在 M1~M5 零命中）。表现是突发大并发下内存与磁盘队列无界增长 | — | Phase 2。**这一条是计划对 DESIGN 的静默遗漏**，不是本节新增的范围决策——之所以写在这里，是为了让最终复审看得见它 |
 | **错误 XML 只有 `Code` + `Message`** | DESIGN §15.4 要求四要素，但 s3s 的 `S3Error` 序列化器（`src/error/mod.rs:170`）**把 `Resource` 那两行注释掉了**，`RequestId` 也只有调用过 `set_request_id` 才出现——而全库无人调用它。要补只能绕开 s3s 自己改写 XML 字符串 | — | 真需要时在组合根加一层中间件做 XML 注入；`RequestId` 更简单的做法是给 `to_s3_error` 传一个请求 id。**同样是对 DESIGN 的静默遗漏** |
+| **`S3Response::with_status` 在 `S3` trait 路径上是空操作** | s3s 0.17 的生成 operation 只取 `s3_resp.output`/`.headers`/`.extensions`，**不读 `.status`**（全库唯一读它的地方是 `CustomRoute` 分支，`src/ops/mod.rs:467`）。所以 handler 想返回非默认状态码只有三条路：靠 `output` 字段隐含（`content_range` → 206、`DeleteObject` 无字段也硬编码 204）、走 `serialize_error` 的错误通道（304 就是这么做的）、或挂 `S3Error` 的码。**日后若要做 `CopyObject` 的 201、或 206 以外的成功码，先回来看这条**——写 `with_status` 会**静默**变成 200 | 5.10 | 无上游修复可等（0.17 的生成器就是这样）。真要任意状态码只能自己 wrap `S3Service`，那是 Phase 2 中间件层的事 |
 | **DESIGN §14.2 的 7 层服务栈只落地了 compat 栈** | `CatchPanic` / `RateLimit` / `ReadinessGate` / `RequestId` / `Trace` 五层**在 M1~M6 里没有任何任务**（`grep CatchPanic\|RateLimit\|RequestId docs/MVP.md` 在实现任务里零命中）。6.1 只做了 `/health`、`/ready` 两个**端点**，不是「未就绪时把 s3s 挡在外面」的那层中间件；handler 里 panic 的表现是连接被断开，而不是 500 | — | Phase 2。**静默遗漏**，写在这里让最终复审看得见。`CatchPanic` 若要补，位置是 `crates/server` 的 tower 栈（`rstore-s3` 看不见 s3s 之外的层，接不进去） |
 | **单节点** | 无多节点、无 heal 的调度者。DESIGN §17 说 heal 由「观测到 `Corrupt`」触发：目前 `Corrupt` 会被分类、记录、参与 quorum 判定，但**没有自动修复流程** | — | Phase 3 |
 
