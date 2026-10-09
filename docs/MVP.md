@@ -2729,29 +2729,75 @@ git commit -m "feat(store): erasure set geometry and quorum rules"
 - [ ] **Step 1: 写失败测试**
 
 ```rust
+use super::*;
+use rstore_disk::faulty::{Fault, FaultKind};
+
+/// 测试辅助：构造一个 6 盘、`m=4 / n=6` 的 `ErasureSet`。
+/// `fault(i)` 返回第 i 块盘要注入的故障，`None` 表示该盘正常。
+/// **由 Task 4.3 提供**（`ErasureSet` 定型后才有实体）；4.3 若已给出等效辅助就直接复用。
+async fn set_with_disks<F>(n: usize, fault: F) -> ErasureSet
+where
+    F: Fn(usize) -> Option<Fault>,
+;
+
 #[tokio::test]
 async fn commits_when_quorum_reached() {
-    let set = set_with_disks(6, 2).await;
+    let set = set_with_disks(6, |_| None).await;
     let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
     assert!(r.is_ok());
 }
 
 #[tokio::test]
 async fn fails_and_reports_when_below_quorum() {
-    // 3 块盘 DropWrites/Offline，只留 3 块可 rename，write_quorum=4
+    // 前 3 块盘 rename 必失败，只剩 3 块能成功；write_quorum = 4。
+    let set = set_with_disks(6, |i| {
+        (i < 3).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Corrupt })
+    })
+    .await;
     let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
     assert!(matches!(r, Err(StoreError::WriteQuorum { achieved: 3, required: 4 })));
 }
 
+/// 回滚必须真的动手：2 块盘 rename 成功后失败，这 2 个目录不能被留下。
+/// （若删除本身也失败，残留由对账处理——所以只断言"尽力而为"的可见结果。）
 #[tokio::test]
 async fn rollback_removes_already_renamed_dirs() {
-    // 达到 2 块盘 rename 成功后失败 → 回滚应尽力删除这 2 个
-    // 断言：data_dir 在成功的盘上不再存在（若删除也失败，则残留由对账处理，测试只断言尽力而为）
+    let set = set_with_disks(6, |i| {
+        // 0/1 正常 → rename 成功；其余全部立即失败
+        (i >= 2).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Transient })
+    })
+    .await;
+    let r = commit(&set, "b/o/tx1", "b/o/0000", 4).await;
+    assert!(matches!(r, Err(StoreError::WriteQuorum { achieved: 2, .. })));
+
+    for i in [0usize, 1] {
+        let d = set.disks()[i].as_ref().expect("这两块盘应当存在");
+        assert!(
+            matches!(d.stat("b/o/0000").await, Ok(None) | Err(DiskError::NotFound)),
+            "盘 {i} 上残留了回滚不掉的目录"
+        );
+    }
 }
 
+/// **硬承诺（DESIGN §12.2）**：只要返回 Ok，成功盘数就不可能低于 write_quorum。
+/// 这是全项目最重要的一条不变量。
+/// 6 块盘、每块"成功 / 失败"两种状态 → 用位掩码穷举全部 64 种组合，不做抽样。
 #[tokio::test]
 async fn never_reports_success_below_quorum() {
-    // 属性式：随机注入故障，只要返回 Ok，就断言成功盘数 >= write_quorum
+    const QUORUM: u8 = 4;
+    for mask in 0u32..64 {
+        let set = set_with_disks(6, |i| {
+            (mask & (1 << i) != 0).then_some(Fault::FailAfter { calls: 0, kind: FaultKind::Corrupt })
+        })
+        .await;
+        if let Ok(outcome) = commit(&set, "b/o/tx1", "b/o/0000", QUORUM).await {
+            assert!(
+                outcome.achieved >= QUORUM,
+                "mask={mask:#07b}: 报了成功，但只达成 {} < {QUORUM}",
+                outcome.achieved
+            );
+        }
+    }
 }
 ```
 
@@ -2763,6 +2809,18 @@ Expected: 编译失败
 - [ ] **Step 3: 实现**
 
 ```rust
+/// 提交结果。达到 quorum 时返回。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// 成功 rename 的盘数（= `renamed.len()`）。
+    pub achieved: u8,
+    /// 成功的盘下标。
+    pub renamed: Vec<usize>,
+    /// 失败的盘下标与原因。**不要丢**——上层要据此把这些盘标记为落后，
+    /// 交给反熵 / heal 补数据。丢掉它们等于永远不知道谁落后了。
+    pub failures: Vec<(usize, DiskError)>,
+}
+
 /// 返回达到的 quorum 数；调用方据此决定成功或失败。
 ///
 /// 硬承诺（DESIGN §12.2）：**绝不在低于 quorum 时报告成功**。
@@ -2773,23 +2831,25 @@ pub async fn commit(
     final_rel: &str,
     write_quorum: u8,
 ) -> Result<CommitOutcome, StoreError> {
-    let mut achieved = 0u8;
     let mut renamed: Vec<usize> = Vec::new();
-    let mut errs: Vec<DiskError> = Vec::new();
+    let mut failures: Vec<(usize, DiskError)> = Vec::new();
 
-    // 并行 rename 到所有可用盘
+    // 并行 rename 到所有可用盘（下面注记说明串行/并行）
     for (i, disk) in set.disks().iter().enumerate() {
         match disk {
-            None => errs.push(DiskError::NotFound("offline".into())),
+            // 盘离线是「暂时够不着」，不是「确定性缺失」——归 Transient，
+            // 免得被 heal 当成损坏统计进去（DESIGN §17）。
+            None => failures.push((i, DiskError::Transient(TransientKind::Io))),
             Some(d) => match d.rename(staging_rel, final_rel).await {
-                Ok(()) => { achieved += 1; renamed.push(i); }
-                Err(e)   => errs.push(e),
+                Ok(()) => renamed.push(i),
+                Err(e) => failures.push((i, e)),
             },
         }
     }
 
+    let achieved = renamed.len() as u8;
     if achieved >= write_quorum {
-        Ok(CommitOutcome { achieved, renamed })
+        Ok(CommitOutcome { achieved, renamed, failures })
     } else {
         // 尽力回滚：只清理我们自己 rename 过去的那些
         for i in &renamed {
@@ -2799,6 +2859,13 @@ pub async fn commit(
     }
 }
 ```
+
+> **`final_rel` 必须是本次写入独有的路径。** 回滚做的是
+> `remove_dir_all(final_rel)`——如果两次写入共用同一个 `final_rel`，
+> 回滚会把上一次已经提交成功的数据一起删掉。所以覆盖写不是「rename 到同一个名字」，
+> 而是「rename 到新的版本目录，成功之后再由 Task 4.8 处理旧版本」。
+> 顺带一提：这也意味着 `rename` 的目标目录通常**不该已存在**，正好和
+> `std::fs::rename` 对非空目标目录会失败的行为对得上。
 
 > **注意并发写法**：上面是串行伪代码，便于阅读与测试。实现时应换成
 > `futures::future::join_all` 并行发起，但**判定逻辑一字不改**——
