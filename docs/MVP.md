@@ -6254,7 +6254,7 @@ M5 要测的是**协议翻译**：状态码、响应头、XML 形状、XML 字�
 做法：写一个内存版 `ObjectStore` 假实现，再用 `tower::ServiceExt::oneshot` 把请求直接
 打给 `S3Service`（它是 hyper + tower 的 service，**不绑端口、不等待**）。
 
-- [ ] **Step 1（5.2 的下属步骤）: 建 `crates/s3/src/mock.rs`**
+- [ ] **预备步骤（属于 Task 5.2，不是它 Step 1 之前的独立任务）: 建 `crates/s3/src/mock.rs`**
 
 `#[cfg(test)]` 门控；`lib.rs` 里 `#[cfg(test)] mod mock;`。
 它是 5.2~5.6 **全部测试**共用的夹具，先建它。
