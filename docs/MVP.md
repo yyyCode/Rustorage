@@ -6777,6 +6777,19 @@ async fn all_six_multipart_ops_are_501_not_implemented() {
 }
 ```
 
+> **`POST /b/k?uploadId=x`（CompleteMultipartUpload）不能发空 body，否则测不到 501。**
+> s3s 在调用 handler **之前**就解析它的 XML body：空体先变成
+> `400 MalformedXML`（`ops/generated/complete_multipart_upload.rs:50` 的
+> `MissingRequestBodyError`），还没轮到 trait 的默认实现。所以这一条要发
+> 一个空的合法体 `<?xml…?><CompleteMultipartUpload></CompleteMultipartUpload>`
+> **并显式带上 `Content-Length` 头**——不带的话撞 `411 MissingContentLength`。
+> 其余五种形状空体即可。
+>
+> 这不是「实现有问题」，而是「`501` 这个断言在那种形状下根本走不到会被断言的代码」——
+> 一条恒红的测试比没有测试更糟，因为它逼着后来的人去「修」一个不存在的问题。
+> 相应地，「六个 multipart 操作一律 501」这句话在本文档里出现的地方都要带上
+> 「请求形状必须合法」这个前提，见「已知限制」表。
+
 六个都断言，**不要只测一个就 `..` 掉**：`S3` trait 方法众多，日后有人覆写了其中一个
 （比如为了别的目的实现了 `UploadPart`），只有单独断言才能发现。
 
@@ -8249,7 +8262,9 @@ MVP 交付时必须全部为真：
 - [ ] 崩溃点测试覆盖 DESIGN §12.3 的全部窗口
 - [ ] `rstore-s3-compat` 中每个中间件都有对应的冒烟测试，且注释指明来源客户端
 - [ ] DESIGN §1.2 的非目标清单中，没有任何一项被意外实现（范围不蔓延）
-- [ ] 六个 multipart 操作各自返回 `501 NotImplemented`（MVP 明确推迟，见 Task 5.6）
+- [ ] 六个 multipart 操作各自返回 `501 NotImplemented`（MVP 明确推迟，见 Task 5.6；
+      注意 `CompleteMultipartUpload` 的测试请求必须带合法的 XML body 与 `Content-Length`，
+      空体会先在 s3s 的解析层拿到 `400`/`411`，走不到我们的 501）
 - [ ] 桶操作可用：建桶幂等、非空桶删返回 409、`ListBuckets` 不把系统目录当桶
       （Task 4.11）
 - [ ] `ListObjectsV2` 不列出删除标记、不列出未提交的 `.staging-*` 目录，
@@ -8265,7 +8280,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 
 | 限制 | 表现 | 所属 Task | 日后要补时 |
 |---|---|---|---|
-| **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
+| **不支持 multipart** | 六个 multipart 操作一律 `501 NotImplemented`（前提是**请求形状本身合法**：`CompleteMultipartUpload` 若不带合法的 XML body，先在 s3s 的解析层拿到 `400 MalformedXML`，还没轮到我们的 501——这是 s3s 的正常前置校验，不是我们的行为）。aws-cli 的 `s3 cp` 对 > 8 MiB 的文件会自动改走 multipart，因此真实用户传大文件会拿到 501 | 5.6 | 先改 4.5/4.7 的存储层（多 part 目录、part 索引、ETag 的 `-n` 格式），再实现六个操作 |
 | **载荷上限约 8 MiB** | 同上一条的推论：交付给客户端的大对象只能靠 < 8 MiB 的单次 PUT | 5.6 / 5.9 | 同 5.6 |
 | **条件请求只覆盖 GET / HEAD** | `PUT` 带 `If-None-Match: *`（条件创建）**不求值**，会被当成普通 PUT。`If-Range` 也不支持 | 5.10 | 需要先给 `ObjectStore` 加原子的 conditional-put——在 S3 层「先查再写」是 TOCTOU，不能这么补 |
 | **含空段 / `.` / `..` / 首尾斜杠的对象 key 被拒（400）** | 与 AWS 的行为**不同**：AWS 把 `a//b`、`a/`、`/a` 都当成与 `a/b`、`a` 不同的独立 key，我们一律 400 `InvalidArgument`。**客户端真能构造出这些 key**，不是理论边角：s3s 在 `ops/mod.rs:696` 对 URI path 做 `urlencoding::decode`，所以 `--key 'a%2F%2Fb'` 解码后到达校验的就是 `a//b`。实际会撞上的场景是**目录占位对象**（`aws s3api put-object --bucket b --key dir/` —— 只为了建一个「文件夹」），以及任何以 `/` 结尾的 key | 5.7 | 在盘上编码 key（改 `fsx`），而不是打开 s3s 的 `normalize_forward_slash_path`——理由见 Task 5.7 |
