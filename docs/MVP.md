@@ -5186,9 +5186,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 4.10: 崩溃点状态机测试
 
 **Files:**
-- Create: `crates/store/src/reconcile.rs`（`scan_orphans` / `reclaim_orphans` 与 `#![cfg(test)]` 的用例）
+- Create: `crates/store/src/reconcile.rs`（产品代码：`scan_orphans` / `reclaim_orphans`；
+  测试是文件内的 `#[cfg(test)] mod tests`。**注意模块本身不是 `#![cfg(test)]`**——
+  与 4.9 不同，这两个函数是产品代码）
 - Modify: `crates/store/src/lib.rs`（加 `pub mod reconcile;`）
-- Modify: `crates/store/src/put.rs` / `get.rs` / `delete.rs`（按 `scan_orphans` 的需要微调，见 Step 3）
+- **不需要**改 `put.rs` / `get.rs` / `delete.rs`：本任务要用的两样东西
+  （`get::resolve_version`、`delete::gc_superseded`）在 4.7/4.8 就已经是 `pub(crate)`，
+  而原计划列出的暂存目录前缀改动也已经在 4.5/4.7 落地（见下文）。
 
 > **不再放 `crates/store/tests/`**，理由同 Task 4.9：集成测试看不到 crate 内的
 > `testutil`。用 `#![cfg(test)]` 模块放在 `src/`。
@@ -5224,8 +5228,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 > `reclaim_orphans` 的文档注释：对账是离线/运维动作，不是随写随跑的 GC。
 > 真要并发，得给暂存目录带上 pid/时间戳并按年龄判断——Phase 3 再说。
 
-这一步要改的地方：`put.rs` 与 `delete.rs` 里 `staging` 的拼法改成
-`format!("{bucket}/{key}/.staging-{txid}")`，`get.rs` 的发现阶段加前缀过滤。
+**这三处已经落地了，本任务不要重复改**（原计划把它们列在 Step 3 里，那是写在
+4.5/4.7 之前的话）：
+
+| 位置 | 现状 |
+| --- | --- |
+| `put.rs` 的 `staging` 拼法 | Task 4.5 起就是 `format!("{key_rel}/.staging-{txid}")` |
+| `delete.rs` 的 `staging` 拼法 | Task 4.8 起同上 |
+| `get.rs` 发现阶段的前缀过滤 | Task 4.7 起就有 |
+
 （4.4 的 `commit` 只是把人给的路径 `rename` 过去，不关心名字，不用改；
 它那几条测试里用的 `"b/o/tx1"` 是纯粹的字面路径，也不用改。）
 
@@ -5750,7 +5761,9 @@ Run: `cargo test -p rstore-s3 validate`
 Expected: PASS
 
 ```bash
-git add crates/s3/src/validate.rs crates/meta/src/keys.rs crates/s3/src/impl_s3.rs
+# 注意是 `crates/common/src/consts.rs`（常量落在 rstore-common），**不是**
+# `crates/meta/src/keys.rs`——那是原计划修掉之前的位置，本任务一行都不用动它。
+git add crates/s3/src/validate.rs crates/common/src/consts.rs crates/s3/src/impl_s3.rs
 git commit -m "feat(s3): bucket and object key validation with reserved prefix rule
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -5796,7 +5809,7 @@ fn maps_api_errors_to_s3_codes() {
 
 | `StoreError` | `ApiError` | 说明 |
 |---|---|---|
-| `NotFound` | `NoSuchKey` | 4.7 会加这个变体 |
+| `NotFound` | `NoSuchKey` | Task 4.7 已加这个变体 |
 | `ReadQuorum { .. }` / `WriteQuorum { .. }` | `Unavailable` | 503 + `Retry-After`；这是**暂时**不可用，不是 500 |
 | `ShardLayout(_)` | `Internal` | 布局坏了是本实现自己的 bug，必须显式暴露 |
 | `Internal(_)` | `Internal` | |
@@ -5894,6 +5907,22 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ---
 
 ## M6 — 运维面与验收
+
+> **本里程碑里 6.1 / 6.2 / 6.3 的 `#[tokio::test]` 函数体目前是空的**（里面只有一行
+> 描述要测什么的注释）。那不是测试，是待办列表——**实现时必须把断言写出来**，
+> 而且要先让它们红起来（TDD）。之所以没在这里替它们把代码写死：这三节的 API 面
+> 由 M5 的 `rstore-server` 骨架决定，此刻写出来的签名很可能是错的。
+> 每一条至少要断言一件**可观察**的事：
+>
+> - 6.1：`/ready` 的状态码与 `Retry-After` 头；`/health` 在 `Booting` 阶段也是 200；
+>   `mark_stage` 回退时**不改变** stage（要断言返回值或重新读一次，不能只调用了事）。
+> - 6.2：开关关闭时计数**不变**（读两次，比对）；`/metrics` 的响应体里必须
+>   **真的出现**那几个指标名（断言字符串包含，不是断言 `is_ok()`）。
+> - 6.3：`format.json` 不一致时**返回 `Err`**，且错误信息里**包含出问题的盘路径**
+>   （断言 `contains`，因为「启动失败」这件事本身不指明是哪块盘就没法运维）；
+>   已有数据的盘 + 空白盘必须拒绝；关闭时在飞请求跑完才退出。
+>
+> 判断标准就一句：**把这行断言删掉，测试是不是照样绿？** 是的话它就等于没写。
 
 ### Task 6.1: Readiness 与健康端点
 
@@ -6025,39 +6054,66 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+ENDPOINT=http://127.0.0.1:9000
+ROOT=/tmp/rs
+WORK=$(mktemp -d)          # 载荷与比对结果放服务端数据目录**之外**
+
 # 启动 6 盘 4+2 实例（4 数据分片 + 2 校验分片 = 6 块盘）
-mkdir -p /tmp/rs/{d1,d2,d3,d4,d5,d6}
-cargo run -p rstore-server -- --volumes /tmp/rs/d{1,2,3,4,5,6} --port 9000 &
+mkdir -p $ROOT/{d1,d2,d3,d4,d5,d6}
+cargo run -p rstore-server -- --volumes $ROOT/d{1,2,3,4,5,6} --port 9000 &
 SERVER_PID=$!
+# 无论从哪一条 `set -e` 退出，都别把服务留在后台占着 9000：
+trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+
 # 不要 `sleep 3`：慢机器上会假失败，快机器上白等。轮询 /ready 直到 200。
+# (`curl … && break` 里 curl 不是 `&&` 列表中的最后一条，所以失败不会触发 errexit。)
 for _ in $(seq 1 60); do
-    curl -fsS -o /dev/null http://127.0.0.1:9000/ready && break
+    curl -fsS -o /dev/null $ENDPOINT/ready && break
     sleep 0.5
 done
-curl -fsS -o /dev/null http://127.0.0.1:9000/ready || {
-    echo "server did not become ready" >&2; kill $SERVER_PID; exit 1
+curl -fsS -o /dev/null $ENDPOINT/ready || {
+    echo "server did not become ready" >&2; exit 1
 }
 
-# 1. 客户端冒烟
+# 1. 客户端冒烟（三个脚本各自的 endpoint / 凭据 / 建桶约定见 tests/compat/）
 bash tests/compat/aws_cli.sh
 bash tests/compat/mc.sh
 bash tests/compat/rclone.sh
 
-# 2. 容错：停掉两块盘 —— **用 `mv` 把盘目录挪走，不要用 `chmod 000`**。
+# 2. 放一份**可逐字节比对**的载荷，作为容错验收的基准。
+#    必须 < 8 MiB：MVP 不支持 multipart，aws-cli 超阈值会自动改走分片上传。
+head -c 3000000 /dev/urandom > $WORK/payload.bin
+#    建桶：已存在时 `mb` 会失败，所以吞掉它的退出码，别让 `set -e` 在这里把脚本带走。
+aws --endpoint-url $ENDPOINT s3 mb s3://accept 2>/dev/null || true
+aws --endpoint-url $ENDPOINT s3 cp $WORK/payload.bin s3://accept/big.bin
+
+# 3. 容错：停掉两块盘 —— **用 `mv` 把盘目录挪走，不要用 `chmod 000`**。
 #    本项目的开发与验收环境是 Windows（Git Bash），`chmod 000` 在那里是空操作：
 #    脚本会一路绿灯，却一块盘都没停掉，于是这条容错验收等于没测。
 #    `mv` 在两个平台都真的让路径消失，`LocalDisk` 会得到 NotFound/IO 错误，
 #    正是「盘掉线」要模拟的东西。
-mv /tmp/rs/d5 /tmp/rs/d5.off
-mv /tmp/rs/d6 /tmp/rs/d6.off
-# → 读仍成功（4+2 掉 2 块，read_quorum = 4）
-# 3. 恢复并校验数据完整
-mv /tmp/rs/d5.off /tmp/rs/d5
-mv /tmp/rs/d6.off /tmp/rs/d6
+mv $ROOT/d5 $ROOT/d5.off
+mv $ROOT/d6 $ROOT/d6.off
 
-kill $SERVER_PID
+#    4+2 掉 2 块，read_quorum = 4，读**必须**成功且**内容逐字节相同**。
+#    原计划这一步只有一行「→ 读仍成功」的注释、没有任何命令——那等于什么都没测：
+#    分片读错、解码错位、返回截断的数据，这条注释全都发现不了。
+aws --endpoint-url $ENDPOINT s3 cp s3://accept/big.bin $WORK/degraded.bin
+cmp $WORK/payload.bin $WORK/degraded.bin
+
+# 4. 恢复，再读一次确认恢复没把数据改坏（同一条比对，但走的是另一条盘路径）。
+mv $ROOT/d5.off $ROOT/d5
+mv $ROOT/d6.off $ROOT/d6
+aws --endpoint-url $ENDPOINT s3 cp s3://accept/big.bin $WORK/healed.bin
+cmp $WORK/payload.bin $WORK/healed.bin
+
 echo "ACCEPTANCE: OK"
 ```
+
+> **两条比对（第 3、4 步）是这份脚本里唯一真正有诊断价值的部分**，别把它们退化成
+> `curl -f` 或者 `aws … >/dev/null`。`cmp` 失败会带出首个不同字节的偏移，
+> 而「读成功但内容不对」恰恰是纠删码实现最典型的坏法（P1：宁可报错，绝不返回错数据）。
+> 载荷用 `/dev/urandom` 而不是全零：全零的字节里，分片错位与补零 bug 都看不出来。
 
 - [ ] **Step 2: 运行，直到全部通过**
 
