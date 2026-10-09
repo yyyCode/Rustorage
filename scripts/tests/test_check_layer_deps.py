@@ -7,6 +7,7 @@
 运行：python3 scripts/tests/test_check_layer_deps.py
 """
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 CHECKER = SCRIPTS_DIR / "check_layer_deps.py"
+REPO_ROOT = str(SCRIPTS_DIR.parent)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import check_layer_deps as chk  # noqa: E402
@@ -55,13 +57,24 @@ CASES = [
         pkg("rstore-api", "rstore-store"),
     ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
 
-    # 路径依赖带着 path 字段，即使名字没有 rstore- 前缀也必须被约束。
-    # 不能写成 pkg(...)：那个辅助函数只造 {"name": ...}，造不出 path 字段，
-    # 而 path 字段正是这条用例要验的东西。
-    ("路径依赖绕过前缀过滤", {"packages": [
+    # 路径依赖带着 path 字段，落在 workspace 内、名字又没前缀的，必须被约束——
+    # 否则放在 crates/ 之外的内部 crate 两头都漏。不能写成 pkg(...)：那个辅助
+    # 函数只造 {"name": ...}，造不出 path 字段。
+    #
+    # 路径由 REPO_ROOT 现算而不是写死，才能同时在本机和 Linux CI 上成立。
+    ("仓内路径依赖绕过前缀过滤", {"workspace_root": REPO_ROOT, "packages": [
         {"name": "rstore-server", "dependencies": [
-            {"name": "evilhelper", "path": "../tools/evilhelper"}]},
+            {"name": "evilhelper",
+             "path": str(Path(REPO_ROOT) / "tools" / "evilhelper")}]},
     ]}, 1, "FORBIDDEN EDGE: rstore-server -> evilhelper"),
+
+    # 反面：本地 fork 的外部 crate 同样带 path 字段，但落在 workspace 之外，
+    # 不是内部 crate。判据若只看"有没有 path"，这条会被误报成架构违规。
+    ("仓外路径依赖（本地 fork）不算违规", {"workspace_root": REPO_ROOT, "packages": [
+        {"name": "rstore-common", "dependencies": [
+            {"name": "serde",
+             "path": str(Path(REPO_ROOT).parent / "forks" / "serde")}]},
+    ]}, 0, None),
 ]
 
 
@@ -224,13 +237,17 @@ def main():
     skip = {"test_fixture_cases"}
     unit_tests = [
         fn for nm, fn in sorted(globals().items())
-        if nm.startswith("test_") and callable(fn) and nm not in skip
+        if nm.startswith("test_") and inspect.isfunction(fn) and nm not in skip
     ]
     for fn in unit_tests:
         try:
             fn()
-        except AssertionError as e:
-            failures.append(f"{fn.__name__}: {e}")
+        except Exception as e:                # noqa: BLE001
+            # 放宽到 Exception，不是只接 AssertionError：一个签名不对的 test_
+            # 函数（比如漏了参数）抛 TypeError 会带着 traceback 直接结束进程，
+            # 汇总行都不打印，之前累积的失败也一并丢掉。这里要的是"记一笔、
+            # 继续跑、最后汇总"。
+            failures.append(f"{fn.__name__}: {type(e).__name__}: {e}")
 
     for f in failures:
         print(f"FAIL {f}")

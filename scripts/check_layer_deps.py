@@ -10,6 +10,7 @@
      必须与 1 分开，否则 CI 日志会把基础设施故障读成「有人加了违规依赖」。
 """
 import json
+import os
 import sys
 
 ALLOWED = {
@@ -79,20 +80,47 @@ def require(cond, what):
         raise MetadataShapeError(what)
 
 
+def is_inside(path, root):
+    """path 是否落在 workspace 根目录内。
+
+    用来判"内部 crate"：判据是 workspace 边界，而不是"这个依赖带不带 path
+    字段"。后者会把本地 fork 的外部 crate（`serde = { path = "../forks/serde" }`）
+    一起卷进来——它同样带 path 字段，但显然不是内部 crate，报违规就是误伤。
+
+    必须用 commonpath 而不是字符串前缀比较：`E:\\rust\\Rustorage-other` 以
+    `E:\\rust\\Rustorage` 开头，但不在里面。commonpath 懂这一点。
+
+    判断不了（字段缺失、相对路径、跨盘符）时返回 True，即按内部依赖处理。
+    失效方向必须是 fail-closed：宁可多查一条边，也不要因为路径解析失败
+    就静默放过一条依赖边。
+    """
+    if not isinstance(path, str) or not isinstance(root, str):
+        return True
+    if not os.path.isabs(path) or not os.path.isabs(root):
+        return True                      # 相对路径无从比较；cargo 实际给绝对路径
+    try:
+        root = os.path.realpath(root)
+        return os.path.commonpath([root, os.path.realpath(path)]) == root
+    except ValueError:
+        return True                      # 跨盘符等，判断不了
+
+
 def check(meta):
     """返回违规消息列表。空列表表示合规。
 
     结构不符时抛 MetadataShapeError，而不是返回违规——「cargo 的输出看不懂」
     和「架构违规」必须分开报，前者是护栏故障（2），后者才是发现违规（1）。
 
-    路径依赖（带 path 字段）一律按下内部依赖约束：这类依赖必然来自本仓库或
-    本地目录，名字不带 rstore- 并不代表它不在图里。只按前缀过滤的话，一个放在
-    crates/ 之外、名字又没前缀的内部 crate 会同时漏掉 UNKNOWN CRATE 和这条边。
+    内部依赖的判据是"名字带 rstore- 前缀，或路径落在 workspace 根内"，不是
+    "名字带前缀"：只按前缀过滤的话，一个放在 crates/ 之外、名字又没前缀的
+    内部 crate 会同时漏掉 UNKNOWN CRATE（它不是 workspace 成员，--no-deps
+    不列它）和这条边。
     """
     require(isinstance(meta, dict), f"顶层不是对象：{type(meta).__name__}")
     packages = meta.get("packages")
     require(isinstance(packages, list), f"packages 不是列表：{type(packages).__name__}")
     require(packages, "packages 为空——workspace 里应当有 crate")
+    workspace_root = meta.get("workspace_root")
 
     violations = []
     for pkg in packages:
@@ -113,8 +141,13 @@ def check(meta):
             dep_name = dep.get("name")
             require(isinstance(dep_name, str), f"{name} 的依赖名不是字符串：{dep_name!r}")
 
-            if dep.get("path") is None and not dep_name.startswith("rstore-"):
-                continue                      # 注册表依赖：不受内部层次约束
+            if not dep_name.startswith("rstore-"):
+                # 不带前缀的依赖分三类：注册表依赖（无 path，比如 serde）、
+                # 仓内路径依赖（内部 crate）、仓外路径依赖（本地 fork 的外部
+                # crate）。只有中间那类受内部层次约束。
+                dep_path = dep.get("path")
+                if dep_path is None or not is_inside(dep_path, workspace_root):
+                    continue
             if dep_name not in ALLOWED[name]:
                 kind = dep.get("kind") or "normal"
                 violations.append(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
