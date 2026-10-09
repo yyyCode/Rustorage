@@ -1338,7 +1338,8 @@ pub struct Codec {
 }
 
 impl Codec {
-    /// 校验几何合法性：`2 <= data+parity <= 16`、`parity >= 1`、`shard_size > 0`。
+    /// 校验几何合法性：`data >= 1`、`2 <= data+parity <= 16`、`parity >= 1`、
+    /// `shard_size > 0` 且为偶数。
     pub fn new(data: usize, parity: usize, shard_size: usize) -> Result<Self, ErasureConstructionError>;
 
     pub fn data_shards(&self) -> usize;
@@ -1358,10 +1359,14 @@ impl Codec {
 // crates/erasure/src/error.rs
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ErasureConstructionError {
-    #[error("invalid geometry: data={data} parity={parity} (need 2<=data+parity<=16, parity>=1)")]
+    #[error(
+        "invalid geometry: data={data} parity={parity} (need data>=1, 2<=data+parity<=16, parity>=1)"
+    )]
     InvalidGeometry { data: usize, parity: usize },
-    #[error("shard_size must be > 0")]
-    ZeroShardSize,
+    /// 分片长度必须为正且为偶数：后端在 GF(2^16) 上运算，按 2 字节符号处理，
+    /// 奇数长度根本无法编码。放在构造期拒绝，避免拖到 `encode` 才报 Backend。
+    #[error("shard_size must be > 0 and even (got {0})")]
+    InvalidShardSize(usize),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1399,10 +1404,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_geometry() {
-        assert!(Codec::new(1, 0, 1024).is_err());
-        assert!(Codec::new(17, 1, 1024).is_err());
-        assert!(Codec::new(4, 0, 1024).is_err());
-        assert!(Codec::new(4, 2, 0).is_err());
+        assert!(Codec::new(1, 0, 1024).is_err()); // parity >= 1
+        assert!(Codec::new(17, 1, 1024).is_err()); // data+parity <= 16
+        assert!(Codec::new(4, 0, 1024).is_err()); // parity >= 1
+        assert!(Codec::new(4, 2, 0).is_err()); // shard_size > 0
+        assert!(Codec::new(0, 2, 1024).is_err()); // data 必须 >= 1
+        assert!(Codec::new(4, 2, 1025).is_err()); // shard_size 必须是偶数（GF(2^16)）
     }
 
     proptest! {
@@ -1426,12 +1433,13 @@ mod tests {
                 originals.iter().cloned().map(Some).collect();
             slots.extend(checks.into_iter().map(Some));
 
-            // 按 drop_mask 丢弃若干槽位
-            let n = data + parity;
+            // 按 drop_mask 丢弃若干槽位。
+            // 用 iter_mut().enumerate() 而不是 `for i in 0..n { slots[i] = .. }`：
+            // 后者会触发 clippy::needless_range_loop，在 `-D warnings` 下直接失败。
             let mut kept = 0;
-            for i in 0..n {
+            for (i, slot) in slots.iter_mut().enumerate() {
                 if drop_mask & (1 << i) != 0 {
-                    slots[i] = None;
+                    *slot = None;
                 } else {
                     kept += 1;
                 }
@@ -1465,7 +1473,11 @@ mod tests {
             for s in slots.iter_mut() {
                 if kept < data - 1 { kept += 1; } else { *s = None; }
             }
-            prop_assert!(matches!(codec.decode(&slots), Err(ErasureError::TooFewShards { .. })));
+            // 先绑定成 bool 再断言：proptest 的单参数 `prop_assert!` 会把条件
+            // 字符串化丢进 format!，`{ .. }` 会被当成 format 占位符而编译失败。
+            let failed_closed =
+                matches!(codec.decode(&slots), Err(ErasureError::TooFewShards { .. }));
+            prop_assert!(failed_closed);
         }
     }
 }
@@ -1487,10 +1499,12 @@ Expected: 编译失败，`Codec` 方法未实现
 外部只见门面类型，不感知 `error` 模块路径。
 
 关键点：
-- **长度语义要钉死**：`encode` 要求 `data_shards.len() == data` 且**每片长度 == `self.shard_size`**；
-  `decode` 要求 `slots.len() == total_shards` 且每个非 `None` 槽位长度 == `self.shard_size`。
-  长度不符一律返回 `UnequalShardLength`（不要交给库去 panic）。不做"长度相等即可"的宽松判定——
-  把 `shard_size` 收严，畸形输入才有唯一的解释。
+- **长度语义要钉死**，两种不符要分开报：
+  - **分片个数**不符 → `WrongShardCount`（`encode`：`data_shards.len() != data`；
+    `decode`：`slots.len() != total_shards`）；
+  - **单个分片长度**不符 → `UnequalShardLength`（任一分片长度 != `self.shard_size`）。
+  不要交给库去 panic。不做"长度相等即可"的宽松判定——把 `shard_size` 收严，
+  畸形输入才有唯一的解释。
 - **槽位如何映射到库**：`slots[0..data]` 是数据分片，`slots[data..total]` 是校验分片。
   `Some` 的槽位按各自下标放进库要求的 `HashMap<usize, Vec<u8>>`；
   两个 map 都为空时库会报错，但那时必然已经被 `TooFewShards` 拦下。
@@ -2020,7 +2034,16 @@ git commit -m "feat(meta): inline data framing with size thresholds"
 
 ### Task 3.1: DiskAPI trait
 
-**Files:** Create `crates/disk/src/lib.rs`
+**Files:**
+- Create: `crates/common/src/disk_id.rs`（`DiskId`——**必须放 common**）
+- Create: `crates/disk/src/lib.rs`
+- Modify: `crates/common/src/lib.rs`（加 `pub mod disk_id;`）
+- Modify: `crates/disk/Cargo.toml`（`tokio`/`async-trait`/`thiserror` 已在 `[dependencies]`；
+  需加 `[dev-dependencies] tempfile.workspace = true`）
+
+> `DiskId` 定义在 **`rstore-common`** 而不是 disk：Task 3.3 的 `meta::format` 也要用它，
+> 而 meta 只允许依赖 common/checksum（护栏方向 `disk → meta`）。
+> `FileStat` 只有 disk 层用，直接定义在 `crates/disk/src/lib.rs`。
 
 - [ ] **Step 1: 定义 trait（这是契约）**
 
@@ -2047,9 +2070,17 @@ pub trait DiskAPI: Send + Sync {
 - [ ] **Step 2: 写契约测试（对任意实现都应通过）**
 
 `crates/disk/src/lib.rs` 中放一个 `pub mod contract_tests`，内含一个
-`pub async fn run_all<D: DiskAPI>(disk: D, tmp: &str)`，覆盖：写后读回、
-读越界返回 `NotFound` 而非 panic、rename 后旧路径 `NotFound`、`list_dir` 排序稳定、
-`sync_file_and_parent` 幂等。
+`pub async fn run_all<D: DiskAPI + ?Sized>(disk: &D)`——盘根由 `disk` 自身携带，
+不另传 `tmp`（Task 3.2 / 3.4 的调用点都是 `run_all(&d).await`）。覆盖：
+写后读回；**读不存在的路径**返回 `NotFound` 而非 panic；rename 后旧路径 `NotFound`；
+`list_dir` 排序稳定；`sync_file_and_parent` 幂等。
+
+> 区分两种「读不到」：**路径不存在 → `NotFound`**（确定性，参与 quorum 时计为「缺失」）；
+> **文件存在但 `offset + len` 越界 → `Transient`**（短读，DESIGN §17 把它归入可重试）。
+> 别合并成一种——Task 3.2 的 `read_past_eof_is_transient_not_corrupt` 钉的就是后者。
+>
+> 契约测试对**任意** `D: DiskAPI` 都要通过，所以不能依赖具体实现的路径布局。
+> `run_all` 内部自己造一条临时相对路径（如 `__contract__/probe`），用完删掉。
 
 - [ ] **Step 3: 提交（此时还没有实现，仅契约）**
 
@@ -2098,7 +2129,7 @@ mod tests {
     async fn missing_path_is_not_found() {
         let tmp = TempDir::new().unwrap();
         let d = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
-        assert!(matches!(d.read_exact_at("nope", 0, 1).await, Err(DiskError::NotFound(_))));
+        assert!(matches!(d.read_exact_at("nope", 0, 1).await, Err(DiskError::NotFound)));
     }
 
     #[tokio::test]
@@ -2135,6 +2166,13 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
+```rust
+impl LocalDisk {
+    /// 打开一块盘。`root` 是盘根目录；`disk_id` 来自 format.json，首次初始化时新生成。
+    pub fn open(root: impl AsRef<Path>, disk_id: DiskId) -> Result<Self, DiskError>;
+}
+```
+
 `fsx.rs` 提供阻塞原语（`write_all_fsync`、`rename_fsync`、`walk`），
 `local.rs` 用 `tokio::task::spawn_blocking` 包装。**关键约束**：
 
@@ -2161,7 +2199,10 @@ git commit -m "feat(disk): LocalDisk with fsync-aware rename and path escape gua
 
 **Files:**
 - Create: `crates/meta/src/format.rs`
+- Modify: `crates/meta/src/lib.rs`（加 `pub mod format;`）
 - Test: 同文件 `#[cfg(test)]`
+
+`DiskId` 从 `rstore_common::disk_id` 取（见 Task 3.1）；meta 只依赖 common/checksum，够用。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2199,6 +2240,63 @@ mod tests {
         a.erasure.sets[0].pop();
         assert!(a.validate().is_err());
     }
+
+    /// quorum 投票：多数派的 identity 胜出，少数派被忽略。
+    /// 比较 identity 而不是内部字段，避免绑死 `sample` 的具体内容。
+    #[test]
+    fn quorum_picks_the_majority_identity() {
+        let id = DiskId::new_v4();
+        let a = FormatV1::sample(id);
+        let mut same = a.clone();
+        same.erasure.this = DiskId::new_v4();     // 只有 this 不同 → 同一 identity
+        let mut other = FormatV1::sample(id);
+        other.erasure.sets[0][1] = DiskId::new_v4(); // 拓扑不同 → 另一种 identity
+
+        let chosen = select_authoritative(&[a.clone(), same, other]).unwrap();
+        assert_eq!(chosen.shared_identity(), a.shared_identity());
+    }
+
+    /// 票数打平（无多数）必须报错，不能随便挑一个。
+    #[test]
+    fn no_quorum_is_an_error() {
+        let id = DiskId::new_v4();
+        let a = FormatV1::sample(id);
+        let mut b = FormatV1::sample(id);
+        b.erasure.sets[0][1] = DiskId::new_v4();
+        assert!(select_authoritative(&[a, b]).is_err());
+    }
+
+    /// 初始化闸门：**只要有一块盘不是 NotFound 就不能当新拓扑**。
+    /// 这条是 DESIGN §7「网络不可达的盘绝不被当作新拓扑的证据」的直接落地。
+    #[test]
+    fn init_only_when_every_disk_is_missing() {
+        assert!(should_initialize(&[DiskError::NotFound, DiskError::NotFound]));
+        assert!(!should_initialize(&[
+            DiskError::NotFound,
+            DiskError::Transient(TransientKind::Timeout),
+        ]));
+        assert!(!should_initialize(&[]));
+    }
+}
+```
+
+> `Transient` / `TransientKind` 是 M3 才引入的 `DiskError` 变体（Task 2.1 里
+> `#[non_exhaustive]` 留的口子）。**在本任务把 `DiskError::Transient(TransientKind)`、
+> `TransientKind::Timeout`、以及 `DiskError::Fatal(FatalKind)` 一并定义到
+> `crates/common/src/error.rs`**——磁盘层从 Task 3.2 起就会返回它们，现在补比以后再改好。
+> `TransientKind` 至少要有 `Io` / `Timeout` / `ShortRead`；`FatalKind` 至少要有
+> `PermissionDenied` / `ReadOnly` / `PathEscape` / `NoSpace`。
+
+```rust
+/// 拓扑协商失败。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FormatError {
+    #[error("unknown format: {0}")]
+    UnknownFormat(String),
+    #[error("inconsistent topology: {0}")]
+    Inconsistent(String),
+    #[error("no quorum among {total} disks (best identity got {best} votes)")]
+    NoQuorum { total: usize, best: usize },
 }
 ```
 

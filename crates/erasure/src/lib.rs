@@ -15,18 +15,19 @@ pub struct Codec {
 }
 
 impl Codec {
-    /// 校验几何合法性：`2 <= data+parity <= 16`、`parity >= 1`、`shard_size > 0`。
+    /// 校验几何合法性：`data >= 1`、`2 <= data+parity <= 16`、`parity >= 1`、
+    /// `shard_size > 0` 且为偶数。
     pub fn new(
         data: usize,
         parity: usize,
         shard_size: usize,
     ) -> Result<Self, ErasureConstructionError> {
         let total = data + parity;
-        if !(2..=16).contains(&total) || parity < 1 {
+        if data < 1 || !(2..=16).contains(&total) || parity < 1 {
             return Err(ErasureConstructionError::InvalidGeometry { data, parity });
         }
-        if shard_size == 0 {
-            return Err(ErasureConstructionError::ZeroShardSize);
+        if shard_size == 0 || !shard_size.is_multiple_of(2) {
+            return Err(ErasureConstructionError::InvalidShardSize(shard_size));
         }
         Ok(Self {
             data,
@@ -136,10 +137,14 @@ mod tests {
 
     #[test]
     fn rejects_invalid_geometry() {
-        assert!(Codec::new(1, 0, 1024).is_err());
-        assert!(Codec::new(17, 1, 1024).is_err());
-        assert!(Codec::new(4, 0, 1024).is_err());
-        assert!(Codec::new(4, 2, 0).is_err());
+        assert!(Codec::new(1, 0, 1024).is_err()); // parity >= 1
+        assert!(Codec::new(17, 1, 1024).is_err()); // data+parity <= 16
+        assert!(Codec::new(4, 0, 1024).is_err()); // parity >= 1
+        assert!(Codec::new(4, 2, 0).is_err()); // shard_size > 0
+                                               // 以下两条是构造期必须拦下的：放过去的话，`Codec::new` 会返回 Ok，
+                                               // 错误要拖到 `encode` 才以 Backend 的形式冒出来。
+        assert!(Codec::new(0, 2, 1024).is_err()); // data 必须 >= 1
+        assert!(Codec::new(4, 2, 1025).is_err()); // shard_size 必须是偶数（GF(2^16)）
     }
 
     proptest! {
