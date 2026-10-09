@@ -2,6 +2,12 @@
 //!
 //! 本模块只定义**契约**（trait + 共享契约测试），具体实现见 Task 3.2 的 `local.rs`。
 
+pub mod error_map;
+pub mod fsx;
+pub mod local;
+
+pub use local::LocalDisk;
+
 use rstore_common::disk_id::DiskId;
 use rstore_common::error::DiskError;
 
