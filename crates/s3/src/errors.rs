@@ -18,6 +18,8 @@ use s3s::S3Error;
 pub(crate) fn to_s3_error(err: ApiError) -> S3Error {
     match err {
         ApiError::NoSuchBucket => s3s::s3_error!(NoSuchBucket),
+        // 对象读写（5.3）：GET / HEAD 一个不存在的 key → 404 NoSuchKey。
+        ApiError::NoSuchKey => s3s::s3_error!(NoSuchKey),
         ApiError::BucketNotEmpty => s3s::s3_error!(BucketNotEmpty),
         ApiError::Internal(msg) => s3s::s3_error!(InternalError, "internal error: {msg}"),
         // 5.3~5.6 按需在此前插入各自用到的变体；5.8 收敛成完整表。
@@ -43,5 +45,10 @@ mod tests {
         assert_code(ApiError::NoSuchBucket, "NoSuchBucket", 404);
         assert_code(ApiError::BucketNotEmpty, "BucketNotEmpty", 409);
         assert_code(ApiError::Internal("boom".into()), "InternalError", 500);
+    }
+
+    #[test]
+    fn object_operation_errors_map_to_their_s3_codes() {
+        assert_code(ApiError::NoSuchKey, "NoSuchKey", 404);
     }
 }

@@ -488,4 +488,142 @@ mod tests {
         );
         assert_eq!(error_code(&body), "NoSuchBucket");
     }
+
+    // ---- Task 5.3: 对象读写 ----
+
+    /// 所有对象读写用例共用的对象体，恰好 15 字节（断言 `Content-Length == 15`）。
+    const OBJ_BODY: &[u8] = b"hello rustorage";
+
+    /// 取一个响应头为 `&str`。
+    fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+        headers
+            .get(name)
+            .unwrap_or_else(|| panic!("缺 {name} 响应头"))
+            .to_str()
+            .unwrap_or_else(|e| panic!("{name} 应是 ASCII: {e}"))
+    }
+
+    /// 断言 `Last-Modified` 存在**且是合法的 HTTP-date**。
+    ///
+    /// 客户端（`rclone` / `mc`）会读这个头做增量同步；`mod_time` 为 0 或格式不对时
+    /// 这条会红。用 `jiff::fmt::rfc2822` 解析——s3s 正是按 RFC 1123（RFC 2822 的
+    /// HTTP-date 子集，结尾 `GMT`）序列化的。
+    fn assert_valid_last_modified(headers: &HeaderMap) {
+        let raw = header(headers, "last-modified");
+        jiff::fmt::rfc2822::parse(raw)
+            .unwrap_or_else(|e| panic!("Last-Modified 不是合法 HTTP-date: {raw:?} ({e})"));
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_bytes() {
+        let store = Arc::new(MockStore::default());
+
+        // PUT /test-bucket/k → 200，且响应头带 ETag
+        let (status, headers, body) = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!header(&headers, "etag").is_empty(), "PUT 应回非空 ETag");
+
+        // GET /test-bucket/k → 200，体与长度都对
+        let (status, headers, body) = call_on(
+            mock_service(store),
+            request("GET", "/test-bucket/k", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), OBJ_BODY, "GET 体应与 PUT 进去的一致");
+        assert_eq!(header(&headers, "content-length"), "15");
+        assert!(!header(&headers, "etag").is_empty(), "GET 应回非空 ETag");
+        // accept-ranges 是客户端发起 Range 请求的前提（Task 5.4），这里先立住。
+        assert_eq!(header(&headers, "accept-ranges"), "bytes");
+        assert_valid_last_modified(&headers);
+    }
+
+    #[tokio::test]
+    async fn head_object_has_length_but_no_body() {
+        let store = Arc::new(MockStore::default());
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+
+        let (status, headers, body) = call_on(
+            mock_service(store),
+            request("HEAD", "/test-bucket/k", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(header(&headers, "content-length"), "15");
+        assert!(
+            body.is_empty(),
+            "HEAD 响应体必须为空（否则就是把整份对象读回来再丢掉）"
+        );
+        assert!(!header(&headers, "etag").is_empty(), "HEAD 应回非空 ETag");
+        assert_eq!(header(&headers, "accept-ranges"), "bytes");
+        assert_valid_last_modified(&headers);
+    }
+
+    #[tokio::test]
+    async fn get_missing_key_is_404_nosuchkey() {
+        let store = Arc::new(MockStore::default());
+
+        let (status, _headers, body) = call_on(
+            mock_service(store),
+            request("GET", "/test-bucket/missing", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "NoSuchKey");
+    }
+
+    #[tokio::test]
+    async fn delete_object_is_204_and_idempotent() {
+        let store = Arc::new(MockStore::default());
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+
+        // 删两次：S3 的 DELETE 幂等，第二次（对象已不在）仍须 204。
+        for round in 0..2 {
+            let (status, _headers, body) = call_on(
+                mock_service(store.clone()),
+                request("DELETE", "/test-bucket/k", b""),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "第 {} 次 DELETE，body: {}",
+                round + 1,
+                String::from_utf8_lossy(&body)
+            );
+            assert!(body.is_empty(), "DELETE 响应体应为空");
+        }
+    }
 }
