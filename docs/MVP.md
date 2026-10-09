@@ -7271,6 +7271,9 @@ MVP 交付时必须全部为真：
 | 单节点下 rename 的持久性依赖文件系统 | `sync_file_and_parent` 必须先 fsync 文件再 fsync 父目录，Task 3.2 有专门测试 |
 | LIST 全盘扫描在大数据集上很慢 | MVP 明确接受，接口留挂钩位；不要在这一阶段引入索引（YAGNI） |
 | 崩溃点测试难以稳定复现 | 用 `FaultyDisk::FailAfter` 精确控制，而非依赖真实 kill；不确定的路径不要写进测试 |
+| **默认凭据三处不一致**（Task 6.3 的 `--access-key`/`--secret-key` 默认值、`tests/compat/*.sh`、`tests/acceptance.sh`） | 三处写的是同一个 `rustorage` / `rustorage-secret`，但**没有任何东西能强制它们一致**——编译器看不见 shell 脚本。不一致的表现是三个脚本齐刷刷 403 `SignatureDoesNotMatch`。改动任一处时三处同改；6.4 的验收脚本是全链路唯一会同时用到它们的地方 |
+| **`--parity` 默认值与验收脚本的期望不一致** | `default_parity(6) = 3`（有测试钉住），而 6.4 要的是 4+2。所以 6.4 的脚本**必须显式**传 `--parity 2`；漏掉的话「掉 2 块」离边界还很远，那条最关键的容错验收会退化成一次普通读 |
+| **Task 5.9 的冒烟脚本依赖 Task 6.3 的启动编排** | 本计划里唯一一处 M5 依赖 M6。5.9 的 Step 2 只有在 6.3 落地后才能跑；这不是可以「先欠着」的排序，别在 5.9 里临时写一次性 main 绕过 |
 
 ---
 
