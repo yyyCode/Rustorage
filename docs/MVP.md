@@ -58,7 +58,7 @@ crates/common/
   src/error.rs                      # DiskError / CorruptKind / TransientKind / FatalKind
   src/id.rs                         # DeploymentId / DiskId / DataDirId（16 字节 UUID 包装）
   src/config.rs                     # 全局配置模型（唯一定义处）
-  src/consts.rs                     # BLOCK_SIZE / HASH_LEN / MAX_SHARDS 等
+  src/consts.rs                     # BLOCK_SIZE / HASH_LEN / MAX_SHARDS / RESERVED_PREFIX 等
 
 crates/checksum/
   src/lib.rs                        # bitrot_hash / bitrot_size / KAT
@@ -110,19 +110,21 @@ crates/s3/
   src/impl_s3.rs                    # impl S3 for RstoreFs —— 只持有 api trait，不依赖 rstore-store
   src/errors.rs                     # ApiError → S3 错误码
   src/validate.rs                   # 对象 key 保留前缀校验（Task 5.7）
+  src/mock.rs                       # 内存版 ObjectStore，仅供测试（#[cfg(test)]，Task 5.2）
   # 没有 auth.rs：凭证走 s3s::auth::SimpleAuth::from_single，见 Task 5.1
 
 crates/s3-compat/
   src/lib.rs                        # compat 中间件栈（按 §DESIGN 15.3 准入）
 
 crates/server/
-  src/lib.rs                        # 可测试的服务装配（供集成测试调用）
+  src/lib.rs                        # 可测试的服务装配（供集成测试调用）；/health /ready /metrics
+                                    #   的**路由挂载**在这里——与 S3 API 共用同一个端口
   src/main.rs                       # 瘦二进制入口，只调 lib（Task 6.3 创建）
   src/wiring.rs                     # 组合根：把 rstore-store 的实现绑定到 rstore-api trait（DESIGN §5 R4）
   src/startup.rs                    # 启动编排
-  src/readiness.rs
-  src/metrics.rs
-  src/config_load.rs
+  src/readiness.rs                  # SystemStage 与 /health /ready 的处理
+  src/metrics.rs                    # Prometheus 文本格式
+  src/config.rs                     # 命令行参数 → Config（**不是** config_load.rs：不读配置文件）
 
 # 集成测试放在各自 crate 的 tests/ 下 —— 根目录是虚拟 workspace（无 [package]），
 # 根 tests/ 不会被 cargo 编译。根 tests/ 只放 shell 脚本。
