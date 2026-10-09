@@ -10,9 +10,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http::StatusCode;
-use rstore_api::{ApiError, ObjectStore};
+use rstore_api::ObjectStore;
 use s3s::dto::*;
-use s3s::{S3Error, S3Request, S3Response, S3Result, S3};
+use s3s::{S3Request, S3Response, S3Result, S3};
+
+use crate::errors::to_s3_error;
 
 /// S3 门面。构造参数是 trait 对象，不是引擎类型——s3 层看不到 `ErasureSet`。
 ///
@@ -197,24 +199,6 @@ fn timestamp_of(mod_time_nanos: u64) -> Timestamp {
     Timestamp::from(system_time)
 }
 
-/// `ApiError` → S3 错误。
-///
-/// TODO(Task 5.2/5.8): 这段目前是 `impl_s3.rs` 里的私有函数；`errors.rs` 建好后
-/// 应整张表挪过去，并由 5.8 的 `assert_code` 矩阵把它钉死。
-fn to_s3_error(err: ApiError) -> S3Error {
-    match err {
-        ApiError::NoSuchKey => s3s::s3_error!(NoSuchKey),
-        ApiError::NoSuchBucket => s3s::s3_error!(NoSuchBucket),
-        ApiError::BucketNotEmpty => s3s::s3_error!(BucketNotEmpty),
-        ApiError::InvalidBucketName => s3s::s3_error!(InvalidBucketName),
-        ApiError::InvalidObjectName => s3s::s3_error!(InvalidArgument, "{}", err),
-        ApiError::InvalidRange => s3s::s3_error!(InvalidRange),
-        ApiError::NotImplemented => s3s::s3_error!(NotImplemented),
-        ApiError::Unavailable => s3s::s3_error!(ServiceUnavailable),
-        ApiError::Internal(msg) => s3s::s3_error!(InternalError, "internal error: {msg}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -230,6 +214,7 @@ mod tests {
     use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
 
     use super::*;
+    use crate::mock::MockStore;
 
     const ACCESS_KEY: &str = "testkey";
     const SECRET_KEY: &str = "testsecret";
@@ -297,9 +282,12 @@ mod tests {
 
     type TestBody = Full<Bytes>;
 
-    /// 打一个请求进去，返回 (状态码, 响应头, 响应体字节)。零端口、零等待。
-    async fn call(req: http::Request<TestBody>) -> (StatusCode, HeaderMap, Bytes) {
-        let resp = service().oneshot(req).await.expect("service call failed");
+    /// 打一个请求进**指定的** service，返回 (状态码, 响应头, 响应体字节)。零端口、零等待。
+    async fn call_on(
+        service: s3s::service::S3Service,
+        req: http::Request<TestBody>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let resp = service.oneshot(req).await.expect("service call failed");
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = resp
@@ -309,6 +297,30 @@ mod tests {
             .expect("collect body failed")
             .to_bytes();
         (status, headers, bytes)
+    }
+
+    /// 打一个请求进 5.1 的认证 service（`NopStore` + `SimpleAuth`）。
+    async fn call(req: http::Request<TestBody>) -> (StatusCode, HeaderMap, Bytes) {
+        call_on(service(), req).await
+    }
+
+    /// 业务测试用的 service：挂 `MockStore`，**不设 auth**。
+    ///
+    /// 无 auth 时 s3s 接受匿名请求并跳过鉴权（见 `S3ServiceBuilder` 文档）——
+    /// 签名的正确性已由 5.1 的 `rejects_bad_signature` / `accepts_valid_sigv4` 覆盖，
+    /// 5.2 只测操作翻译，不必给每个请求再签一遍名。
+    fn mock_service(store: Arc<MockStore>) -> s3s::service::S3Service {
+        S3ServiceBuilder::new(RstoreFs { store }).build()
+    }
+
+    /// 构造一个（通常不签名的）请求。`path` 用 origin-form，如 `/test-bucket`。
+    fn request(method: &str, path: &str, body: &[u8]) -> http::Request<TestBody> {
+        http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", HOST)
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .expect("build request")
     }
 
     /// 解析错误响应体的 `<Code>`，例如 `"SignatureDoesNotMatch"`。
@@ -392,5 +404,88 @@ mod tests {
         );
         let xml = std::str::from_utf8(&body).expect("xml body");
         assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
+    }
+
+    // ---- Task 5.2: 桶操作 ----
+
+    #[tokio::test]
+    async fn create_bucket_then_head_and_list() {
+        let store = Arc::new(MockStore::default());
+
+        // PUT /test-bucket → 200
+        let (status, _headers, body) = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // HEAD /test-bucket → 200 空体
+        let (status, _headers, body) = call_on(
+            mock_service(store.clone()),
+            request("HEAD", "/test-bucket", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(body.is_empty(), "HEAD 响应体应为空");
+
+        // GET / → 200，XML 里 <Buckets> 含 <Name>test-bucket</Name>
+        let (status, _headers, body) = call_on(mock_service(store), request("GET", "/", b"")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = std::str::from_utf8(&body).expect("xml body");
+        assert!(xml.contains("<Name>test-bucket</Name>"), "xml: {xml}");
+    }
+
+    #[tokio::test]
+    async fn delete_non_empty_bucket_is_409() {
+        let store = Arc::new(MockStore::default());
+        store
+            .create_bucket("test-bucket")
+            .await
+            .expect("create bucket");
+        store
+            .put_object("test-bucket", "obj", b"data".to_vec())
+            .await
+            .expect("put object");
+
+        let (status, _headers, body) =
+            call_on(mock_service(store), request("DELETE", "/test-bucket", b"")).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "BucketNotEmpty");
+    }
+
+    #[tokio::test]
+    async fn head_missing_bucket_is_404_nosuchbucket() {
+        let store = Arc::new(MockStore::default());
+
+        let (status, _headers, body) =
+            call_on(mock_service(store), request("HEAD", "/missing-bucket", b"")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "NoSuchBucket");
     }
 }
