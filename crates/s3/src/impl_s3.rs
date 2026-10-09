@@ -1050,4 +1050,53 @@ mod tests {
         // 恰好填满且已到底：必须 false，否则客户端会再多翻一页空页（循环不收敛）。
         assert_eq!(scalar(&page2, "IsTruncated"), "false");
     }
+
+    // ---- Task 5.6: Multipart 一律 501 ----
+
+    #[tokio::test]
+    async fn all_six_multipart_ops_are_501_not_implemented() {
+        // 六种请求形状各自路由到 s3s 的一个 multipart trait 方法；本项目都没覆写
+        // （`impl S3 for RstoreFs` 里一个都没有），于是命中 s3s 的默认实现
+        // → `501 NotImplemented`。MVP 不做 multipart，这是刻意的。
+        //
+        // **六个都单独断言**：trait 方法众多，日后有人覆写其中一个（例如为实现
+        // 别的目的而实现了 `UploadPart`），只有逐条断言才能发现——只测一个再
+        // `..` 掉是不行的。
+        // CompleteMultipartUpload 的输入里有 XML body 字段，s3s 会在**调用 handler
+        // 之前**先解析它：空体会先变成一个 `400 MalformedXML`，根本够不到那个默认的
+        // 501。所以这一形状要给一份合法（Part 列表为空）的 XML，才真正走到默认实现。
+        let empty_complete_xml = b"<CompleteMultipartUpload></CompleteMultipartUpload>";
+        let shapes: [(&str, &str, &[u8]); 6] = [
+            ("POST", "/test-bucket/k?uploads", b""),
+            ("PUT", "/test-bucket/k?partNumber=1&uploadId=x", b""),
+            ("POST", "/test-bucket/k?uploadId=x", empty_complete_xml),
+            ("DELETE", "/test-bucket/k?uploadId=x", b""),
+            ("GET", "/test-bucket/k?uploadId=x", b""),
+            ("GET", "/test-bucket?uploads", b""),
+        ];
+        for (method, path, payload) in shapes {
+            // `request` 夹具不带 Content-Length；CompleteMultipartUpload 的 XML
+            // 解析要求它，缺了会先撞上 `411 MissingContentLength`（s3s 要求带体的
+            // 请求显式声明长度）。补上，其余形状带 0 也无害。
+            let mut req = request(method, path, payload);
+            req.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&payload.len().to_string()).expect("长度是 ASCII"),
+            );
+            let (status, _headers, body) =
+                call_on(mock_service(Arc::new(MockStore::default())), req).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{method} {path} 应回 501，body: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                error_code(&body),
+                "NotImplemented",
+                "{method} {path} 的 error code 应为 NotImplemented，body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
 }
