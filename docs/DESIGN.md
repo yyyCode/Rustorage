@@ -683,7 +683,7 @@ rstore-s3-compat   行为差异：tower 中间件，每条必须可追溯到失�
 | ListObjectsV2 分页 | `continuation-token` / `max-keys` / `delimiter` 与 `CommonPrefixes` 的边界 |
 | 虚拟主机风格寻址 | `bucket.host` 形式的请求要正确解析 bucket |
 | 条件请求 | `If-Match` / `If-None-Match` / `If-Modified-Since` 的 304/412 语义 |
-| 错误 XML 格式 | 必须含 `Code` / `Message` / `Resource` / `RequestId` |
+| 错误 XML 格式 | **目标**是含 `Code` / `Message` / `Resource` / `RequestId`。**实测受限**：s3s 的 `S3Error` 序列化器把 `Resource` 那两行注释掉了，`RequestId` 也只有调用过 `set_request_id` 才出现（全库无人调用），所以 MVP 实际只能发 `Code` + `Message`。见 MVP「已知限制」与 Task 5.8 |
 | 空 body 的 Content-Length | 部分客户端对 `PUT` 空对象处理不一致 |
 | HEAD 的 Content-Length | 必须回真实的 `Content-Length`，但不得回 body |
 | 路径中的双斜杠 | 某些客户端/list 操作会发出 `//` |

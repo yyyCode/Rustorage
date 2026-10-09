@@ -7052,8 +7052,36 @@ fn maps_api_errors_to_s3_codes() {
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
-要求每个 S3 错误响应包含 `Code` / `Message` / `Resource` / `RequestId` 四要素
-（DESIGN §15.4）。`assert_code` 的第三个参数就是这个变体对应的 HTTP 状态码。
+`assert_code` 的第三个参数就是这个变体对应的 HTTP 状态码。
+
+> **不要为「DESIGN §15.4 的四要素」写代码——那个要求在 s3s 上做不到，且原因在它自己源码里。**
+> s3s 的 `S3Error` 序列化器（`src/error/mod.rs:170`）只写三个元素，而且
+> **`Resource` 那两行是被上游注释掉的**：
+>
+> ```rust
+> s.content("Code", self.0.code.as_str())?;
+> if let Some(val) = self.0.message.as_deref() {
+>     s.content("Message", val)?;
+> }
+> // if let Some(val) = self.0.resource.as_deref() {      // ← 注释掉了
+> //     s.content("Resource", val)?;
+> // }
+> if let Some(val) = self.0.request_id.as_deref() {
+>     s.content("RequestId", val)?;
+> }
+> ```
+>
+> 所以实际能发出去的只有 **`Code` + `Message`**（`RequestId` 仅当
+> `set_request_id(..)` 被调用过才出现，而全仓 `grep -rn request_id s3s/src/`
+> 里**没有任何一处调用它**——`S3Service` 不生成请求 id）。要补 `Resource`
+> 只有一条路：绕开 s3s 的序列化器，自己在 `to_http_response` 之后做 XML 字符串
+> 手术。**MVP 不做**——那是为了一个客户端只是转述给客服看的字段去改写上游的输出。
+> 这一条已写进「已知限制」表（连同被整个略去的 DESIGN §14.2 服务栈）。
+>
+> 顺带说清：`Message` 用的是 s3s 码表里的默认消息（如
+> "The specified key does not exist."），不是我们自己的措辞。只有
+> `ApiError::Internal(msg)` 那条经 `s3_error!(InternalError, "internal error: {msg}")`
+> 带上了具体内容——**这是有意的**：内部错误的那句话正是运维唯一能拿到的线索。
 
 **`StoreError → ApiError` 的映射不在这个文件里**，它属于组合根
 （`rstore-server/src/wiring.rs` 的 `EngineAdapter`），因为只有那里同时看得见两边。
@@ -8237,6 +8265,8 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **LIST 是全盘遍历** | 大数据集上很慢；没有索引、没有分页下推（分页只在 S3 层做） | 4.11 / 5.5 | Phase 2 的索引；接口已留挂钩位 |
 | **无并发锁** | DESIGN §16.1 的按 `(bucket, key)` 分片 `RwLock` **在 M1~M5 全篇没有任何任务实现它**（`crates/store/src/` 下 `grep -rn "RwLock\|Mutex"` 只命中 `testutil.rs` 的一句注释）。PUT/GET 并发目前由文件系统语义兜底：`.staging-*` + rename 提交保证了「看不到半成品」，但**不保证同一 key 上两个并发 PUT 的先后** | — | Phase 2。连同「heal 与写共用同一把锁」那条约束一起推迟——那条约束在 heal 存在之前没有意义 |
 | **无背压** | DESIGN §16.3 的信号量 + 有界降级通道 + `{Primary, Degraded, Unbounded, Rejected}` 准入**同样在计划里没有任何任务**（`背压` / `Semaphore` 在 M1~M5 零命中）。表现是突发大并发下内存与磁盘队列无界增长 | — | Phase 2。**这一条是计划对 DESIGN 的静默遗漏**，不是本节新增的范围决策——之所以写在这里，是为了让最终复审看得见它 |
+| **错误 XML 只有 `Code` + `Message`** | DESIGN §15.4 要求四要素，但 s3s 的 `S3Error` 序列化器（`src/error/mod.rs:170`）**把 `Resource` 那两行注释掉了**，`RequestId` 也只有调用过 `set_request_id` 才出现——而全库无人调用它。要补只能绕开 s3s 自己改写 XML 字符串 | — | 真需要时在组合根加一层中间件做 XML 注入；`RequestId` 更简单的做法是给 `to_s3_error` 传一个请求 id。**同样是对 DESIGN 的静默遗漏** |
+| **DESIGN §14.2 的 7 层服务栈只落地了 compat 栈** | `CatchPanic` / `RateLimit` / `ReadinessGate` / `RequestId` / `Trace` 五层**在 M1~M6 里没有任何任务**（`grep CatchPanic\|RateLimit\|RequestId docs/MVP.md` 在实现任务里零命中）。6.1 只做了 `/health`、`/ready` 两个**端点**，不是「未就绪时把 s3s 挡在外面」的那层中间件；handler 里 panic 的表现是连接被断开，而不是 500 | — | Phase 2。**静默遗漏**，写在这里让最终复审看得见。`CatchPanic` 若要补，位置是 `crates/server` 的 tower 栈（`rstore-s3` 看不见 s3s 之外的层，接不进去） |
 | **单节点** | 无多节点、无 heal 的调度者。DESIGN §17 说 heal 由「观测到 `Corrupt`」触发：目前 `Corrupt` 会被分类、记录、参与 quorum 判定，但**没有自动修复流程** | — | Phase 3 |
 
 > **加新限制时，必须同时确认代码里有对应的拒绝路径。** 比如「不支持 multipart」
