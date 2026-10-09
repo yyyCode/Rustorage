@@ -243,6 +243,7 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 
 **Files:**
 - Create: `scripts/check-layer-deps.sh`
+- Create: `.gitattributes`
 - Modify: `Cargo.toml`（`[workspace.package]` 加 `publish = false`；新增 `[workspace.lints]`）
 - Modify: 10 × `crates/*/Cargo.toml`（各加 `[lints] workspace = true`）
 - Modify: `rust-toolchain.toml`（固定版本）
@@ -394,7 +395,25 @@ channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 ```
 
-- [ ] **Step 5: 验证加固后仍然全绿**
+- [ ] **Step 5: 锁定 shell 脚本行尾**
+
+本仓库 `core.autocrlf=true`。`scripts/check-layer-deps.sh` 若在 checkout 时被转成 CRLF，
+`set -euo pipefail` 会带上一串 `\r`，bash 在每个词后面都报 `command not found`，
+`#!/usr/bin/env bash` 这个 shebang 也会失效——守卫脚本在 Windows 上直接废掉。
+
+新建 `.gitattributes`：
+
+```
+* text=auto eol=lf
+```
+
+`eol=lf` 让工作区、索引、CI 三处的行尾一致；`text=auto` 已含二进制自动识别，
+无需再为 png/jpg 之类单列规则。加完确认脚本仍是 LF：
+
+Run: `file scripts/check-layer-deps.sh`
+Expected: 输出中不含 `CRLF`
+
+- [ ] **Step 6: 验证加固后仍然全绿**
 
 Run: `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: 均通过，无 warning
@@ -402,10 +421,10 @@ Expected: 均通过，无 warning
 Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
-git add scripts/check-layer-deps.sh Cargo.toml rust-toolchain.toml crates/
+git add scripts/check-layer-deps.sh .gitattributes Cargo.toml rust-toolchain.toml crates/
 git commit -m "chore: allowlist-based layer guard and workspace lint hardening"
 ```
 
