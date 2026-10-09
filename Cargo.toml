@@ -6,6 +6,7 @@ members = ["crates/*"]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
+publish = false
 
 [workspace.dependencies]
 # 内部
@@ -38,3 +39,10 @@ tempfile = "3"
 futures = "0.3"
 async-trait = "0.1"
 lru = "0.12"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+await_holding_lock = "deny"

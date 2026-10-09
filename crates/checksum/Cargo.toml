@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 rstore-common.workspace = true
 blake3.workspace = true
+
+[lints]
+workspace = true

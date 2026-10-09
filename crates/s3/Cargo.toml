@@ -9,3 +9,6 @@ rstore-api.workspace = true
 rstore-common.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

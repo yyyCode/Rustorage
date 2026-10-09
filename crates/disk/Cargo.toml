@@ -11,3 +11,6 @@ rstore-checksum.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true
