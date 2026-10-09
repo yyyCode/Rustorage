@@ -28,6 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bytes = "1"
 blake3 = "1"
+md-5 = "0.10"
 crc32c = "0.6"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

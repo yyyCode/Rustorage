@@ -9,6 +9,7 @@ pub mod keys;
 
 pub use container::{decode, encode};
 pub use fileinfo::{
-    decode_header, encode_header, ChecksumAlgo, FileVersionHeader, Flags, InlineData, ObjectBody,
-    ObjectMeta, OpaqueBody, PartInfo, ShallowVersion, StorageClass, VersionType,
+    decode_body, decode_header, encode_body, encode_header, ChecksumAlgo, FileVersionHeader, Flags,
+    InlineData, ObjectBody, ObjectMeta, OpaqueBody, PartInfo, ShallowVersion, StorageClass,
+    VersionType,
 };

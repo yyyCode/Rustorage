@@ -167,6 +167,26 @@ pub fn decode_header(bytes: &[u8]) -> Result<FileVersionHeader, DiskError> {
     rmp_serde::from_slice(bytes).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
 }
 
+/// 把 `ObjectBody` 编成 `ShallowVersion::body` 的线格式。
+///
+/// `body` 对外是 `OpaqueBody`（不透明），但总得有人知道它里面是什么——这个
+/// 拥有格式的 crate 就是那个人。PUT（Task 4.5）靠它构造 body，GET（Task 4.7）
+/// 靠 [`decode_body`] 读回 `ec_dist` / `parts`。**这是唯一的公开入口**：
+/// 让 store 直接依赖 `rmp-serde` 会把「body 是 msgpack」这个线格式事实泄漏出去，
+/// 并再抄一份错误映射。
+pub fn encode_body(body: &ObjectBody) -> Result<OpaqueBody, DiskError> {
+    rmp_serde::to_vec(body).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
+}
+
+/// 解析 `ShallowVersion::body`。**读 `ec_dist` / `parts` 的唯一入口。**
+///
+/// 错误映射与 [`encode_header`] / [`decode_header`] 逐字一致：一律
+/// `Corrupt(MalformedHeader)`，不新造 kind。DESIGN §17 规定 heal 由「观察到
+/// `Corrupt`」触发，多一个 kind 就多一条没人处理的路径。
+pub fn decode_body(bytes: &[u8]) -> Result<ObjectBody, DiskError> {
+    rmp_serde::from_slice(bytes).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
+}
+
 /// 内联数据帧：version-key -> 原始字节（DESIGN §8.4）。
 ///
 /// **必须是 newtype 而不是 `type` 别名**——Task 2.3 要在它上面挂 `encode`/`decode`，
@@ -363,6 +383,41 @@ mod tests {
         let mut rest = Vec::new();
         cursor.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, vec![0xAB]);
+    }
+
+    /// body 的线格式入口必须能原样往返：GET（4.7）靠 `decode_body` 读回
+    /// `ec_dist` / `parts`，这里漏掉任何一个字段都会在真实读路径上暴露成空分布。
+    #[test]
+    fn body_roundtrips_back_to_itself() {
+        let body = ObjectBody {
+            id: Some(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            parts: vec![PartInfo {
+                number: 1,
+                size: 375_000,
+                actual_size: 1_500_000,
+                etag: "5d41402abc4b2a76b9719d911017c592".into(),
+                index: None,
+            }],
+            ec_dist: vec![3, 4, 5, 6, 1, 2],
+            checksum_algo: ChecksumAlgo::Crc32c,
+            storage_class: StorageClass::Standard,
+            meta_user: [("k".to_string(), "v".to_string())].into_iter().collect(),
+            meta_sys: [("x-rs-actual-size".to_string(), vec![1u8, 2, 3])]
+                .into_iter()
+                .collect(),
+        };
+        let enc = encode_body(&body).unwrap();
+        assert_eq!(decode_body(&enc).unwrap(), body);
+    }
+
+    #[test]
+    fn body_garbage_decodes_to_malformed_header() {
+        // `0x91` = fixarray(1)：字段数远少于 `ObjectBody`，解不成。
+        let err = decode_body(&[0x91, 0x01]).unwrap_err();
+        assert!(
+            matches!(&err, DiskError::Corrupt(CorruptKind::MalformedHeader)),
+            "got {err:?}"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod commit;
 pub mod error;
 pub mod pool;
+pub mod put;
 pub mod reader;
 pub mod set;
 #[cfg(test)]
