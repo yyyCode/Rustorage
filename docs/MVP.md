@@ -6634,8 +6634,11 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 - [ ] **Step 1: 写测试**
 
 ```rust
-// 夹具：b 下有 "a.txt", "dir/x", "dir/y", "dir/sub/z", "z.txt"
-#[tokio::test] async fn lists_all_sorted() { /* 5 条，按 key 升序 */ }
+// 夹具：b 下有 "a.txt", "dir/sub/z", "dir/x", "dir/y", "z.txt"
+// **这个顺序就是字节序本身**："dir/sub/z" 排在 "dir/x" 之前，因为 's' < 'x'。
+// 原先把夹具写成 dir/x, dir/y, dir/sub/z 是口语顺序，与「按 key 升序」自相矛盾——
+// 照那个顺序写断言，测出来的就是错的行为。Task 4.11 的既有测试也证实是纯字典序。
+#[tokio::test] async fn lists_all_sorted() { /* 5 条，按 key 升序（= 上面这个顺序） */ }
 #[tokio::test] async fn prefix_filters() { /* prefix="dir/" → 3 条 */ }
 #[tokio::test] async fn delimiter_rolls_up_common_prefixes() {
     // delimiter="/" → contents 是 ["a.txt", "z.txt"]，
@@ -6651,8 +6654,13 @@ fn resolve_range(r: Range, size: u64) -> Result<ByteRange, ApiError> {
 }
 #[tokio::test] async fn max_keys_zero_returns_empty_and_truncated() {
     // max-keys=0 → contents 空、key_count == 0、**is_truncated == true**
-    // （桶里还有对象）。这条盯的是「计数检查放在 push 之后」的写法：
-    // 那样 0 永远等不到相等，会把全部 5 条都返回出去。
+    // （桶里还有对象），且 **next_continuation_token 为空**。
+    // 这条盯的是「计数检查放在 push 之后」的写法：那样 0 永远等不到相等，
+    // 会把全部 5 条都返回出去。
+    //
+    // 已知边角（**刻意保留，见下面的注记**）：这时 IsTruncated 是 true 却没有
+    // NextContinuationToken——一个只会「看 IsTruncated 就再翻一页」的客户端会
+    // 原地循环。真实客户端不会发 max-keys=0，所以不为此改语义，只记在这里。
 }
 #[tokio::test] async fn max_keys_truncates_and_sets_is_truncated() {
     // max-keys=2 → key_count == 2，is_truncated == true，
