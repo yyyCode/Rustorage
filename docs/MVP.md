@@ -1899,8 +1899,8 @@ DESIGN §8.1 有意如此：CRC 只保护结构部分，且让「只读前缀即
 4. `minor > 0` → `Corrupt(UnsupportedVersion)`（DESIGN §8.1：minor 过新也是确定性损坏）；
 5. 读 `version_count`（偏移 10..12）。**在分配之前**用「剩余字节数 / 最小记录尺寸」
    做上界检查 → `Corrupt(LengthMismatch)`；
-6. 逐条解析记录：把 `rmp_serde::Deserializer` 套在 `&mut Cursor` 上读一个
-   `FileVersionHeader`（msgpack 自描述，读完 `cursor.position()` 就是边界，
+6. 逐条解析记录：用 `rmp_serde::from_read::<_, FileVersionHeader>(&mut cursor)`
+   从 `&mut Cursor` 读一个 header（msgpack 自描述，读完 `cursor.position()` 就是边界，
    **不需要长度前缀**）；随后读 `body_len u32 BE`，**分配之前**检查
    `body_len <= 剩余字节` → `Corrupt(LengthMismatch)`；再读 `body_len` 字节作为
    不透明 `Vec<u8>`。msgpack 解析失败 → `Corrupt(MalformedHeader)`；
@@ -1914,6 +1914,15 @@ DESIGN §8.1 有意如此：CRC 只保护结构部分，且让「只读前缀即
 > 这里直接调 `rmp_serde::to_vec`（Task 2.3 才会给 `InlineData` 加上
 > `encode`/`decode` 方法）。等 2.3 落地后，把这一处和对应的解码处替换成
 > `meta.inline.encode()` / `InlineData::decode(tail)`——别留着两份做着同一件事的代码。
+
+> **依赖 Task 2.1 的两个前提，二者都已被测试钉住：**
+>
+> 1. `FileVersionHeader` 通过 `#[serde(from = "HeaderWire", into = "HeaderWire")]`
+>    桥接到 msgpack。**不要**试图给它直接 `derive(Serialize, Deserialize)`——
+>    那会绕过 `None ↔ 0` 映射和 16 字节 UUID 编码，破坏线格式。
+> 2. `rmp_serde` 在 `Read` 上**不预读**（`msgpack_does_not_overread_on_a_cursor`
+>    钉住的正是这一点）。整个记录边界方案建立在这条之上：若它预读，读完 header 后
+>    `cursor.position()` 会跑过头，随后的 `body_len` 就读到垃圾。**改动这里前先确认那条测试还在。**
 
 > **第 5–6 步在 CRC 之前，这不是疏忽。** CRC 的物理位置由记录长度决定，不解析就找不到它——
 > 把「先校验 CRC 再解析任何内容」写进计划是自相矛盾的，别照做。这么做的安全性由
@@ -1931,7 +1940,9 @@ Expected: 全部 PASS
 
 ```bash
 git add crates/meta/
-git commit -m "feat(meta): meta.xl container codec with corruption defenses"
+git commit -m "feat(meta): meta.xl container codec with corruption defenses
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
@@ -2025,7 +2036,9 @@ Expected: PASS
 
 ```bash
 git add crates/meta/ crates/common/
-git commit -m "feat(meta): inline data framing with size thresholds"
+git commit -m "feat(meta): inline data framing with size thresholds
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
