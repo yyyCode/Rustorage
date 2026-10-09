@@ -8222,14 +8222,16 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify `crates/server/src/lib.rs`（加 `pub mod config; pub mod startup; pub mod wiring;`；
   **注意 `main.rs` 不是 lib 的一部分**，它是独立的 crate root，要用
   `use rstore_server::...` 而不是 `use crate::...`）
-- Modify `crates/server/Cargo.toml`（加 **`async-trait`**、**`serde_json`**、`clap`、`tokio-util`）
+- Modify `crates/server/Cargo.toml`（加 **`async-trait`**、**`serde_json`**、`clap`、`tokio-util`、
+  **`hyper`**（features `["server", "http1"]`）、**`hyper-util`**（features `["tokio"]`）；
+  另加 `[dev-dependencies] tempfile`）
 - Modify `crates/store/src/get.rs`（加 `HeadOut` 与 `ErasureSet::head_object`；`GetOut` 加 `mod_time`）
-- Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`）
+- Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`、`hyper`、`hyper-util`）
 
 > 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
 > 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
 >
-> **依赖要加四个，且都不在 `crates/server/Cargo.toml` 里**：
+> **依赖要加六个，且都不在 `crates/server/Cargo.toml` 里**：
 >
 > - **`async-trait`**（`async-trait.workspace = true`）——`wiring.rs` 要写
 >   `#[async_trait] impl ObjectStore for Wiring`。它已经在根 `Cargo.toml` 的
@@ -8245,6 +8247,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 >   验收脚本以「unrecognized option」失败。
 > - **`tokio-util`**（`rt` feature，工作区里也**完全没有**，根 `Cargo.toml` 也要加）
 >   提供「启动顺序」一节里要求的 `CancellationToken`。
+> - **`hyper`**（features `["server", "http1"]`）与 **`hyper-util`**（features `["tokio"]`）
+>   ——**`s3s` 不自带 HTTP 服务器、也不 re-export `hyper`**，没有这两条边根本起不了服务。
+>   详细配方见下面「`bind` 怎么把 s3s 跑起来」一节；这两条**只对 `hyper-util` 会新增
+>   `Cargo.lock` 条目**（`hyper 1.12.0` 早已在锁里，因为它是 `s3s` 的非可选依赖）。
 
 #### 启动契约（原计划完全没有这一段）
 
@@ -8506,6 +8512,7 @@ async fn shutdown_stops_accepting_then_drains() {
     // (a) 关闭发起后**新连接被拒**——不是回 503，而是根本连不上：
     //     断言 `TcpStream::connect(addr).await` 返回 `Err`（监听套接字已释放）。
     //     回 503 与「不再 accept」是两回事，只有这一条能区分。
+    //     **必须在 `shutdown().await` 返回之后才断言**（理由见下面 `bind` 那节的 (a)）。
     //
     // (b) 关闭发起**之前**已经接住的在飞工作**跑完了才返回**：
     //     用 `Running::track_task` 登记一个 `tokio::spawn` 的任务，它先
@@ -8522,12 +8529,26 @@ async fn shutdown_stops_accepting_then_drains() {
 }
 ```
 
-> **测试怎么造出 `Config`。** 前两条测试要调 `open_disks(&Config)`，得先有一个
-> `Config`。`Config` 由 clap `derive` 出来，字段默认**模块私有**——写在 `startup`
-> 模块里的测试**看不见** `config::Config` 的私有字段，结构体字面量直接编译不过。
-> 把 `Config` 的字段标成 `pub(crate)`，测试里就写结构体字面量；这是最省事的一种，
-> 别为了造一个配置去拼 argv 数组，也别给 `Config` 加「只给测试用」的构造函数
-> ——那会变成第二个必须与 clap 定义同步的地方。
+> **测试怎么造出 `Config`。** 三条测试都要调 `open_disks(&Config)`（第三条是间接的：
+> `bind` 内部会调它），得先有一个 `Config`。`Config` 由 clap `derive` 出来，字段默认
+> **模块私有**——写在 `startup` 模块里的测试**看不见** `config::Config` 的私有字段，
+> 结构体字面量直接编译不过。把 `Config` 的字段标成 `pub(crate)`，测试里就写结构体
+> 字面量；这是最省事的一种，别为了造一个配置去拼 argv 数组，也别给 `Config` 加
+> 「只给测试用」的构造函数——那会变成第二个必须与 clap 定义同步的地方。
+>
+> **`crates/server` 的 `[dev-dependencies]` 要加 `tempfile`**（它已在根
+> `[workspace.dependencies]` 里，但这个 crate 连 `[dev-dependencies]` 段都还没有）。
+>
+> 三条测试各自的 `Config`：
+>
+> - 前两条只需要 `volumes: vec![两/三个 tempdir]`，`port` 随便填（不绑定）。
+> - `shutdown_stops_accepting_then_drains` 要**两块** `tempfile::tempdir()`
+>   （`validate()` 要求每个 set 长度 `2..=16`，见上面 `format.json` 那节）、
+>   `parity: 1`，并且 **`port: 0`**——让内核分配端口。这正是 `Running::local_addr()`
+>   存在的理由：`0` 这个值本身不是可用地址，测试必须从返回值里取真实端口才能连。
+>   两块**空**目录 → 全部 `NotFound` → 走初始化路径，顺带把「初始化」也测了。
+>   `tempdir` 必须在 `Running` 之后（或与之同作用域）存活：`Running::shutdown(self)`
+>   一跑完盘目录就没人用了，但**别在 `bind` 之前 drop**。
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
@@ -8557,6 +8578,17 @@ pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome>;
 pub async fn serve(cfg: &Config) -> anyhow::Result<()>;  // main.rs 调它
 ```
 
+> **`serve` 里等关闭信号只写 `tokio::signal::ctrl_c()`。** 不要顺手加上
+> `tokio::signal::unix::signal(SignalKind::terminate())`——那个模块是 `#[cfg(unix)]` 的，
+> **在 Windows 上直接编译不过**，而我们的开发机就是 Windows（`cargo clippy` 门禁会在
+> 这里红）。6.4 的验收脚本用 `kill` 结束进程：Git Bash 的 `kill` 发的是 Windows 层的
+> 终止信号，进程被直接结束也无所谓——**脚本不依赖优雅退出**，别为了它去搞跨平台信号。
+>
+> `main.rs` 就是 `#[tokio::main] async fn main()` + 初始化 `tracing_subscriber` +
+> `rstore_server::startup::serve(&cfg).await`，错误用 `anyhow` 打出来并返回非零退出码
+> （`fn main() -> anyhow::Result<()>` 或显式 `std::process::exit(1)`）。
+> `Config` 的解析（clap `Parser::parse`）也在 `main.rs`。
+
 > **`bind` 里三条路径的匹配必须发生在进 s3s 之前**，且只认**精确路径**
 > （`/health`、`/ready`、`/metrics`）。用「前缀匹配」的话，一个名叫 `metrics` 的桶
 > 的请求 `GET /metrics/` 会被吞掉；而 `GET /health` 与 S3 的任何合法操作都不冲突。
@@ -8564,6 +8596,130 @@ pub async fn serve(cfg: &Config) -> anyhow::Result<()>;  // main.rs 调它
 >
 > `shutdown` 的上限：等在飞请求 `join` 时给个几秒超时，超时就放弃并记录。
 > 不设上限的话，一个卡住的请求会让进程永远退不出去，`kill` 也只能靠 SIGKILL。
+
+#### `bind` 怎么把 s3s 跑起来：hyper + `hyper_util::rt::TokioIo`（原计划完全没有这一段）
+
+原计划只写了「起 HTTP 服务」，没写拿什么起。这里是那个坑：**`s3s` 只实现协议，不自带
+服务器**，而且**不 re-export `hyper`**（它的 `pub mod` 列表里没有 `hyper`）。所以
+`crates/server` 必须自己加 `hyper` + `hyper-util` 两条边（见上面的依赖清单）。
+
+**`bind` 到底该做多少事**：签名 `bind(cfg, ready, m)` 里**没有 store 参数**，所以
+「从 `cfg` 到可以接受连接」的整条链都在它里面——
+`open_disks(cfg)` → `ErasureSet::new` → `Arc<dyn ObjectStore>`（`Wiring`）→
+`rstore_s3::build_service(..)` → `TcpListener::bind` → spawn accept 循环。
+两处 `mark_stage` 也在这里落，好让「`bind` 返回 ⇒ `/ready` 已是 200」这条不变量成立：
+
+- `ErasureSet` 构造完 → `mark_stage(StorageReady)`
+- `TcpListener` 绑好（accept 循环已 spawn）→ `mark_stage(FullReady)`
+
+于是 `serve(cfg)` 只剩「`bind` → 等关闭信号 → `shutdown()`」三件事，
+「启动顺序」一节里那个 StorageReady → 起 HTTP → FullReady 的顺序就是上面这两行。
+
+**`S3Service` 可以直接喂给连接**，这比看起来简单：s3s 为它实现了 **hyper 自己的**
+`Service` trait——`impl hyper::service::Service<http::Request<hyper::body::Incoming>> for S3Service`
+（`service.rs:702`），`Response = http::Response<s3s::Body>`、`Error = s3s::HttpError`。
+三个类型约束刚好都对得上：`HttpError` 实现了 `Error` 且是 `Send + Sync + 'static`
+（`protocol.rs:34,60`，`s3s::HttpError` 在 lib.rs:196 是 `pub use`，**可以命名**）；
+`s3s::Body` 实现了 `http_body::Body`（`http/body.rs:182`）、其 `Error = StdError`
+（就是 `Box<dyn Error + Send + Sync>`），正好满足 `serve_connection` 要的
+`S::Error: Into<Box<dyn StdError + Send + Sync>>` 与
+`<S::ResBody as Body>::Error: Into<Box<dyn StdError + Send + Sync>>`
+（`hyper-1.12.0/src/server/conn/http1.rs:470-476`）。
+
+> **`hyper::service::Service` 与 `tower::Service` 是两个不同的 trait**（前者是 hyper
+> 自己的，`&self` 签名；后者是 `tower-service` 的）。s3s 两个都实现了，hyper 1.x 的
+> 服务器只用前者——**所以 `crates/server` 不需要 `tower` 依赖**，也不会出现
+> 「两个 `call` 方法二义」的问题。
+>
+> **也不能不用 `multi_thread` 运行时**：`#[tokio::main]` 默认就是 multithread；
+> 别改成 `current_thread`，accept 循环里每个连接都 `spawn` 出去了，
+> 单线程运行时会让 `shutdown_stops_accepting_then_drains` 里那个 `sleep(200ms)`
+> 的任务与 accept 循环互相排队（能不能过取决于调度，属于偶发失败）。
+
+**三条路径用 `hyper::service::service_fn` 截，不用自己实现 `Service`**：
+
+```rust
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::{Service as _, service_fn};
+use hyper_util::rt::TokioIo;
+use s3s::Body;
+
+let listener = tokio::net::TcpListener::bind(addr).await?;
+let local = listener.local_addr()?;
+let s3 = /* rstore_s3::build_service(..) 的返回值，类型是 S3Service */;
+
+// accept 循环（它自己是一个被 track_task 登记的 spawn 任务）：
+let loop_handle = tokio::spawn(async move {
+    loop {
+        let (stream, _peer) = tokio::select! {
+            _ = token.cancelled() => break,      // 取消后 drop(listener) → 端口释放
+            accept = listener.accept() => accept?,
+        };
+        let s3 = s3.clone();          // S3Service: Clone（内部是 Arc，很便宜）
+        let ready = ready.clone();    // Arc<Readiness>
+        let metrics = metrics.clone();// Arc<Metrics>
+        tokio::spawn(async move {
+            let conn = http1::Builder::new().serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |req: http::Request<Incoming>| {
+                    let s3 = s3.clone();
+                    let ready = ready.clone();
+                    let metrics = metrics.clone();
+                    async move {
+                        // **精确路径匹配**，不是前缀——`GET /metrics/` 必须落到 s3s 去
+                        // （一个名叫 metrics 的桶），见上一段的注释。
+                        match req.uri().path() {
+                            // 三条路径的响应是 `http::Response<Bytes>`，而 service_fn 的
+                            // ResBody 必须是 `s3s::Body`；`.map(Body::from)` 就是那个转换
+                            // （`impl From<Bytes> for Body`，`http/body.rs:152`）。
+                            "/health" => Ok::<_, s3s::HttpError>(
+                                Readiness::health_response().map(Body::from),
+                            ),
+                            "/ready" => Ok(ready.ready_response().map(Body::from)),
+                            "/metrics" => Ok(metrics.metrics_response().map(Body::from)),
+                            // `Service::call(&self, ..)`——hyper 那个 trait，`&self` 签名，
+                            // 所以 `s3` 不必是 `mut`。
+                            _ => s3.call(req).await,
+                        }
+                    }
+                }),
+            );
+            // `Connection` 是个 future，不 await 它什么都不发生。
+            let _ = conn.await;
+        });
+    }
+    Ok::<(), std::io::Error>(())
+});
+```
+
+> **`Ok::<_, s3s::HttpError>` 那个标注别省**：三个 `Ok(...)` 的错误类型要靠它统一。
+> 只在一个分支写 `Ok(...)`、另一个分支是 `s3.call(req).await` 时，编译器有时能从后者
+> 推出来，但那属于「碰巧能推」——把三行都写成显式标注，改一个分支不会引发一串推断错误。
+>
+> `health_response()` 是**关联函数**（Task 6.1 里它不接 `&self`），`ready_response()` /
+> `metrics_response()` 要 `&self`——上面那两行的写法差别不是笔误。
+>
+> **`TokioIo` 不是可选的**：`serve_connection` 要求 `I: hyper::rt::Read + hyper::rt::Write`，
+> 而 hyper 对这两个 trait 只给了 `Box<T>` / `&mut T` / `Pin<P>` 三个转发 impl
+> （`hyper-1.12.0/src/rt/io.rs:444,452,501,509`），`tokio::net::TcpStream` 不在其中。
+> 想自己写适配器就得碰 `ReadBufCursor::as_mut()`（`unsafe`），而工作区是
+> `unsafe_code = "forbid"`——**这条路在编译期就被堵死**，不用试。
+>
+> **在 `serve_connection` 外面截路径，顺带绕开了 `SimpleAuth`**：`/health`、`/ready`
+> 是给运维探针（6.4 的脚本、k8s 之类）用的，不该要求 SigV4 签名。s3s 也提供了
+> `S3Route` 能在 S3 管线内部截请求（`examples/axum.rs` 就是这么做的），但那条路要
+> 先过 s3s 的路由/鉴权阶段，语义上就不适合健康探针。**用 `service_fn`，不要用 `S3Route`。**
+>
+> **每个连接任务的 `Connection` 不必响应取消信号**：`shutdown` 等的是 `track_task`
+> 登记过的任务，而 `shutdown_stops_accepting_then_drains` 的 (b) 断言测的正是
+> 「已登记的 `track_task` 任务跑完」。给 `Connection` 加 `graceful_shutdown` + 连接计数
+> 是 DESIGN 的远期项，MVP 不加——加了反而让 (b) 那条断言的语义变模糊。
+>
+> **(a) 断言的正确姿势**：`TcpStream::connect(addr)` 必须在 **`shutdown().await` 返回之后**
+> 才断言 `Err`。取消 token 到 accept 任务真正 `drop(listener)` 之间有一小段调度延迟，
+> 在 `shutdown()` 返回前就去连会偶发地连上（那不是 bug，是「还没轮到那个任务被唤醒」）。
+> `shutdown` 内部 await 了登记的任务，所以它一返回，监听套接字必然已释放。
 
 ```bash
 git add crates/server/src/wiring.rs crates/server/src/config.rs crates/server/src/startup.rs \
@@ -8754,6 +8910,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **`S3Response::with_status` 在 `S3` trait 路径上是空操作** | s3s 0.17 的生成 operation 只取 `s3_resp.output`/`.headers`/`.extensions`，**不读 `.status`**（全库唯一读它的地方是 `CustomRoute` 分支，`src/ops/mod.rs:467`）。所以 handler 想返回非默认状态码只有三条路：靠 `output` 字段隐含（`content_range` → 206、`DeleteObject` 无字段也硬编码 204）、走 `serialize_error` 的错误通道（304 就是这么做的）、或挂 `S3Error` 的码。**日后若要做 `CopyObject` 的 201、或 206 以外的成功码，先回来看这条**——写 `with_status` 会**静默**变成 200 | 5.10 | 无上游修复可等（0.17 的生成器就是这样）。真要任意状态码只能自己 wrap `S3Service`，那是 Phase 2 中间件层的事 |
 | **DESIGN §14.2 的 7 层服务栈只落地了 compat 栈** | `CatchPanic` / `RateLimit` / `ReadinessGate` / `RequestId` / `Trace` 五层**在 M1~M6 里没有任何任务**（`grep CatchPanic\|RateLimit\|RequestId docs/MVP.md` 在实现任务里零命中）。6.1 只做了 `/health`、`/ready` 两个**端点**，不是「未就绪时把 s3s 挡在外面」的那层中间件；handler 里 panic 的表现是连接被断开，而不是 500 | — | Phase 2。**静默遗漏**，写在这里让最终复审看得见。`CatchPanic` 若要补，位置是 `crates/server` 的 tower 栈（`rstore-s3` 看不见 s3s 之外的层，接不进去） |
 | **指标的动态标签族走 `Mutex<HashMap<..>>`，不是 lock-free handle** | DESIGN §18.2 设想的是「热路径用 `LazyLock` 缓存 handle」。6.2 为了不引入 `prometheus` crate，`erasure_quorum_failures_total{op}` 与 `disk_errors_total{kind}` 每次 `record_*` 都先加一次互斥锁去取那一格计数器——锁只守护注册表查询、临界区极短，但确实进了热路径。**没有任何实测数据**：MVP 既没有并发压测，也还没有调用方（第一个调用方是 6.3） | 6.2 | Phase 2。有两条更轻的路：给 `op` / `kind` 这两个**闭合**的标签域用固定计数器 + `&str → 索引` 的 `match`（最省事，还顺手去掉锁中毒分支），或照设计用 `Arc<AtomicU64>` + 读一次缓存句柄 |
+| **HTTP 层只有「HTTP/1.1 + 无 TLS + 无连接上限」** | 6.3 的 `bind` 用 `hyper::server::conn::http1` 直接 `serve_connection`：**不接受 HTTP/2**、不做 TLS、没有连接数上限、没有请求超时（`--port` 也只绑 `127.0.0.1`）。四个目标客户端（aws-cli / mc / boto3 / rclone）默认都走 HTTP/1.1，所以这四样在 MVP 里都不构成功能缺口。**注意 `Cargo.lock` 里 `hyper` 是带 `http2` feature 的**（s3s 开的）——「http2 编进来了」不等于「我们服务 http2」 | 6.3 | Phase 2：换 `hyper_util::server::conn::auto` 或加一层 TLS 终止；连接上限/超时归 DESIGN §14.2 的中间件层 |
 | **单节点** | 无多节点、无 heal 的调度者。DESIGN §17 说 heal 由「观测到 `Corrupt`」触发：目前 `Corrupt` 会被分类、记录、参与 quorum 判定，但**没有自动修复流程** | — | Phase 3 |
 
 > **加新限制时，必须同时确认代码里有对应的拒绝路径。** 比如「不支持 multipart」
