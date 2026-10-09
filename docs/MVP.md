@@ -1970,6 +1970,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/common/src/lib.rs`（加 `pub mod consts;`）
 - Modify: `crates/meta/src/lib.rs`（加 `pub mod inline;`）
 - Modify: `crates/meta/src/fileinfo.rs`（给 `InlineData` 补 `encode`/`decode`，也可放在 inline.rs，同一 crate 内均可）
+- **Modify: `crates/meta/src/container.rs`**（收掉 Task 2.2 留下的两处 `TODO(Task 2.3)`——
+  `rmp_serde::to_vec(&meta.inline)` → `meta.inline.encode()`，以及解码侧那段
+  `if tail.is_empty()` 手工判空 → 一行 `InlineData::decode(tail)`。**不收就会留下
+  两份做着同一件事的代码**，且 `container.rs` 里的判空与 `InlineData::decode` 的判空会各自演化。）
 - Test: 同文件 `#[cfg(test)]`
 
 - [ ] **Step 1: 写失败测试**
@@ -1992,10 +1996,29 @@ mod tests {
     }
 
     #[test]
-    fn known_input_is_under_threshold() {
+    fn empty_input_decodes_to_empty_map() {
+        // 容器尾部理论上可能什么都没有（DESIGN §8.4）。这是解码侧要容忍的形状，
+        // 不能被当成畸形输入——否则一个合法容器会因为「没有内联数据」而读不出来。
+        assert_eq!(InlineData::decode(&[]).unwrap(), InlineData::new());
+    }
+
+    #[test]
+    fn garbage_decodes_to_malformed_header() {
+        // 0x91 = fixarray(1)，不是 map——解不成 `InlineData`。
+        let err = InlineData::decode(&[0x91, 0x01]).unwrap_err();
+        assert!(
+            matches!(&err, DiskError::Corrupt(CorruptKind::MalformedHeader)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_inline_respects_thresholds() {
+        // 原名 `known_input_is_under_threshold` 声称只测「在门限下」，但实际同时
+        // 断言了超门限的情况——名字会误导后续维护者。
         assert!(rstore_common::consts::should_inline(64 * 1024, false));
         assert!(!rstore_common::consts::should_inline(256 * 1024, false));
-        // 版本化桶门限更严格
+        // 版本化桶门限更严格（1/8）
         assert!(!rstore_common::consts::should_inline(32 * 1024, true));
         assert!(rstore_common::consts::should_inline(8 * 1024, true));
     }
@@ -2021,11 +2044,12 @@ Expected: 编译失败
 ```rust
 //! 跨层共享的常量与门限。
 
-pub const INLINE_BLOCK: u64 = 128 * 1024;
+/// 常量名对齐 DESIGN §8.4 的 `DEFAULT_INLINE_BLOCK`（原计划写的 `INLINE_BLOCK` 与 DESIGN 不一致）。
+pub const DEFAULT_INLINE_BLOCK: u64 = 128 * 1024;
 
 /// 版本化桶取 1/8；MVP 未启用版本化，但函数签名保留该维度。
 pub fn should_inline(size: u64, versioned_bucket: bool) -> bool {
-    let threshold = if versioned_bucket { INLINE_BLOCK / 8 } else { INLINE_BLOCK };
+    let threshold = if versioned_bucket { DEFAULT_INLINE_BLOCK / 8 } else { DEFAULT_INLINE_BLOCK };
     size <= threshold
 }
 ```
