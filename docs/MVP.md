@@ -5603,6 +5603,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   它对应 500，与新建桶失败同一类；测试 `delete_bucket_needs_a_strict_majority`
   断言的就是这个变体）。
   删之前先确认桶存在：桶压根不在 → `Err(StoreError::NotFound)`。
+  **但「存在」的判定必须比 `bucket_exists` 弱**：这里是「**任意一块在线盘**上读到标记文件」，
+  而不是 `bucket_exists` 的「≥ 严格多数」。两者不能混用——`delete_bucket_needs_a_strict_majority`
+  这条测试让 3 块盘掉线，标记只剩 3 份 < 4，若用 `bucket_exists` 判定就会得到
+  `NotFound`，而测试断言的是 `WriteQuorum`。语义上也该如此：
+  「桶存在但掉线过半」是一次**写失败**（503 + Retry-After，可以重试），
+  不是「桶本来就不存在」（404，重试无用）——把后者报给客户端会让它以为数据没了。
+  这也是 `ApiError` 里 `NoSuchBucket` 与 `Unavailable` 分开的理由。
 
 用同一个数是为了避免再造一个新常量；写进注释说明它是「桶级元数据的多数派门槛」，
 **不是** `delete_quorum` 在语义上被挪用——两者恰好都是「严格多数」而已。
