@@ -31,6 +31,17 @@ pub struct GetOut {
     pub size: u64,
     pub etag: String,
     pub data_dir: Uuid,
+    /// 最新版本的 `mod_time`（Unix 纳秒）；缺省按 0。S3 的 `Last-Modified` 要它。
+    pub mod_time: u64,
+}
+
+/// HEAD 的输出：只走元数据、一个分片都不碰。S3 的 HEAD（`mc stat` / `rclone check`）
+/// 不该为拿 size/etag/mod_time 付一次全量读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadOut {
+    pub size: u64,
+    pub etag: String,
+    pub mod_time: u64,
 }
 
 /// 一个 `ObjectMeta` 里「最新」的那个版本：先比 `mod_time`，相同再比 `version_id`。
@@ -417,6 +428,7 @@ impl ErasureSet {
                 size,
                 etag,
                 data_dir,
+                mod_time: header.mod_time.unwrap_or(0),
             });
         }
 
@@ -434,6 +446,25 @@ impl ErasureSet {
             size,
             etag,
             data_dir,
+            mod_time: header.mod_time.unwrap_or(0),
+        })
+    }
+
+    /// HEAD：只走元数据、不碰任何 `part.*` 分片，返回 size/etag/mod_time。
+    ///
+    /// 与 GET 用同一处版本发现（`resolve_version`）与同一处 etag 算法
+    /// （`etag_of_meta`），保证 HEAD 与 LIST/GET 的 ETag 不分叉。
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadOut, StoreError> {
+        let resolved = resolve_version(self, bucket, key).await?;
+        let Some((_dir, meta)) = resolved.live() else {
+            return Err(StoreError::NotFound); // 不存在，或最新版本是删除标记
+        };
+        let latest = latest_version(meta)
+            .ok_or_else(|| StoreError::Internal(format!("{bucket}/{key} has no versions")))?;
+        Ok(HeadOut {
+            size: latest.header.size,
+            etag: etag_of_meta(meta)?,
+            mod_time: latest.header.mod_time.unwrap_or(0),
         })
     }
 }
@@ -601,5 +632,26 @@ mod tests {
         let set = set_with_disks(6, 2).await;
         let r = set.get_object("b", "nope", None).await;
         assert!(matches!(r, Err(StoreError::NotFound)), "got {r:?}");
+    }
+
+    /// HEAD 只走元数据：size/etag/mod_time 与 GET 一致，且不存在的 key 回 `NotFound`。
+    #[tokio::test]
+    async fn head_matches_get_metadata_without_touching_shards() {
+        let set = set_with_disks(6, 2).await;
+        let data = vec![9u8; 1_500_000];
+        set.put_object(put_args("b", "k", data.clone()))
+            .await
+            .unwrap();
+
+        let got = set.get_object("b", "k", None).await.unwrap();
+        let head = set.head_object("b", "k").await.unwrap();
+        assert_eq!(head.size, got.size);
+        assert_eq!(head.etag, got.etag);
+        assert_eq!(head.mod_time, got.mod_time);
+
+        assert!(matches!(
+            set.head_object("b", "nope").await,
+            Err(StoreError::NotFound)
+        ));
     }
 }

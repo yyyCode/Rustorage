@@ -54,6 +54,13 @@ impl Metrics {
         }
     }
 
+    /// 开关状态。调用方靠它决定**要不要**取 `Instant::now()`——DESIGN §18.2 明确
+    /// 要求关闭时跳过计时，而不是「计完了再丢掉」。`record_*` 内部也各自判一次，
+    /// 两处判断不重复：这里是热路径的省，那里是 API 的兜底。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// 记一次 PUT 的整体耗时。
     pub fn record_put(&self, d: Duration) {
         if self.enabled {

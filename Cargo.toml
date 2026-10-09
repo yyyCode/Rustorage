@@ -46,6 +46,10 @@ tower = { version = "0.5", features = ["util"] }
 http = "1"
 http-body-util = "0.1"
 jiff = "0.2"
+clap = { version = "4", features = ["derive"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
