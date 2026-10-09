@@ -8214,19 +8214,23 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify `crates/server/src/lib.rs`（加 `pub mod config; pub mod startup; pub mod wiring;`；
   **注意 `main.rs` 不是 lib 的一部分**，它是独立的 crate root，要用
   `use rstore_server::...` 而不是 `use crate::...`）
-- Modify `crates/server/Cargo.toml`（加 **`async-trait`**、`clap`、`tokio-util`）
+- Modify `crates/server/Cargo.toml`（加 **`async-trait`**、**`serde_json`**、`clap`、`tokio-util`）
 - Modify `crates/store/src/get.rs`（加 `HeadOut` 与 `ErasureSet::head_object`；`GetOut` 加 `mod_time`）
 - Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`）
 
 > 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
 > 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
 >
-> **依赖要加三个，且都不在 `crates/server/Cargo.toml` 里**：
+> **依赖要加四个，且都不在 `crates/server/Cargo.toml` 里**：
 >
 > - **`async-trait`**（`async-trait.workspace = true`）——`wiring.rs` 要写
 >   `#[async_trait] impl ObjectStore for Wiring`。它已经在根 `Cargo.toml` 的
 >   `[workspace.dependencies]` 里（`rstore-api` 用的就是它），但 `crates/server`
 >   **没有把这条边加进去**，漏掉的表现是 `wiring.rs` 直接编译不过。
+> - **`serde_json`**（`serde_json.workspace = true`）——盘上 `format.json` 的编解码
+>   （见下面「盘上的 `format.json`」一节）。它已在根 `Cargo.toml` 的
+>   `[workspace.dependencies]` 里，但 `crates/meta` 只在 `[dev-dependencies]` 用，
+>   `crates/server` 还没有这条边。
 > - **`clap`**（`derive` + `cargo` feature，工作区里**完全没有**，根 `Cargo.toml`
 >   也要加）用来解析下面那张启动契约表里的七个参数——`--volumes` 是 `nargs(1..)`，
 >   手写解析要为它实现「吃到下一个 `--xxx` 为止」的扫描，而这条规则错了的后果是
@@ -8314,6 +8318,52 @@ cargo run -p rstore-server -- \
   错误列表里不全都是 `NotFound`，于是返回 `false`，启动必须**拒绝**。
 
 这两个函数在 Task 2.x 就写好了并有测试，6.3 只是调用者。
+
+#### 盘上的 `format.json` 与 `disk_id`：Task 3.3 刻意留给了 6.3（连编解码函数都没写）
+
+**先把这件事说破**：`crates/meta/src/format.rs` 里**没有任何磁盘 IO**——没有
+`read_format` / `write_format`，也没有 JSON 的编解码（它的 `serde_json` 放在
+`[dev-dependencies]` 里，只有那条 shape 测试用）。Task 3.3 的原文就是
+「真正读盘上 format.json 的是 Task 6.3 的 `crates/server/`，那个 crate 自己带依赖」。
+所以下面这几件事**必须在 6.3 落地**，否则 `select_authoritative` 连输入都拿不到。
+
+盘上布局（DESIGN §6.2；`--volumes` 里每个路径都是一块盘的**根目录**）：
+
+- `<volume>/format.json` —— `FormatV1` 的 JSON
+- `<volume>/.rstore.sys/disk_id` —— 本盘 UUID 的**字符串**形式（`DiskId` 实现了 `Display`）
+
+**推荐配方**（写在 `open_disks` 里）：
+
+1. **bootstrap 阶段用 `std::fs` 逐盘读 `<volume>/format.json`**，错误一律经
+   `rstore_disk::error_map::map_io`（它是 `pub` 的）转成 `DiskError`。
+   **为什么这里绕开 `DiskAPI`**：`LocalDisk::open(root, disk_id)` 需要先有 `DiskId`，
+   而 id 只可能来自盘上。这是全流程唯一一处直接碰文件系统的地方，别扩散。
+   - `Ok(bytes)` → `serde_json::from_slice::<FormatV1>`。**解析失败就立刻返回 `Err` 并
+     带上该盘路径**——「一堆盘里有一块格式坏了」是运维错误，不该丢给 quorum 去投票
+     （投票只会把它当异构盘投掉，然后启动成功，而那块盘从此参数不一致）。
+   - `Err(e)` → `map_io(e)` 得到 `DiskError`，push 进 `errs`。
+2. 看 `errs` 与成功的 `formats`：
+   - `should_initialize(&errs)` 为真（**所有盘都是 `NotFound`**）→ 初始化（见第 3 步）。
+   - **否则只要出现「有盘读到了、有盘 `NotFound`」就必须拒绝启动**——这正是
+     `refuses_to_reformat_reachable_disks`：一盘有数据、一盘空白时，把空白那块也
+     格式化成同一拓扑 = 悄悄把一个「新盘」认成老成员。错误信息里要列出**空盘的路径**。
+   - 其余情况（没有任何 `NotFound`）→ `select_authoritative(&formats)`。
+3. **初始化路径**：给每块盘 `DiskId::new_v4()`，然后
+   `sets = vec![所有 id]`（MVP 就是全部盘一个 set，顺序即 `--volumes` 的顺序），
+   逐盘 `LocalDisk::open(volume, id)` 之后用 **`DiskAPI`** 写两个文件：
+   `format.json` 与 `.rstore.sys/disk_id`，每个都跟着 `sync_file_and_parent`。
+   `disk_info` 填 `DiskInfo::default()` 之类的零值即可（它不参与一致性）。
+4. 非初始化路径：`id` 取权威 `format.erasure.this`，`LocalDisk::open(volume, id)`。
+5. `ErasureSet::new(disks, parity)`，盘序按权威 `format.sets` 走。
+
+> **`DiskAPI::disk_id()` 目前没有任何消费者**（全仓库 grep `disk_id()` 只在 `crates/disk`
+> 内部命中），所以第 3/4 步那个 id **传对了不会改变行为、传错了也不会**。即便如此也要
+> 按上面的来：`LocalDisk::open` 的 `disk_id` 参数是 DESIGN 承诺的盘标识，将来
+> `find_disk_index_by_disk_id` 一旦落地，第一件事就是读它。
+>
+> **`validate()` 要求每个 set 长度 `2..=16`**，所以 `--volumes` 至少要两块盘。
+> 只给一块时要报一句人话（「一个 set 至少要 2 块盘」），别让它变成一个
+> 来自 `FormatError::Inconsistent` 的、看不出是参数问题的错误。
 
 #### 组合根：`crates/server/src/wiring.rs`
 
