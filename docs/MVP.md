@@ -3543,7 +3543,12 @@ Expected: 编译失败
 
 ```rust
 /// 提交结果。达到 quorum 时返回。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **没有 `Clone`，不是笔误**：`failures` 里装着 `DiskError`，而 `DiskError`
+/// （`rstore-common`）只派生了 `Debug, PartialEq, Eq`。给它补 `Clone` 是一条跨 crate 的
+/// 改动，而这里没有任何调用方需要克隆提交结果——需要时再补，不要为了对齐一个
+/// 顺手写下的 derive 列表去动公共错误类型。
+#[derive(Debug, PartialEq, Eq)]
 pub struct CommitOutcome {
     /// 成功 rename 的盘数（= `renamed.len()`）。
     pub achieved: u8,
@@ -3554,7 +3559,7 @@ pub struct CommitOutcome {
     pub failures: Vec<(usize, DiskError)>,
 }
 
-/// 返回达到的 quorum 数；调用方据此决定成功或失败。
+/// 达到 quorum 则返回 `Ok(CommitOutcome)`，否则回滚并返回 `Err(WriteQuorum)`。
 ///
 /// 硬承诺（DESIGN §12.2）：**绝不在低于 quorum 时报告成功**。
 /// 回滚是 best-effort：失败时的残留由对账流程清理，本函数不保证不留字节。
@@ -3625,11 +3630,56 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/store/src/lib.rs`（加 `pub mod put;`）
 - Modify: `crates/store/Cargo.toml`（`[dependencies]` 加 `md-5.workspace = true`；见下方 etag）
 - Modify: `Cargo.toml`（`[workspace.dependencies]` 加 `md-5 = "0.10"`）
+- Modify: `crates/meta/src/fileinfo.rs`（加 `encode_body` / `decode_body`，见下方「body 编解码」）
+- Modify: `crates/meta/src/lib.rs`（把这两个函数加进再导出列表）
 - Test: 同文件 `#[cfg(test)]`
 
 > **前置**：4.1（写入器）、4.2（读取器）、4.3（`TestSet` 夹具）、4.4（`commit`）都必须已落地。
 > 而 4.3 的夹具依赖 Task 3.4 的 `FaultyDisk`，所以实际顺序是
 > **4.1 → 4.2 → 3.4 → 4.3 → 4.4 → 4.5**。
+
+#### 先补一个缺口：`rstore-meta` 没有公开的 body 编解码入口
+
+`ShallowVersion::body` 的类型是 `OpaqueBody`，而 `OpaqueBody = Vec<u8>`——
+**「不透明」是对外的承诺，但总得有人知道它里面是什么。** 现在整个工作区里
+唯一一处 `rmp_serde::to_vec(&ObjectBody { .. })` 在 `fileinfo.rs` 的 `#[cfg(test)]` 里，
+`crates/meta/src/lib.rs` 只再导出了 `encode_header` / `decode_header`：
+
+```
+$ grep -rn "encode_body\|decode_body" crates/meta/src/     # 无输出
+```
+
+这意味着**本任务和 Task 4.7 都走不通**：
+- PUT 要构造 `ShallowVersion { header, body }`，`body` 得由 `ObjectBody` 编出来——**造不出**；
+- GET 要从元数据里取 `ec_dist`（拼接分片顺序）和 `parts` 的长度——**读不回**。
+
+两条路都别走：**不要让 `crates/store` 直接依赖 `rmp-serde` 自己编**。
+那等于把「body 是 msgpack」这个线格式事实从 meta 层泄漏到 store 层，
+而且 store 还得自己把 `rmp_serde` 的错误映射成 `DiskError::Corrupt(MalformedHeader)`——
+同一套映射 meta 已经写过两遍（`encode_header` / `decode_header`），第三遍必然分叉。
+更糟的是日后换编码（比如为了省 CPU 换成某二进制格式）要改两个 crate。
+
+正确做法是让**拥有格式的 crate 提供入口**，在 `crates/meta/src/fileinfo.rs` 加：
+
+```rust
+/// 把 `ObjectBody` 编成 `ShallowVersion::body` 的线格式。
+pub fn encode_body(body: &ObjectBody) -> Result<OpaqueBody, DiskError> {
+    rmp_serde::to_vec(body).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
+}
+
+/// 解析 `ShallowVersion::body`。**读 `ec_dist` / `parts` 的唯一入口。**
+pub fn decode_body(bytes: &[u8]) -> Result<ObjectBody, DiskError> {
+    rmp_serde::from_slice(bytes).map_err(|_| DiskError::Corrupt(CorruptKind::MalformedHeader))
+}
+```
+
+并在 `crates/meta/src/lib.rs` 的 `pub use fileinfo::{...}` 里加上这两个名字。
+这两个函数各自补一条 roundtrip 单测（含「垃圾字节 → `Corrupt(MalformedHeader)`」），
+和 `encode_header` 的测试并排放在 `fileinfo.rs` 的测试模块里。
+
+> 错误映射必须与 `encode_header`（`fileinfo.rs:161`）**逐字一致**：用
+> `DiskError::Corrupt(CorruptKind::MalformedHeader)`，不要新造一个 kind。
+> DESIGN §17 规定 heal 由「观察到 `Corrupt`」触发，多一个 kind 就多一条没人处理的路径。
 
 #### 对象目录布局（M4 起冻结；GET / DELETE / 对账都按它找路）
 
@@ -3928,6 +3978,10 @@ pub(crate) fn expected_shard_len(size: u64, data: u8) -> u64 {
    `version_id`，body 的
    `parts = [PartInfo { number: 1, size: shard_len, actual_size: size, etag, index: None }]`、
    `ec_dist = dist`、`checksum_algo = ChecksumAlgo::Crc32c`、`storage_class = Standard`。
+   `ShallowVersion::body` 用 `rstore_meta::encode_body(&body)` 得到——**不要自己调 `rmp_serde`**，
+   理由见上文「body 编解码」。
+   `header.version_id = Some(version_id)`、`header.ty = VersionType::Object`、
+   `header.flags` 需置 `USES_DATA_DIR`（本版本确实用了数据目录）。
    **`header.mod_time` 必须写**（`SystemTime::now()` 的纳秒数）——GET 靠它在一个 key
    存在多个版本目录时选出最新的那个（见 4.7）。全程留 `None` 的话，覆盖写之后
    「哪一份是新的」就没有比较依据了。
