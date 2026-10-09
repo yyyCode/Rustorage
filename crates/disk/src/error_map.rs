@@ -13,7 +13,8 @@ use rstore_common::error::{DiskError, FatalKind, TransientKind};
 /// 分级：
 /// - `NotFound` → [`DiskError::NotFound`]（确定性缺失，quorum 计为「缺失」）。
 /// - `UnexpectedEof` → `Transient(ShortRead)`；`WouldBlock` / `TimedOut` → `Transient(Timeout)`。
-/// - `PermissionDenied` → `Fatal(PermissionDenied)`；只读文件系统 → `Fatal(ReadOnly)`。
+/// - `PermissionDenied` → `Fatal(PermissionDenied)`；只读文件系统 → `Fatal(ReadOnly)`；
+///   磁盘写满 → `Fatal(NoSpace)`。
 /// - **其余一律 `Transient(Io)`**：默认可重试，绝不升级为 `Corrupt`。
 pub fn map_io(err: io::Error) -> DiskError {
     match err.kind() {
@@ -23,10 +24,14 @@ pub fn map_io(err: io::Error) -> DiskError {
             DiskError::Transient(TransientKind::Timeout)
         }
         io::ErrorKind::PermissionDenied => DiskError::Fatal(FatalKind::PermissionDenied),
-        // 兜底：未知/其余错误 → Transient(Io)，除非 OS 明确指出是只读挂载。
+        // 兜底：未知/其余错误 → Transient(Io)，除非 OS 明确指出了别的致命原因。
         _ => {
             if is_read_only(&err) {
                 DiskError::Fatal(FatalKind::ReadOnly)
+            } else if is_no_space(&err) {
+                // DESIGN §17 把「容量耗尽」列为致命。报成 Transient 的话，
+                // 上层会对着一个永远写不进去的盘无限重试，而不是把问题浮出来。
+                DiskError::Fatal(FatalKind::NoSpace)
             } else {
                 DiskError::Transient(TransientKind::Io)
             }
@@ -59,6 +64,31 @@ fn is_read_only_code(_code: i32) -> bool {
     false
 }
 
+/// 同上，`ErrorKind` 也没有稳定的「磁盘已满」变体。
+fn is_no_space(err: &io::Error) -> bool {
+    match err.raw_os_error() {
+        Some(code) => is_no_space_code(code),
+        None => false,
+    }
+}
+
+#[cfg(unix)]
+fn is_no_space_code(code: i32) -> bool {
+    // ENOSPC：Linux 与 macOS 均为 28。
+    code == 28
+}
+
+#[cfg(windows)]
+fn is_no_space_code(code: i32) -> bool {
+    // ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL。
+    code == 112 || code == 39
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_no_space_code(_code: i32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,8 +108,32 @@ mod tests {
     #[test]
     fn unknown_error_defaults_to_transient_io_never_corrupt() {
         // 关键回归：兜底分支不得把未知错误归为 Corrupt。
+        // 这个错误没有 raw_os_error，因此也顺带钉住了「两个 OS 码判定都返回 false」这条路径。
         let e = io::Error::from(io::ErrorKind::Other);
         assert_eq!(map_io(e), DiskError::Transient(TransientKind::Io));
+    }
+
+    #[test]
+    fn disk_full_maps_to_fatal_no_space() {
+        // DESIGN §17 把「容量耗尽」列为致命。报成 Transient 的话，上层会对着一个
+        // 永远写不进去的盘无限重试，而不是把问题浮出来（`FatalKind::NoSpace`
+        // 否则就是个没有任何代码能产生的死变体）。
+        let code = if cfg!(windows) { 112 } else { 28 };
+        assert_eq!(
+            map_io(io::Error::from_raw_os_error(code)),
+            DiskError::Fatal(FatalKind::NoSpace)
+        );
+    }
+
+    #[test]
+    fn readonly_filesystem_maps_to_fatal_readonly() {
+        // 与 NoSpace 同一条兜底路径，但要落在不同的变体上——否则「只读盘」会被
+        // 误判成「盘满」，两者对运维的含义完全不同。
+        let code = if cfg!(windows) { 19 } else { 30 };
+        assert_eq!(
+            map_io(io::Error::from_raw_os_error(code)),
+            DiskError::Fatal(FatalKind::ReadOnly)
+        );
     }
 
     #[test]
