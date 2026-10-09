@@ -6793,23 +6793,85 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+command -v aws >/dev/null || { echo "aws CLI 未安装" >&2; exit 1; }
+
 export AWS_ACCESS_KEY_ID=rustorage
 export AWS_SECRET_ACCESS_KEY=rustorage-secret
 export AWS_DEFAULT_REGION=us-east-1
 EP="http://127.0.0.1:9000"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
-aws --endpoint-url "$EP" s3 mb s3://test-bucket
-head -c 1048576 /dev/urandom > /tmp/1m.bin
-aws --endpoint-url "$EP" s3 cp /tmp/1m.bin s3://test-bucket/1m.bin
-aws --endpoint-url "$EP" s3 cp s3://test-bucket/1m.bin /tmp/roundtrip.bin
-cmp /tmp/1m.bin /tmp/roundtrip.bin
+# `mb` 在桶已存在时会非零退出；我们的 CreateBucket 是幂等的（返回 200），
+# 但客户端自己也可能先行报错——吞掉退出码，别让 `set -e` 在这里把脚本带走。
+aws --endpoint-url "$EP" s3 mb s3://test-bucket || true
+
+head -c 1048576 /dev/urandom > "$WORK/1m.bin"
+aws --endpoint-url "$EP" s3 cp "$WORK/1m.bin" s3://test-bucket/1m.bin
+aws --endpoint-url "$EP" s3 cp s3://test-bucket/1m.bin "$WORK/roundtrip.bin"
+cmp "$WORK/1m.bin" "$WORK/roundtrip.bin"
+
 aws --endpoint-url "$EP" s3api list-objects-v2 --bucket test-bucket --prefix "" --max-keys 1
 aws --endpoint-url "$EP" s3api list-objects-v2 --bucket test-bucket --delimiter "/"
 echo "aws-cli smoke: OK"
 ```
 
-同样方式写 `mc.sh`（`mc alias set` / `cp` / `ls` / `cat` / `rm`）与
-`rclone.sh`（`copy` / `check`）。
+`mc.sh`：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+command -v mc >/dev/null || { echo "mc 未安装" >&2; exit 1; }
+EP="http://127.0.0.1:9000"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+
+mc alias set rs "$EP" rustorage rustorage-secret
+mc mb --ignore-existing rs/test-bucket
+head -c 1048576 /dev/urandom > "$WORK/1m.bin"
+mc cp "$WORK/1m.bin" rs/test-bucket/1m.bin
+mc cat rs/test-bucket/1m.bin > "$WORK/roundtrip.bin"
+cmp "$WORK/1m.bin" "$WORK/roundtrip.bin"
+mc ls rs/test-bucket
+mc rm rs/test-bucket/1m.bin
+echo "mc smoke: OK"
+```
+
+`rclone.sh`：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+command -v rclone >/dev/null || { echo "rclone 未安装" >&2; exit 1; }
+EP="http://127.0.0.1:9000"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+
+# 用环境变量定义 remote，不写 ~/.config/rclone/rclone.conf（那会污染开发机）。
+# `provider=Minio` 是为了让 rclone 用 **path-style** 寻址并挑一套
+# 对自建端点更宽松的签名细节；`provider=Other` 也能用，但对 AWS 专有行为更敏感。
+export RCLONE_CONFIG_RS_TYPE=s3
+export RCLONE_CONFIG_RS_PROVIDER=Minio
+export RCLONE_CONFIG_RS_ENDPOINT="$EP"
+export RCLONE_CONFIG_RS_ACCESS_KEY_ID=rustorage
+export RCLONE_CONFIG_RS_SECRET_ACCESS_KEY=rustorage-secret
+export RCLONE_CONFIG_RS_FORCE_PATH_STYLE=true
+
+rclone mkdir rs/test-bucket
+mkdir -p "$WORK/src"
+head -c 1048576 /dev/urandom > "$WORK/src/1m.bin"
+rclone copy "$WORK/src" rs/test-bucket/
+rclone copy rs/test-bucket/1m.bin "$WORK/roundtrip.bin"
+cmp "$WORK/src/1m.bin" "$WORK/roundtrip.bin"
+# `check` 会比对大小与 **ETag**——它正是 #3 那个「HEAD 的 ETag 必须与 LIST 的一致」
+# 的验收点。ETag 两处算法分叉时，这条会失败而 `cmp` 不会。
+rclone check "$WORK/src" rs/test-bucket --one-way
+echo "rclone smoke: OK"
+```
+
+> **这三个脚本的客户端行为差异本身就是被测对象**，不是可以互相抄的模板：
+> `mc cp` 默认 64 MiB 以上才走 multipart、`rclone` 的 `--s3-upload-cutoff` 默认 200 MiB、
+> `aws s3 cp` 是 **8 MiB**——只有 aws-cli 那条在 1 MiB 上就已经安全。
+> 1 MiB 对三者都在单次 PUT 范围内，这是**刻意选的下限**。
+> 若日后有人把载荷调大，先回来核对这三个阈值。
 
 - [ ] **Step 2: 运行脚本，记录失败项**
 
