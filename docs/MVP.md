@@ -2466,6 +2466,32 @@ mod tests {
         ]));
         assert!(!should_initialize(&[]));
     }
+
+    /// format.json 是运维会直接打开看的文件，字段名与 `DiskId` 的**字符串**形态
+    /// 都是对外契约。`DiskId` 是 Uuid 的 newtype——万一将来有人把它换成
+    /// `[u8; 16]`，JSON 里就会冒出 `[17,34,...]` 这样的数组，人读不了，
+    /// 而只有这条测试会拦下来。
+    #[test]
+    fn format_json_shape_is_stable() {
+        let v = serde_json::to_value(FormatV1::sample(DiskId::new_v4())).unwrap();
+        assert_eq!(v["format"], "erasure");
+        assert_eq!(v["erasure"]["distribution_algo"], "crc32c-rot-v1");
+        assert!(v["erasure"]["this"].is_string(), "got {v:#?}");
+        assert!(v["erasure"]["sets"][0][0].is_string(), "got {v:#?}");
+    }
+
+    /// 集合的**计数**必须进 identity。丢了计数的话，同样的盘按不同方式分组会编出
+    /// 同一串字节——`[[d1,d2]]` 与 `[[d1],[d2]]` 是两种完全不同的纠删拓扑
+    /// （前者 1 个 2 盘组，后者 2 个 1 盘组），却会互相投票凑成多数派。
+    #[test]
+    fn shared_identity_distinguishes_set_grouping() {
+        let (d1, d2) = (DiskId::new_v4(), DiskId::new_v4());
+        let mut a = FormatV1::sample(DiskId::new_v4());
+        a.erasure.sets = vec![vec![d1, d2]];
+        let mut b = FormatV1::sample(DiskId::new_v4());
+        b.erasure.sets = vec![vec![d1], vec![d2]];
+        assert_ne!(a.shared_identity(), b.shared_identity());
+    }
 }
 ```
 
@@ -2519,22 +2545,35 @@ pub struct DiskInfo { pub total: u64, pub free: u64 }
 
 另需一个测试辅助 `impl FormatV1 { pub fn sample(this: DiskId) -> Self }`——
 测试全靠它构造样本（至少 1 个 set、每 set ≥2 块盘，让 `sets[0][1]` 可寻址）。
+`sample` 的 `this` **必须只影响 `erasure.this`**：`id`/`version`/`format`/
+`distribution_algo`/`sets` 一律取固定常量。否则 `shared_identity` 的那几条测试
+（比较两个 `sample` 的 identity）就失去意义了。
 
-**`crates/meta/Cargo.toml` 要加 `serde_json.workspace = true`**（format.json 是 JSON；
-workspace 依赖表里已有它，meta 目前没引用）。原计划的 Files 清单漏了这条。
+**`crates/meta/Cargo.toml` 加 `serde_json`——放 `[dev-dependencies]`，不是 `[dependencies]`。**
+本任务的库代码一行 JSON 都不用（`Serialize`/`Deserialize` 派生只需 `serde`），
+只有 `format_json_shape_is_stable` 这条测试读 JSON。放错会白搭进 meta 的每次构建。
+真正读盘上 format.json 的是 Task 6.3 的 `crates/server/`，那个 crate 自己带依赖。
+（原计划的 Files 清单漏了这条。）
 
 按 DESIGN §7 实现：
 
 - `shared_identity()` → 返回**逻辑拓扑**的全部字段，即**除 `this` 与 `disk_info` 之外**
-  的一切。返回类型取 `Vec<u8>`（规范化的确定性编码）—— `Vec<u8>` 天然
-  `PartialEq + Debug`，且是**精确比对而非指纹**，没有哈希碰撞的语义问题。
+  的一切。返回类型取 `Vec<u8>`—— `Vec<u8>` 天然 `PartialEq + Debug`，且是
+  **精确比对而非指纹**，没有哈希碰撞的语义问题。
   > **`disk_info` 必须排除**：它含 `free`，每块盘必然不同。算进去的话，
   > 同一 pool 的盘永远凑不出多数派，quorum 协商整体失效。
   > **DESIGN §7 原文写的是「除 `this` 之外的全部字段」——那是错的，已改。**
-- `validate()` → `format == "erasure"`、`distribution_algo == "crc32c-rot-v1"`、
-  所有 set 长度一致且 `2..=16`；
+  编码**手写**，不要走 serde：`serde_json::to_vec` 会引入一条不可能失败、
+  只能 `expect` 的 panic 路径，而这里要的是一个不可失败的函数。
+  规则：每个字符串先写 `u32 LE` 长度再写字节；`sets` 先写 set 数量，
+  每个 set 先写盘数，再逐块写 `as_bytes()`（16B）。**长度/计数前缀不是装饰**，
+  见 `shared_identity_distinguishes_set_grouping`。
+- `validate() -> Result<(), FormatError>` → `format == "erasure"`、
+  `distribution_algo == "crc32c-rot-v1"`、`sets` 非空、所有 set 长度一致且 `2..=16`；
 - `select_authoritative(formats: &[FormatV1]) -> Result<FormatV1, FormatError>`：
-  按 `shared_identity()` 分组计票，**多数派 = `总数 / 2 + 1`**，未达 quorum 报错；
+  按 `shared_identity()` 分组计票，**多数派 = `总数 / 2 + 1`**，未达 quorum 报错。
+  选出赢家后再对它跑一次 `validate()`（`?` 直接往上抛）——投票只保证大家
+  「彼此一致」，不保证一致的那份是合法的；不校验就可能把一个非法拓扑扶正。
 - `should_initialize(errs: &[DiskError]) -> bool`：**仅当所有盘都返回 `NotFound` 时**为真
   （对应 DESIGN §7「网络不可达的盘绝不被当作新拓扑的证据」；空切片为 false）。
 
@@ -2544,11 +2583,15 @@ Run: `cargo test -p rstore-meta format`
 Expected: PASS
 
 ```bash
-git add crates/meta/
+git add crates/meta/ Cargo.lock
 git commit -m "feat(meta): format.json with shared identity quorum and strict init gate
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+> `Cargo.lock` 必须一起提交：它按包记录依赖边，给 meta 加依赖会改动
+> `name = \"rstore-meta\"` 那条的 `dependencies` 列表。只 `git add crates/meta/`
+> 会留下一个脏的 lockfile，下一个人 `--locked` 直接失败。
 
 ---
 
@@ -2559,13 +2602,18 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/disk/tests/faulty_disk.rs`
 - Modify: `crates/disk/src/lib.rs`（`pub use local::LocalDisk;`、`pub use error::DiskError;`
   等 re-export，以及下面说的门控模块声明）
-- Modify: `crates/disk/Cargo.toml`（新增 `[features] fault-injection = []`；
-  `[dev-dependencies]` 需要 `tokio.workspace = true`、`tempfile.workspace = true`）
+- Modify: `crates/disk/Cargo.toml`（**只需**新增 `[features] fault-injection = []`）
 
 > **为什么要 feature**：`FaultyDisk` 必须能被 `rstore-store` 的集成测试用到，
 > 而集成测试是**独立编译的 crate**，`#[cfg(test)]` 在那里不生效。
 > 因此模块门控写作 `#[cfg(any(test, feature = "fault-injection"))]`：
 > crate 内单测自动可见，跨 crate 由 feature 显式开启。
+
+> **依赖不用加**（原计划说还要给 `[dev-dependencies]` 补 `tokio`，是多余的）：
+> `tests/` 下的集成测试除了 `[dev-dependencies]` 之外**也能看到 `[dependencies]`**，
+> 所以 `tokio`（已在 `[dependencies]`，`features = ["full"]`）和 `async-trait` 直接可用；
+> `tempfile` 已在 Task 3.1 进 `[dev-dependencies]`。加一份冗余的 tokio dev-dep
+> 只会让人以为两处配置都有关。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2611,6 +2659,22 @@ async fn can_fail_after_n_calls() {
     d.write_all("b", b"2").await.unwrap();
     assert!(matches!(d.write_all("c", b"3").await, Err(DiskError::Transient(_))));
 }
+
+#[tokio::test]
+async fn can_return_to_healthy_after_fault() {
+    // 故障注入必须是可逆的：否则「故障排除后原数据还读得回来吗」这类断言写不出来。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let inner = LocalDisk::open(tmp.path(), DiskId::new_v4()).unwrap();
+    let d = FaultyDisk::wrap(inner).with(Fault::Offline);
+    assert!(matches!(
+        d.write_all("f", b"x").await,
+        Err(DiskError::Transient(_))
+    ));
+
+    d.clear_fault();
+    d.write_all("f", b"x").await.unwrap();
+    assert_eq!(d.read_exact_at("f", 0, 1).await.unwrap(), b"x");
+}
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2633,7 +2697,7 @@ pub enum Fault {
     PartialWrite,
     /// 写入时在偏移 `at` 处按 `mask` 异或——**静默损坏**：不报任何错，读回来的字节就是错的。
     CorruptBytes { at: usize, mask: u8 },
-    /// 写入后把文件截断到 `len` 字节。
+    /// 只写入前 `len` 字节，其余丢弃（`PartialWrite` 的带参形式）。
     Truncate { len: usize },
     /// **前 `calls` 次调用正常**，第 `calls + 1` 次起一律返回 `kind` 对应的错误。
     /// （原文写的是「第 `calls` 次调用起」，与 `can_fail_after_n_calls` 的期望
@@ -2675,11 +2739,25 @@ impl FaultyDisk {
     /// 原地改故障（测试中途切换用）。`&self` —— 内部靠 `Mutex` 提供可变性，
     /// 所以测试里的 `let d = ...` 不需要 `mut`。
     pub fn set_fault(&self, fault: Fault);
+
+    /// 清除故障，回到与内层盘完全一致的行为。
+    /// **原计划漏了这个口子**：内部状态是 `Mutex<Option<Fault>>`、初值 `None`，
+    /// 但没有任何 API 能再回到 `None`——注入故障后就成了单行道，M4 里
+    /// 「故障恢复后原数据读得回来吗」这类断言根本写不出来。
+    pub fn clear_fault(&self);
 }
 ```
 
-`CorruptBytes` / `Truncate` 都对**写入**生效；读路径只负责把已经损坏的字节原样交出去，
-不额外校验——否则就模拟不出「静默损坏」了。
+**`CorruptBytes` / `Truncate` / `PartialWrite` 一律是「交给内层盘之前」对 payload 做变换**，
+不是写完之后再去改盘上的文件。原文把 `Truncate` 写成「写入后把文件截断到 `len` 字节」——
+那**根本实现不了**：`DiskAPI` 没有 `truncate`/`set_len`，`FaultyDisk` 拿不到任何能在写入后
+缩短文件的手段。改成写前变换后语义一致（`LocalDisk::write_all` 是创建即截断，只写前 `len`
+字节得到的就是一个 `len` 字节的文件），而且不需要读-改-写。
+
+**读路径一律不动**：只把已经损坏的字节原样交出去，不额外校验——否则就模拟不出「静默损坏」了。
+
+**`FailAfter` 的计数器计的是「任意 `DiskAPI` 方法的调用次数」，不区分读写。** 这一点必须写进
+doc 注释：M4 的崩溃点测试要按这个口径推算 `calls`，含糊的话会写出随机飘的断言。
 
 **要求：`FaultyDisk` 必须通过 `contract_tests`（无故障注入时行为与 `LocalDisk` 完全一致）**，
 否则它测出来的问题可能是它自己引入的。
