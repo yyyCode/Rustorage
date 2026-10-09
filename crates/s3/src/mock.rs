@@ -16,7 +16,8 @@ use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, Objec
 
 /// 所有对象共用的固定 `mod_time`（Unix 纳秒，2023-11-14）。
 /// 用固定值而不是 `SystemTime::now()`：测试断言可复现，且不必引入时间依赖。
-const MOCK_MOD_TIME_NANOS: u64 = 1_700_000_000_000_000_000;
+/// `pub(crate)`：条件请求测试（5.10）要拿它构造期望的 `If-Modified-Since`。
+pub(crate) const MOCK_MOD_TIME_NANOS: u64 = 1_700_000_000_000_000_000;
 
 /// 一个已存对象：`(内容, etag, mod_time_nanos)`。
 type StoredObject = (Vec<u8>, String, u64);
@@ -215,7 +216,8 @@ impl ObjectStore for MockStore {
 ///
 /// **不是真 MD5**：测试只需要 etag 稳定、可预测、内容不同则 etag 不同，
 /// 这样才断言得了「它原样传到了响应头」。引入 `md-5` 只为这个夹具不值得。
-fn fake_etag(data: &[u8]) -> String {
+/// `pub(crate)`：条件请求测试（5.10）要拿它构造期望的 `If-None-Match`。
+pub(crate) fn fake_etag(data: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in data {
         hash ^= u64::from(byte);

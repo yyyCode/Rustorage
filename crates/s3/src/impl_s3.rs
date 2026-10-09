@@ -11,10 +11,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http::StatusCode;
-use rstore_api::{ApiError, ByteRange, ObjectStore};
+use rstore_api::{ApiError, ByteRange, ObjectInfo, ObjectStore};
 use s3s::dto::*;
-use s3s::{S3Request, S3Response, S3Result, S3};
+use s3s::{S3Error, S3Request, S3Response, S3Result, S3};
 
+use crate::conditional::{self, Verdict};
 use crate::errors::to_s3_error;
 use crate::validate::validate_object_key;
 
@@ -127,12 +128,31 @@ impl S3 for RstoreFs {
         // 变成 500；而不合法的 key 是客户端的错（400），不是「服务端坏了」。
         validate_object_key(&req.input.key).map_err(to_s3_error)?;
         // 闭合 Range 需要对象长度，先 head 拿 size 再带 range get——MVP 不流式，
-        // 两次调用可接受，不必为此改 `ObjectStore` trait。
+        // 两次调用可接受，不必为此改 `ObjectStore` trait。这次 head 同时也是条件
+        // 求值的数据来源，**不要 head 两遍**。
         let info = self
             .store
             .head_object(&req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
+        // 条件求值必须在**查到对象之后**：先求条件后查对象的话，不存在的 key 会
+        // 被 `If-Match` 误判成 412，而正确答案是 404。
+        match conditional::evaluate(
+            conditional::Conditions {
+                if_match: req.input.if_match.as_ref(),
+                if_none_match: req.input.if_none_match.as_ref(),
+                if_modified_since: req.input.if_modified_since.as_ref(),
+                if_unmodified_since: req.input.if_unmodified_since.as_ref(),
+            },
+            &info,
+        ) {
+            // 条件错误不是 `ApiError`，映射表里没有对应变体，只能在调用点构造
+            // （与 416 挂 `Content-Range` 是同一类例外）。
+            Verdict::PreconditionFailed => return Err(s3s::s3_error!(PreconditionFailed)),
+            // 304 无 body；响应头只回验证器 ETag / Last-Modified（见 `not_modified`）。
+            Verdict::NotModified => return Err(not_modified(&info)),
+            Verdict::Proceed => {}
+        }
         let resolved = match req.input.range {
             Some(r) => Some(match resolve_range(r, info.size) {
                 Ok(br) => br,
@@ -188,6 +208,22 @@ impl S3 for RstoreFs {
             .head_object(&req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
+        // 条件求值必须在查到对象之后（理由同 get_object）：不存在的 key 带 `If-Match`
+        // 应是 404 NoSuchKey，不是 412。
+        match conditional::evaluate(
+            conditional::Conditions {
+                if_match: req.input.if_match.as_ref(),
+                if_none_match: req.input.if_none_match.as_ref(),
+                if_modified_since: req.input.if_modified_since.as_ref(),
+                if_unmodified_since: req.input.if_unmodified_since.as_ref(),
+            },
+            &info,
+        ) {
+            Verdict::PreconditionFailed => return Err(s3s::s3_error!(PreconditionFailed)),
+            // HEAD 的 304 同样无 body；只回验证器 ETag / Last-Modified。
+            Verdict::NotModified => return Err(not_modified(&info)),
+            Verdict::Proceed => {}
+        }
         Ok(S3Response::new(HeadObjectOutput {
             content_length: Some(info.size as i64),
             e_tag: Some(ETag::Strong(info.etag)),
@@ -318,6 +354,35 @@ fn timestamp_of(mod_time_nanos: u64) -> Timestamp {
     Timestamp::from(system_time)
 }
 
+/// 构造 304 `Not Modified` 错误（GET / HEAD 的条件命中）。
+///
+/// **为什么走错误通道而不是 `S3Response::with_status(_, NOT_MODIFIED)`**：s3s 0.17 的
+/// 生成 operation 在成功路径上**不读** `S3Response.status`（`serialize_http` 把状态
+/// 写死成 200，Range 命中才是 206），所以那样返回会变成 200。`S3ErrorCode::NotModified`
+/// 的 HTTP 状态恰是 304，而 `serialize_error` 对 304 这类 bodyless 状态会剥掉 body 与
+/// 描述 body 的头——正好是 304 要的形状。验证器（ETag / Last-Modified）用 `set_headers`
+/// 挂上（RFC 9110 §15.4.5 建议 304 回显当前验证器）。
+fn not_modified(info: &ObjectInfo) -> S3Error {
+    let mut err = s3s::s3_error!(NotModified);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ETAG,
+        ETag::Strong(info.etag.clone())
+            .to_http_header()
+            .expect("etag 是合法 header 值"),
+    );
+    let mut buf = Vec::new();
+    conditional::last_modified(info)
+        .format(TimestampFormat::HttpDate, &mut buf)
+        .expect("timestamp 可格式化为 HTTP-date");
+    headers.insert(
+        http::header::LAST_MODIFIED,
+        http::HeaderValue::from_bytes(&buf).expect("HTTP-date 是 ASCII"),
+    );
+    err.set_headers(headers);
+    err
+}
+
 /// 把 s3s 解析好的 `Range` 收敛成真实对象的闭区间。越界 → `ApiError::InvalidRange`。
 ///
 /// s3s 只做 `bytes=` 的语法解析，不知道对象多大，所以闭合区间与越界检查在这一层。
@@ -360,7 +425,7 @@ mod tests {
     use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
 
     use super::*;
-    use crate::mock::MockStore;
+    use crate::mock::{fake_etag, MockStore};
 
     const ACCESS_KEY: &str = "testkey";
     const SECRET_KEY: &str = "testsecret";
@@ -1147,5 +1212,91 @@ mod tests {
         // 规则 2：`a//b` 会被 `fsx::resolve` 折成 `a/b`，两个不同的 S3 key 落到同一个
         // 文件上——放行就是静默互相覆盖。规则 1 的测试对这条完全无感，必须单独测。
         put_key_expect_invalid_argument("a//b").await;
+    }
+
+    // ---- Task 5.10: 条件请求（GET / HEAD） ----
+
+    /// 构造一个带任意请求头的请求，其余走 `request` 夹具。
+    fn request_with(method: &str, path: &str, headers: &[(&str, &str)]) -> http::Request<TestBody> {
+        let mut req = request(method, path, b"");
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("合法请求头名"),
+                http::HeaderValue::from_str(value).expect("合法请求头值"),
+            );
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn get_with_if_none_match_hit_is_304_and_has_no_body() {
+        let store = Arc::new(MockStore::default());
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+        // 客户端手里的 ETag 就是线格式（带引号），直接用夹具算出的期望值构造。
+        let etag = format!("\"{}\"", fake_etag(OBJ_BODY));
+
+        let (status, headers, body) = call_on(
+            mock_service(store),
+            request_with("GET", "/test-bucket/k", &[("if-none-match", etag.as_str())]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_MODIFIED,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(body.is_empty(), "304 响应不能带 body");
+        // RFC 9110 §15.4.5：304 应回显当前验证器；也不能带描述 body 的长度头。
+        assert_eq!(header(&headers, "etag"), etag);
+        assert!(
+            headers.get("content-length").is_none(),
+            "304 不应带 Content-Length"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_with_if_match_mismatch_is_412() {
+        let store = Arc::new(MockStore::default());
+        let _ = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/test-bucket/k", OBJ_BODY),
+        )
+        .await;
+
+        let (status, _headers, body) = call_on(
+            mock_service(store),
+            request_with("GET", "/test-bucket/k", &[("if-match", "\"deadbeef\"")]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "PreconditionFailed");
+    }
+
+    #[tokio::test]
+    async fn conditional_header_does_not_turn_404_into_412() {
+        // 盯的是「先求条件再查对象」的写法：那样对不存在的 key 会先撞上 If-Match
+        // 不命中而回 412，正确顺序是先查到对象（这里 404）再求条件。
+        let (status, _headers, body) = call_on(
+            mock_service(Arc::new(MockStore::default())),
+            request_with("GET", "/test-bucket/missing", &[("if-match", "\"deadbeef\"")]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "NoSuchKey");
     }
 }
