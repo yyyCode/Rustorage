@@ -216,6 +216,10 @@ pub struct ObjectMeta {
 /// body 解析后的内容（DESIGN §8.2）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectBody {
+    /// 数据目录/对象 id。此字段走 `Uuid` 自身的 serde（**不经 `HeaderWire` 桥接**），
+    /// 因此线上是 bin8（`0xc4 0x10` + 16 字节），而 header 里的 UUID 是 array16——
+    /// 同一格式里两种 UUID 表示是刻意接受的差异，不是笔误（见
+    /// `uuid_encodes_as_raw_bytes_not_a_string`）。
     pub id: Option<Uuid>,
     pub parts: Vec<PartInfo>,
     pub ec_dist: Vec<u8>,
@@ -355,5 +359,51 @@ mod tests {
         let mut rest = Vec::new();
         cursor.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, vec![0xAB]);
+    }
+
+    #[test]
+    fn uuid_encodes_as_raw_bytes_not_a_string() {
+        // ObjectBody.id / PartInfo 走 Uuid 的 serde，不经 HeaderWire 桥接，
+        // 因此它的线格式取决于 rmp-serde 的 is_human_readable()。
+        // 探针只能证明「今天如此」；钉成测试才能挡住将来 rmp-serde 升级
+        // 把它翻成人类可读字符串（36 字节带连字符）——那会让旧 meta.xl 读不出来。
+        let body = ObjectBody {
+            id: Some(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            parts: Vec::new(),
+            ec_dist: Vec::new(),
+            checksum_algo: ChecksumAlgo::Crc32c,
+            storage_class: StorageClass::Standard,
+            meta_user: BTreeMap::new(),
+            meta_sys: BTreeMap::new(),
+        };
+        let enc = rmp_serde::to_vec(&body).unwrap();
+
+        // UUID 的 32 个十六进制字符一个都不许出现在线格式里。
+        assert!(
+            !enc.contains(&b'-'),
+            "Uuid 被编成了带连字符的字符串: {enc:?}"
+        );
+        assert_ne!(
+            enc,
+            rmp_serde::to_vec(&ObjectBody {
+                id: None,
+                ..body.clone()
+            })
+            .unwrap()
+        );
+
+        // 且必须能读回——钉住的是编码形状，不是往返本身。
+        let back: ObjectBody = rmp_serde::from_slice(&enc).unwrap();
+        assert_eq!(back, body);
+
+        // 钉死 bin8 前缀 `0xc4 0x10`（msgpack bin8，长度 16）+ 原始 16 字节。
+        let mut expected = vec![0xc4, 0x10];
+        let uuid = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        expected.extend_from_slice(uuid.as_bytes());
+        let pos = enc
+            .windows(expected.len())
+            .position(|w| w == expected.as_slice())
+            .expect("未找到 bin8 编码的 16 字节 UUID");
+        assert_eq!(&enc[pos..pos + expected.len()], expected.as_slice());
     }
 }
