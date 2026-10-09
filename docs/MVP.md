@@ -7809,6 +7809,25 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 写失败测试**
 
+> **先把已有的签名辅助函数泛化。** `impl_s3.rs` 的测试模块里现在只有一个
+> `signed_list_buckets(secret)`，它把方法（`GET`）、路径（`/`）和 `Host`
+> 全都写死成常量。而下面的用例需要「指定 method + path + **任意 Host** + 请求体哈希」
+> ——**虚拟主机寻址的关键恰恰是 Host 头**，而且 SigV4 的 `SignedHeaders` 里包含
+> `host`，所以不能只改请求的 Host 头而不重签（那样会先撞 `SignatureDoesNotMatch`，
+> 看起来像「vhost 没生效」）。
+>
+> 做法：把它改写成 `signed_request(method, path, host, body) -> Request<TestBody>`
+> （`signed_list_buckets` 变成它的一行薄封装，现有测试不动）。
+>
+> **请求体哈希怎么来**：`s3s-sigv4` 只导出 `EMPTY_STRING_SHA256_HASH` 常量
+> 与 `create_canonical_request` / `calculate_signature` 这些拼装函数，
+> **没有「对一段字节算 SHA256」的公开函数**（`s3s::Sha256Sum` 只有
+> `from_hex` / `from_bytes` / `ct_equal`，也不能算）。所以给
+> `crates/s3/Cargo.toml` 的 `[dev-dependencies]` 加一行 `sha2 = "0.10"`，
+> 在测试里算 `hex(SHA256(body))`；空体仍可直接用 `EMPTY_STRING_SHA256_HASH`。
+> （另一条路是给 `x-amz-content-sha256` 填 `UNSIGNED-PAYLOAD`——`AmzContentSha256::parse`
+> 接受它，但 s3s 的**校验**路径是否放行未经核实，别把测试赌在这上面。）
+
 ```rust
 #[tokio::test]
 async fn virtual_host_style_host_header_selects_bucket() {
