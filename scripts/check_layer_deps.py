@@ -63,20 +63,58 @@ def table_errors(table):
     return errors
 
 
+class MetadataShapeError(Exception):
+    """cargo metadata 的结构和预期不符。
+
+    单独定义一个类型，是为了让 main() 能精确接住"输入不是我们以为的东西"。
+    靠枚举 KeyError/TypeError/AttributeError……是在猜自己已知的坏法，而契约
+    要求的是**任何**坏法都归 2。check() 里所有结构断言统一抛它，main() 里再
+    加一层 except Exception 兜底，这样"意外异常以 1 逃逸"在结构上不可能发生。
+    """
+
+
+def require(cond, what):
+    """结构断言。不成立就抛 MetadataShapeError，由 main() 转成退出码 2。"""
+    if not cond:
+        raise MetadataShapeError(what)
+
+
 def check(meta):
-    """返回违规消息列表。空列表表示合规。"""
+    """返回违规消息列表。空列表表示合规。
+
+    结构不符时抛 MetadataShapeError，而不是返回违规——「cargo 的输出看不懂」
+    和「架构违规」必须分开报，前者是护栏故障（2），后者才是发现违规（1）。
+
+    路径依赖（带 path 字段）一律按下内部依赖约束：这类依赖必然来自本仓库或
+    本地目录，名字不带 rstore- 并不代表它不在图里。只按前缀过滤的话，一个放在
+    crates/ 之外、名字又没前缀的内部 crate 会同时漏掉 UNKNOWN CRATE 和这条边。
+    """
+    require(isinstance(meta, dict), f"顶层不是对象：{type(meta).__name__}")
+    packages = meta.get("packages")
+    require(isinstance(packages, list), f"packages 不是列表：{type(packages).__name__}")
+    require(packages, "packages 为空——workspace 里应当有 crate")
+
     violations = []
-    for pkg in meta["packages"]:
-        name = pkg["name"]
+    for pkg in packages:
+        require(isinstance(pkg, dict), "packages 的元素不是对象")
+        name = pkg.get("name")
+        require(isinstance(name, str), f"包的 name 不是字符串：{name!r}")
+
         if name not in ALLOWED:
             violations.append(
                 f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖"
             )
             continue
-        for dep in pkg["dependencies"]:
-            dep_name = dep["name"]
-            if not dep_name.startswith("rstore-"):
-                continue                      # 只约束内部 crate
+
+        deps = pkg.get("dependencies")
+        require(isinstance(deps, list), f"{name} 的 dependencies 不是列表")
+        for dep in deps:
+            require(isinstance(dep, dict), f"{name} 的依赖项不是对象")
+            dep_name = dep.get("name")
+            require(isinstance(dep_name, str), f"{name} 的依赖名不是字符串：{dep_name!r}")
+
+            if dep.get("path") is None and not dep_name.startswith("rstore-"):
+                continue                      # 注册表依赖：不受内部层次约束
             if dep_name not in ALLOWED[name]:
                 kind = dep.get("kind") or "normal"
                 violations.append(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
@@ -108,11 +146,19 @@ def main():
         return 2
 
     # 合法 JSON 不等于预期的结构。cargo 若改了输出格式，这里必须落回 2
-    # （护栏故障），而不是让 KeyError/TypeError 冒出去变成 1。
+    # （护栏故障），而不是让异常冒出去变成 1。
+    #
+    # 第二层 except Exception 是兜底，不是冗余：check() 内部已经用 require()
+    # 显式断言了结构，但那段代码将来会长出新的字段访问。契约是"除真正的违规
+    # 之外一律不返回 1"，能表达这个契约的只有"接住一切"——枚举异常类型永远
+    # 慢一步，而漏掉的那种会以"发现违规"的假象出现在 CI 里。
     try:
         violations = check(meta)
-    except (KeyError, TypeError) as e:
-        print(f"ERROR: cargo metadata 结构不符合预期：{e!r}", file=sys.stderr)
+    except MetadataShapeError as e:
+        print(f"ERROR: cargo metadata 结构不符合预期：{e}", file=sys.stderr)
+        return 2
+    except Exception as e:                    # noqa: BLE001
+        print(f"ERROR: 检查元数据时发生意外异常：{type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
     for v in violations:

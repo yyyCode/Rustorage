@@ -57,11 +57,14 @@ jobs:
       - name: 格式
         run: cargo fmt --all -- --check
 
+      # --locked 不能省：Cargo.lock 是提交进仓库的，缓存键也按它算。不带它的话
+      # cargo 会在锁文件与 manifest 不一致时默默重新解析依赖，CI 照样绿——
+      # 于是"锁定依赖"这件事在 CI 里从未被真正验证过。
       - name: 构建
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: 测试
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
