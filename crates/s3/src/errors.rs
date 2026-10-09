@@ -22,6 +22,10 @@ pub(crate) fn to_s3_error(err: ApiError) -> S3Error {
         ApiError::NoSuchKey => s3s::s3_error!(NoSuchKey),
         // Range 越界（5.4）：GET 带 Range 请求超出对象 → 416 RangeNotSatisfiable。
         ApiError::InvalidRange => s3s::s3_error!(InvalidRange),
+        // 命名校验（5.7）：不合法的对象 key → 400。对外码必须用标准的 `InvalidArgument`
+        // ——s3s 的码表里**没有** `InvalidObjectName`，`s3_error!($code)` 会展开成
+        // `S3ErrorCode::$code`（一条路径，不是字符串），写它会编译不过。
+        ApiError::InvalidObjectName => s3s::s3_error!(InvalidArgument),
         ApiError::BucketNotEmpty => s3s::s3_error!(BucketNotEmpty),
         ApiError::Internal(msg) => s3s::s3_error!(InternalError, "internal error: {msg}"),
         // 5.3~5.6 按需在此前插入各自用到的变体；5.8 收敛成完整表。
@@ -53,5 +57,8 @@ mod tests {
     fn object_operation_errors_map_to_their_s3_codes() {
         assert_code(ApiError::NoSuchKey, "NoSuchKey", 404);
         assert_code(ApiError::InvalidRange, "InvalidRange", 416);
+        // 5.7 的命名校验：内部变体叫 `InvalidObjectName`，但对外是标准的
+        // `InvalidArgument`（s3s 码表里没有 `InvalidObjectName`）。
+        assert_code(ApiError::InvalidObjectName, "InvalidArgument", 400);
     }
 }

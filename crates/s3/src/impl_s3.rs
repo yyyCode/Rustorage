@@ -16,6 +16,7 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, S3};
 
 use crate::errors::to_s3_error;
+use crate::validate::validate_object_key;
 
 /// S3 门面。构造参数是 trait 对象，不是引擎类型——s3 层看不到 `ErasureSet`。
 ///
@@ -88,6 +89,8 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        // 写入入口：两条命名规则都在这里挡（DESIGN §6.3 + 盘上别名）。
+        validate_object_key(&req.input.key).map_err(to_s3_error)?;
         let data = match req.input.body {
             // `Bytes` 不实现 `Extend<u8>`，`try_concat()` 在这里用不了；
             // 先收集成 `Vec<Bytes>` 再拼接。
@@ -115,6 +118,9 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // 读路径也必须拦：`..` 在盘层是 Fatal(FatalKind::PathEscape)，不拦会一路
+        // 变成 500；而不合法的 key 是客户端的错（400），不是「服务端坏了」。
+        validate_object_key(&req.input.key).map_err(to_s3_error)?;
         // 闭合 Range 需要对象长度，先 head 拿 size 再带 range get——MVP 不流式，
         // 两次调用可接受，不必为此改 `ObjectStore` trait。
         let info = self
@@ -170,6 +176,7 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        validate_object_key(&req.input.key).map_err(to_s3_error)?;
         // 与 get_object 同形，但调 `head_object`——否则 HEAD 会把整份对象读进内存再丢掉。
         let info = self
             .store
@@ -189,6 +196,7 @@ impl S3 for RstoreFs {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        validate_object_key(&req.input.key).map_err(to_s3_error)?;
         self.store
             .delete_object(&req.input.bucket, &req.input.key)
             .await
@@ -1098,5 +1106,41 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    // ---- Task 5.7: 命名校验 ----
+
+    /// PUT 一个非法 key，断言 `400 InvalidArgument`。
+    async fn put_key_expect_invalid_argument(key: &str) {
+        let (status, _headers, body) = call_on(
+            mock_service(Arc::new(MockStore::default())),
+            request("PUT", &format!("/test-bucket/{key}"), b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "PUT {key} 应回 400，body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidArgument",
+            "PUT {key} 的 error code，body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_key_with_reserved_first_segment_is_400() {
+        // 规则 1：第一段不得以 `.rstore` 开头（DESIGN §6.3）。
+        put_key_expect_invalid_argument(".rstore.sys/x").await;
+    }
+
+    #[tokio::test]
+    async fn put_key_that_aliases_on_disk_is_400() {
+        // 规则 2：`a//b` 会被 `fsx::resolve` 折成 `a/b`，两个不同的 S3 key 落到同一个
+        // 文件上——放行就是静默互相覆盖。规则 1 的测试对这条完全无感，必须单独测。
+        put_key_expect_invalid_argument("a//b").await;
     }
 }

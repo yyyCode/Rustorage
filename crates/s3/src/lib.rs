@@ -2,6 +2,7 @@
 
 pub(crate) mod errors;
 pub mod impl_s3;
+pub(crate) mod validate;
 
 #[cfg(test)]
 mod mock;
