@@ -6946,34 +6946,89 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 6.3: 启动与关闭编排
 
-**Files:** Create `crates/server/src/startup.rs`、`crates/server/src/config_load.rs`
+**Files:** Create `crates/server/src/startup.rs`、`crates/server/src/config.rs`、`crates/server/src/main.rs`
 
-- [ ] **Step 1: 写测试**
+> 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
+> 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
+
+#### 启动契约（原计划完全没有这一段）
+
+**6.4 的验收脚本与 5.9 的三个冒烟脚本，全部依赖下面这些参数名与默认值。**
+任一处在实现时改了名，验收脚本就会以「unrecognized option」失败——而那是 M6 的最后一步。
+
+| 参数 | 必需 | 默认值 | 说明 |
+|---|---|---|---|
+| `--volumes <path>...` | 是 | 无 | **接受一个或多个路径**（`nargs(1..)`）。6.4 的脚本展开成 6 个独立参数传入 |
+| `--port <u16>` | 否 | `9000` | 只监听 `127.0.0.1`（MVP 不做 TLS，也不该对外） |
+| `--parity <u8>` | 否 | `default_parity(volumes.len())`（4.3） | 6 块盘时默认是 **3**（3+3），而验收脚本要 4+2 → 必须显式传 `--parity 2` |
+| `--access-key <str>` | 否 | **`rustorage`** | 加进 `SimpleAuth::from_single`（5.1） |
+| `--secret-key <str>` | 否 | **`rustorage-secret`** | 同上 |
+| `--metrics` | 否 | 关闭 | 打开 `/metrics`（6.2） |
+
+> **那两个默认凭据是 5.9 三个冒烟脚本硬编码的同一对值。** 两边不一致的表现是三个脚本
+> 齐刷刷 `403 SignatureDoesNotMatch`，而错误信息不会告诉你是配置对不上。
+> 改这里的默认值 = 改 `tests/compat/*.sh`，两处必须同时动。
+
+```bash
+# 6.4 的脚本实际会这么调（注意 --volumes 展开成 6 个参数、--parity 显式给 2）：
+cargo run -p rstore-server -- \
+    --volumes /tmp/rs/d1 /tmp/rs/d2 /tmp/rs/d3 /tmp/rs/d4 /tmp/rs/d5 /tmp/rs/d6 \
+    --parity 2 --port 9000
+```
+
+**不要为 MVP 引入配置文件、环境变量覆盖、TOML/YAML 解析。** 六个参数够用，
+而多一层配置来源就多一处「到底哪个在生效」的排查成本。
+
+#### 启动顺序
+
+解析参数 → 打开各盘（`LocalDisk::open`）→ 逐盘读 `format.json` →
+`rstore_meta::format::select_authoritative` → 构造 `ErasureSet` →
+`mark_stage(StorageReady)` → 起 HTTP 服务 → `mark_stage(FullReady)`。
+所有长生命周期任务绑定 `CancellationToken`。
+
+**格式校验必须复用 `crates/meta/src/format.rs` 里已有的两个函数，不要重写一份**：
+
+- `select_authoritative(&[FormatV1]) -> Result<FormatV1, FormatError>` —— 已经实现了
+  「按 `shared_identity()` 分组计票、不一致时报错」。注意它**拿到的是已经读出来的
+  `FormatV1` 列表**：读盘失败（`NotFound`）的盘**不进这个列表**，走下面那条路径。
+- `should_initialize(&[DiskError]) -> bool` —— 已经实现了「**仅当所有盘都返回
+  `NotFound`**（即一块盘都读不到 `format.json`）时才允许初始化」这条闸门。
+  它正是 `refuses_to_reformat_reachable_disks` 要测的东西：一盘有数据、一盘空白时，
+  错误列表里不全都是 `NotFound`，于是返回 `false`，启动必须**拒绝**。
+
+这两个函数在 Task 2.x 就写好了并有测试，6.3 只是调用者。
+
+- [ ] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test]
 async fn refuses_to_start_on_inconsistent_formats() {
-    // 两盘 format.json 的 shared_identity 不一致 → 启动失败且错误信息指明是哪些盘
+    // 两盘 format.json 的 shared_identity 不一致 → 启动返回 Err，
+    // **且错误信息里包含出问题的那块盘的路径**（断言 contains，
+    // 因为「启动失败」这件事本身不指明是哪块盘就没法运维）
 }
 
 #[tokio::test]
 async fn refuses_to_reformat_reachable_disks() {
-    // 一盘有数据、一盘空白 → 必须拒绝，不能把有数据的盘当新盘初始化
+    // 一盘写好 format.json、一盘是空目录 → 启动返回 Err，
+    // 且**不得**把那个空目录初始化成新盘（断言空目录里仍然没有 format.json）
 }
 
 #[tokio::test]
-async fn shutdown_cleanly_stops_accepting_then_drains() { }
+async fn shutdown_cleanly_stops_accepting_then_drains() {
+    // 可观察的两件事，缺一不可：
+    // (a) 关闭发起后，**新**连接被拒（不是 503，是不再 accept）；
+    // (b) 关闭发起**之前**已经接住的在飞请求，跑完并返回 200。
+    // 做法：起一个会 sleep 200ms 的 handler，先发一个请求、不 await，
+    // 再调 shutdown()，最后断言那个请求拿到 200，且随后新请求失败。
+    // **只断言「shutdown() 返回 Ok」等于没测**——那不碰请求生命周期。
+}
 ```
 
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
-启动顺序：解析配置 → 打开各盘 → 读/校验 `format.json` → 构造 `Pool` →
-`mark_stage(StorageReady)` → 起 HTTP 服务。
-关闭：停止接受新连接 → 等待在飞请求（带超时）→ 退出。
-所有长生命周期任务绑定 `CancellationToken`。
-
 ```bash
-git add crates/server/src/startup.rs crates/server/src/config_load.rs crates/server/src/main.rs
+git add crates/server/src/startup.rs crates/server/src/config.rs crates/server/src/main.rs
 git commit -m "feat(server): startup/shutdown orchestration with format validation
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -6994,9 +7049,23 @@ ENDPOINT=http://127.0.0.1:9000
 ROOT=/tmp/rs
 WORK=$(mktemp -d)          # 载荷与比对结果放服务端数据目录**之外**
 
-# 启动 6 盘 4+2 实例（4 数据分片 + 2 校验分片 = 6 块盘）
+# 本脚本自己直接调 `aws`（第 2 步起），所以**必须**在这里给凭据：
+# `tests/compat/*.sh` 里的 export 是子进程，出了那个脚本就没了。
+# 少了这三行，在有 ~/.aws/credentials 的开发机上能跑、在干净的 CI 上必然
+# 「Unable to locate credentials」，而这跟服务端毫无关系。
+# 这三个值必须与 Task 6.3 的默认参数（--access-key / --secret-key）一致。
+export AWS_ACCESS_KEY_ID=rustorage
+export AWS_SECRET_ACCESS_KEY=rustorage-secret
+export AWS_DEFAULT_REGION=us-east-1
+AWS="aws --endpoint-url $ENDPOINT"
+
+# 启动 6 盘 4+2 实例（4 数据分片 + 2 校验分片 = 6 块盘）。
+# **`--parity 2` 必须显式给**：6 块盘的默认 parity 是 3（见 Task 4.3 的 default_parity），
+# 那样 read_quorum = 6-3 = 3，下面「掉 2 块」还剩 4 块，离边界很远，测不到那条边界。
+# 给 2 之后 read_quorum = 6-2 = 4，掉 2 块恰好**只剩 4 块**——一步不多、一步不少，
+# 这是纠删码最有价值的那个用例；而下面引用的「4+2」注释也才对得上。
 mkdir -p $ROOT/{d1,d2,d3,d4,d5,d6}
-cargo run -p rstore-server -- --volumes $ROOT/d{1,2,3,4,5,6} --port 9000 &
+cargo run -p rstore-server -- --volumes $ROOT/d{1,2,3,4,5,6} --parity 2 --port 9000 &
 SERVER_PID=$!
 # 无论从哪一条 `set -e` 退出，都别把服务留在后台占着 9000：
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
@@ -7020,8 +7089,8 @@ bash tests/compat/rclone.sh
 #    必须 < 8 MiB：MVP 不支持 multipart，aws-cli 超阈值会自动改走分片上传。
 head -c 3000000 /dev/urandom > $WORK/payload.bin
 #    建桶：已存在时 `mb` 会失败，所以吞掉它的退出码，别让 `set -e` 在这里把脚本带走。
-aws --endpoint-url $ENDPOINT s3 mb s3://accept 2>/dev/null || true
-aws --endpoint-url $ENDPOINT s3 cp $WORK/payload.bin s3://accept/big.bin
+$AWS s3 mb s3://accept 2>/dev/null || true
+$AWS s3 cp $WORK/payload.bin s3://accept/big.bin
 
 # 3. 容错：停掉两块盘 —— **用 `mv` 把盘目录挪走，不要用 `chmod 000`**。
 #    本项目的开发与验收环境是 Windows（Git Bash），`chmod 000` 在那里是空操作：
@@ -7034,17 +7103,21 @@ mv $ROOT/d6 $ROOT/d6.off
 #    4+2 掉 2 块，read_quorum = 4，读**必须**成功且**内容逐字节相同**。
 #    原计划这一步只有一行「→ 读仍成功」的注释、没有任何命令——那等于什么都没测：
 #    分片读错、解码错位、返回截断的数据，这条注释全都发现不了。
-aws --endpoint-url $ENDPOINT s3 cp s3://accept/big.bin $WORK/degraded.bin
+$AWS s3 cp s3://accept/big.bin $WORK/degraded.bin
 cmp $WORK/payload.bin $WORK/degraded.bin
 
 # 4. 恢复，再读一次确认恢复没把数据改坏（同一条比对，但走的是另一条盘路径）。
 mv $ROOT/d5.off $ROOT/d5
 mv $ROOT/d6.off $ROOT/d6
-aws --endpoint-url $ENDPOINT s3 cp s3://accept/big.bin $WORK/healed.bin
+$AWS s3 cp s3://accept/big.bin $WORK/healed.bin
 cmp $WORK/payload.bin $WORK/healed.bin
 
 echo "ACCEPTANCE: OK"
 ```
+
+> **前置检查也要写**：`command -v aws >/dev/null || { echo "aws CLI 未安装" >&2; exit 1; }`
+> 放在 `set -euo pipefail` 之后。没有这一段时，缺 aws 会以「command not found」失败，
+> 看起来像是服务端的问题。
 
 > **两条比对（第 3、4 步）是这份脚本里唯一真正有诊断价值的部分**，别把它们退化成
 > `curl -f` 或者 `aws … >/dev/null`。`cmp` 失败会带出首个不同字节的偏移，
