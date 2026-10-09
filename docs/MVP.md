@@ -3202,13 +3202,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/store/src/pool.rs`
 - Create: `crates/store/src/testutil.rs`（`#![cfg(test)]` 的模块；M4 所有测试共用）
 - Modify: `crates/store/src/lib.rs`（加 `pub mod set; pub mod pool;` 与 `#[cfg(test)] mod testutil;`）
+- Modify: `crates/disk/src/faulty.rs`（加 `reset_call_count`；原因见下方 `inject_fault_on`）
 - Modify: `crates/store/Cargo.toml`（见下方「依赖」）
 - Test: `crates/store/src/set.rs` 的 `#[cfg(test)]`
 
 > **依赖（原计划的 Files 清单完全没提，缺了它 M4 一个测试都编译不过）：**
 > ```toml
 > [dev-dependencies]
-> tempfile.workspace = true
+> # tempfile 已由 Task 4.1 加过，不要重复声明（Cargo 会合并同名依赖，
+> # 重复写只会让 Cargo.toml 里出现两处同名项）。
 > rstore-disk = { workspace = true, features = ["fault-injection"] }
 > ```
 > 第二条是关键。`FaultyDisk` 在 `rstore-disk` 里是 `#[cfg(any(test, feature = "fault-injection"))]`
@@ -3330,6 +3332,13 @@ impl std::ops::Deref for TestSet {
 impl TestSet {
     /// 往第 `i` 块盘注入故障。`&self`（`FaultyDisk` 内部用 `Mutex`），
     /// 所以测试里 `let set = ...` 不必声明 `mut`。
+    ///
+    /// **实现时必须先调 `FaultyDisk::reset_call_count()` 再 `set_fault()`。**
+    /// `FaultyDisk` 的调用计数是「自构造以来」的累计值，`set_fault` 与 `clear_fault`
+    /// 都不重置它（见 `faulty.rs` 的文档）。不重置的话，
+    /// 「已经跑过一次 PUT 之后再注入 `FailAfter { calls: 2 }`」会立刻全部失败——
+    /// 因为计数器早就超过 2 了，于是测试得不到它想要的那个中断位置。
+    /// 在这里统一成「从注入这一刻起再放行 `calls` 次」，语义才与直觉一致。
     pub fn inject_fault_on(&self, i: usize, fault: Fault);
     /// 撤销第 `i` 块盘的故障，回到正常行为。
     pub fn clear_fault_on(&self, i: usize);
@@ -3347,6 +3356,13 @@ impl TestSet {
 /// **`set_with_disks(6, 2)` 读作「6 块盘、parity=2、data=4」**——整个 M4 的测试都用这个约定。
 pub async fn set_with_disks(total: u8, parity: u8) -> TestSet;
 ```
+
+> **`set_with_disks` 必须给每块盘一个独立的子目录**：盘 `i` 的根是 `{tmp}/disk{i}`，
+> 而不是把 `tmp.path()` 直接交给 6 块盘。同根的话这 6 块「盘」其实是同一个目录——
+> `disks()[i].write_all(rel, ..)` 写的是同一个文件，「6 副本、掉 2 块还能读」
+> 这些性质就全部退化成同义反复：测试照样全绿，但一块盘都没测到。
+> Task 4.8 的 `dirs_on(&set, i, ..)` 会对每个 `i` 返回同样的结果，
+> 那种断言看起来在逐盘校验，实际上只校验了一遍。
 
 > **原计划这里有个签名打架**：Task 4.3 写的是 `set_with_disks(6, 2)`（盘数, parity），
 > Task 4.4 却写成了 `set_with_disks(6, |_| None).await` / `set_with_disks(n, fault)`
@@ -3604,65 +3620,317 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:**
 - Create: `crates/store/src/put.rs`
-- Test: `crates/store/src/put.rs` 的 `#[cfg(test)]`
+- Modify: `crates/store/src/lib.rs`（加 `pub mod put;`）
+- Modify: `crates/store/Cargo.toml`（`[dependencies]` 加 `md-5.workspace = true`；见下方 etag）
+- Modify: `Cargo.toml`（`[workspace.dependencies]` 加 `md-5 = "0.10"`）
+- Test: 同文件 `#[cfg(test)]`
+
+> **前置**：4.1（写入器）、4.2（读取器）、4.3（`TestSet` 夹具）、4.4（`commit`）都必须已落地。
+> 而 4.3 的夹具依赖 Task 3.4 的 `FaultyDisk`，所以实际顺序是
+> **4.1 → 4.2 → 3.4 → 4.3 → 4.4 → 4.5**。
+
+#### 对象目录布局（M4 起冻结；GET / DELETE / 对账都按它找路）
+
+```
+<bucket>/<key>/<data_dir 的 uuid>/meta.xl        ← Task 4.6 的容器，PUT 一次写入
+<bucket>/<key>/<data_dir 的 uuid>/part.1         ← 该盘的**全部** block 串成的单个分片文件
+<bucket>/<key>/.staging-<txid>/…                 ← 写入中的暂存目录，提交前对读路径不可见
+```
+
+- `part.1` 这个名字在每块盘上都一样，但**内容各不相同**：它装的是「落在本盘上的那一份分片」。
+- 单部分对象（multipart 是 Phase 3）永远只有一个 `part.1`；多 block 只是把它写得更长。
+- 一个版本一个目录。`data_dir` 同时写进 header 的 `data_dir` 字段，所以**拿到元数据就知道目录名**，
+  不需要目录名与元数据之间的二次索引。
+- **暂存目录必须以 `.staging-` 开头。** 这不是命名偏好，是正确性前提：发现逻辑（4.7）
+  会跳过这个前缀的条目，从而保证「能被投票的目录」一定已经提交过。
+  如果没有这个前缀，一次「6 块盘都写完了暂存 meta、还没提交就崩了」的 PUT，
+  会让这个半成品目录在 6 块盘上各得一票、轻松越过 `read_quorum`——读到的就是半截数据。
+  详细推导见 Task 4.10。
+- meta 与 part 都先写进暂存目录，再由 `commit` 一次 rename 提交——
+  这样「元数据可见」与「分片可见」是同一个原子事件。
+  （4.4 里的 `write_probe` 只是给不写数据的提交测试造现场，PUT 自己会造。）
+
+#### 分片几何（读侧必须能独立复算，否则解不出来）
+
+- `BLOCK_SIZE: usize = 1 << 20`（1 MiB）。对象按它切块：
+  `n = max(1, size.div_ceil(BLOCK_SIZE))`。
+- 第 `k` 块的明文长度 `L_k`：除最后一块外都是 `BLOCK_SIZE`，最后一块是
+  `size - (n-1) * BLOCK_SIZE`。
+- 第 `k` 块的**分片长度** `shard_size_k = even_ceil(div_ceil(L_k, data))`，
+  `even_ceil(x) = x + (x & 1)`。**必须取偶数**：`Codec::new` 要求 `shard_size`
+  为正偶数，而 `1 MiB / 3` 这类除不尽的情形不取整就构造不出编解码器。
+- 第 `k` 块拆成 `data` 个分片：分片 `i` 取 `[i * shard_size_k, (i+1) * shard_size_k)`，
+  **不足处补零**。拼回时是「`data` 个分片顺序相接，再截断到 `L_k`」——
+  也就是说补齐的零只可能出现在最后一个分片的尾部，这一条是读侧截断规则的依据。
+- 因此**每块盘的分片明文总长** `shard_len = Σ_k shard_size_k`，
+  由 `(size, data, BLOCK_SIZE)` 三者完全决定，读侧可以独立复算。
+- **传给 `BitrotShardWriter` / `BitrotShardReader` 的 `block_size` 是「满块的分片长度」**，
+  一个对象只算一次：
+
+  ```rust
+  /// 用于 bitrot 分块的分片步长。取 `min(size, BLOCK_SIZE)` 那一档，
+  /// 于是 `n == 1`（整对象不足一个满块）时它就是这一块自己的分片长度。
+  fn shard_step(size: u64, data: u8) -> u64 {
+      even_ceil(div_ceil(size.min(BLOCK_SIZE as u64), data as u64))
+  }
+  ```
+
+  最后一块的 `shard_size_k` 必不大于它（`even_ceil` 单调，而 `L_last ≤ BLOCK_SIZE`），
+  所以读取器「除最后一块外长度一律等于 `block_size`」的假设成立。
+- 分片在盘上的顺序就是块序：`part.1` = `[hash][block0 本盘分片][hash][block1 本盘分片] …`。
+
+#### 槽位映射
+
+`dist = distribution(&object_key, N)`，其中 `object_key = format!("{bucket}/{key}")`——
+**必须把 bucket 一起喂进去**，只用 key 的话同名对象在不同桶里退化成同一套分布。
+`dist` 是 `1..=N` 的排列，`dist[k] - 1` 是**第 k 号分片**所在的物理盘下标，
+分片编号沿用 `codec.encode` 的输出顺序：`0..data` 是数据分片，`data..N` 是校验分片。
+反查：盘 `d` 持有分片 `k` ⟺ `dist[k] == d + 1`。PUT 与 GET 必须用同一套映射，
+`distribution` 的输出还要过一遍 `is_valid_distribution`，不通过 → `StoreError::Internal`。
+
+#### etag
+
+`etag = hex(md5(data))`（小写十六进制）。**必须是真的 MD5**，不能是「内容哈希」之类的
+自造摘要：S3 客户端（`aws-cli` / `mc` / `rclone`）单部分上传后比对的就是 MD5，自造摘要
+会让它们在 PUT 成功之后报校验失败。这条到 M5 才发现的话，返工要重写整个 PUT 路径。
+
+#### 操作契约
+
+```rust
+pub const BLOCK_SIZE: usize = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutArgs {
+    pub bucket: String,
+    pub key: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutOut {
+    pub size: u64,
+    pub etag: String,
+    /// 本版本的数据目录名，同时是 header 里的 `data_dir`。
+    pub data_dir: Uuid,
+    pub version_id: Uuid,
+}
+
+impl ErasureSet {
+    pub async fn put_object(&self, args: PutArgs) -> Result<PutOut, StoreError>;
+}
+```
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[tokio::test]
-async fn put_small_object_inlines_it() {
-    let set = set_with_disks(6, 2).await;
-    let put = PutArgs { bucket: "b".into(), key: "small".into(), data: vec![1u8; 1000] };
-    let out = set.put_object(put).await.unwrap();
-    // 内联对象：各盘应存在 meta.xl，但没有 part.*（因为数据在 meta 里）
-    assert!(out.etag.len() > 0);
-    assert_eq!(out.size, 1000);
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{set_with_disks, TestSet};
 
-#[tokio::test]
-async fn put_large_object_creates_shards() {
-    let set = set_with_disks(6, 2).await;
-    let data = vec![7u8; 1_500_000];  // 触发多 block
-    let out = set.put_object(PutArgs { bucket: "b".into(), key: "big".into(), data }).await.unwrap();
-    assert_eq!(out.size, 1_500_000);
-    // 单部分对象：每块盘的数据目录里恰好一个分片文件 part.1（不是 6 个！）
-    for disk_idx in 0..6 {
-        let files = list_data_dir(&set, disk_idx, "b/big", &out.data_dir).await;
-        assert_eq!(files, vec!["meta.xl".to_string(), "part.1".to_string()], "disk {disk_idx}");
+    /// 某块盘上 `bucket/key/<data_dir>` 里的文件名（已排序）。
+    /// 走 `DiskAPI::list_dir` 而不是直接碰文件系统：夹具里的盘可能被 `FaultyDisk`
+    /// 包过，`list_dir` 才是被测试的那条路径。
+    async fn list_data_dir(
+        set: &TestSet,
+        disk_idx: usize,
+        key_rel: &str,
+        data_dir: &Uuid,
+    ) -> Vec<String> {
+        let d = set.disks()[disk_idx].as_ref().expect("该盘应当在线");
+        d.list_dir(&format!("{key_rel}/{data_dir}")).await.unwrap()
     }
-}
 
-#[tokio::test]
-async fn put_fails_below_write_quorum() {
-    let set = set_with_disks(6, 2).await;
-    set.inject_fault_on(0, Fault::Offline);
-    set.inject_fault_on(1, Fault::Offline);
-    set.inject_fault_on(2, Fault::Offline);
-    let r = set.put_object(PutArgs { bucket: "b".into(), key: "k".into(), data: vec![0u8; 1_000_000] }).await;
-    assert!(matches!(r, Err(StoreError::WriteQuorum { .. })));
+    #[tokio::test]
+    async fn put_small_object_inlines_it() {
+        let set = set_with_disks(6, 2).await;
+        let data = vec![1u8; 1000];
+        let out = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "small".into(),
+                data: data.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(!out.etag.is_empty());
+        assert_eq!(out.size, 1000);
+        // 内联对象的数据在 meta.xl 里，**不该有分片文件**。只断言 etag/size
+        // 是不够的——那样「悄悄走了大对象路径」的实现照样能过。
+        for i in 0..6 {
+            let files = list_data_dir(&set, i, "b/small", &out.data_dir).await;
+            assert_eq!(files, vec!["meta.xl".to_string()], "disk {i}");
+        }
+
+        // 「内联了」不等于「内联对了」：把 meta.xl 读回来解一遍。
+        // 本任务还不能用 GET（那是 Task 4.7），所以直接走 meta 容器的解码。
+        let d = set.disks()[0].as_ref().unwrap();
+        let raw = d
+            .read_exact_at(
+                &format!("b/small/{}/meta.xl", out.data_dir),
+                0,
+                d.stat(&format!("b/small/{}/meta.xl", out.data_dir))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .size as usize,
+            )
+            .await
+            .unwrap();
+        let meta = rstore_meta::decode(&raw).unwrap();
+        // 无版本化时版本键是 "null"（DESIGN §8.4）。
+        assert_eq!(meta.inline.get("null"), Some(&data[..]));
+    }
+
+    #[tokio::test]
+    async fn put_large_object_creates_shards() {
+        let set = set_with_disks(6, 2).await;
+        let data = vec![7u8; 1_500_000]; // 2 个 block：1 MiB + 451 424
+        let out = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "big".into(),
+                data: data.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.size, 1_500_000);
+
+        // 单部分对象：每块盘的数据目录里恰好一个分片文件 part.1。
+        // 原计划这里写「不是 6 个！」，是因为当时没定清楚 part.N 的 N 指什么——
+        // N 是**部分号**（multipart 的 part），不是盘号；MVP 只有一部分。
+        for i in 0..6 {
+            let files = list_data_dir(&set, i, "b/big", &out.data_dir).await;
+            assert_eq!(
+                files,
+                vec!["meta.xl".to_string(), "part.1".to_string()],
+                "disk {i}"
+            );
+        }
+
+        // 盘上字节数必须等于读侧能独立复算出来的那个数。写侧算错几何的话，
+        // GET 会以 Transient(ShortRead) 或 Corrupt 收场，而那时错误现场已经离原因很远了。
+        let step = shard_step(out.size, 4);
+        let shard_len = expected_shard_len(out.size, 4);
+        let expect_on_disk = rstore_checksum::bitrot_size(shard_len, step);
+        for i in 0..6 {
+            let d = set.disks()[i].as_ref().unwrap();
+            let st = d
+                .stat(&format!("b/big/{}/part.1", out.data_dir))
+                .await
+                .unwrap()
+                .expect("part.1 必须存在");
+            assert_eq!(st.size, expect_on_disk, "disk {i}");
+        }
+    }
+
+    /// etag 是给 S3 客户端比对的，必须是真 MD5。这条用已知向量钉死，
+    /// 免得后来有人「优化」成自造摘要——那会让客户端在 PUT 成功后报校验失败。
+    #[test]
+    fn etag_is_lowercase_hex_md5() {
+        assert_eq!(etag_of(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(etag_of(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[tokio::test]
+    async fn put_fails_below_write_quorum() {
+        let set = set_with_disks(6, 2).await;
+        for i in 0..3 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        let r = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                data: vec![0u8; 1_000_000],
+            })
+            .await;
+        // `WriteQuorum` 是 struct 变体，`matches!` 里必须带 `{ .. }`（原计划漏了，
+        // 那样写根本编译不过）。
+        assert!(matches!(r, Err(StoreError::WriteQuorum { .. })), "got {r:?}");
+
+        // 越界守卫：低于 quorum 时**一块盘都不该留下可见的最终目录**。
+        for i in 0..6 {
+            let d = set.disks()[i].as_ref().unwrap();
+            let entries = if d.stat("b").await.ok().flatten().is_some() {
+                d.list_dir("b").await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            assert!(entries.is_empty(), "disk {i} 上残留了 {entries:?}");
+        }
+    }
 }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p rstore-store put`
-Expected: 编译失败
+Expected: 编译失败（`put_object` / `etag_of` / `expected_shard_len` 都还不存在）
 
 - [ ] **Step 3: 实现**
 
-流程（严格按 DESIGN §12.1）：
+```rust
+/// `even_ceil`、`div_ceil`、`expected_shard_len`、`etag_of` 都是本模块的自由函数，
+/// 因为 GET 侧（Task 4.7）要复算同一套几何，测试也要用。
+pub(crate) fn even_ceil(x: u64) -> u64 { x + (x & 1) }
+pub(crate) fn shard_step(size: u64, data: u8) -> u64 { … }        // 见上
+pub(crate) fn expected_shard_len(size: u64, data: u8) -> u64 { … } // 见下
+pub(crate) fn etag_of(data: &[u8]) -> String { … }                // hex(md5)
+```
 
-1. 生成 `data_dir = Uuid::new_v4()`，`txid = Uuid::new_v4()`；
-2. 计算 `distribution(key, N)`；校验返回值合法，否则 `InternalError`；
-3. 小对象（`should_inline`）→ 构造只含内联数据的 `ObjectMeta`，直接写 `meta.xl`；
-4. 大对象 → 按 `BLOCK_SIZE = 1 MiB` 分块；每块：
-   a. 按分布排列把块拆到 `data` 个逻辑分片；
-   b. `codec.encode` 得到 `parity` 个校验分片；
-   c. 对 `N` 个槽位并行 `BitrotShardWriter::write_block`；
-   d. 统计成功数，`< write_quorum` → 中止并清理；
-5. 写 `meta.xl` 到各可用盘（同样要求 quorum）；
-6. `commit(set, staging, final, write_quorum)`；
-7. 返回 `{ size, etag(MD5 或 content hash), data_dir, version_id }`。
+`expected_shard_len` 的算法就是几何那一段的直接翻译，不另设规则：
+
+```rust
+pub(crate) fn expected_shard_len(size: u64, data: u8) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    let n = size.div_ceil(BLOCK_SIZE as u64);
+    let full = shard_step(size, data);
+    // 除最后一块外全是满块，长度一样。
+    let last_l = size - (n - 1) * BLOCK_SIZE as u64;
+    (n - 1) * full + even_ceil(last_l.div_ceil(data as u64))
+}
+```
+
+`put_object` 的流程：
+
+1. `txid = Uuid::new_v4()`、`data_dir = Uuid::new_v4()`；
+   `staging = format!("{bucket}/{key}/.staging-{txid}")`、
+   `final_rel = format!("{bucket}/{key}/{data_dir}")`。
+2. `dist = distribution(&format!("{bucket}/{key}"), N)`；`is_valid_distribution` 不过 → `Internal`。
+3. **先数盘**：可用盘（`disks()` 里 `Some` 且 `is_local` 不做额外过滤）数 `< write_quorum`
+   → 直接 `WriteQuorum`。连编码都别做——先编码再发现写不下去，等于白烧 CPU。
+4. **内联分支**：`rstore_common::consts::should_inline(size, /* versioned_bucket = */ false)`。
+   构造 `ObjectMeta`（版本键 `"null"`，`inline["null"] = data`，
+   `header.flags` 置 `INLINE_DATA`，body 的 `meta_sys` 写 `keys::INLINE_DATA` 标记），
+   `rstore_meta::encode(&meta)` → `disk.write_all("{staging}/meta.xl", &bytes)`。
+   **不要再写一份 `should_inline` 的阈值**：`consts` 里已经有一份，两份阈值必然漂移，
+   而漂移的后果是「写的时候按大对象、读的时候按内联」这种最难查的错。
+5. **大对象分支**：
+   a. 循环外为每块盘建一个 `BitrotShardWriter::new(disk, "{staging}/part.1", step as usize)`；
+   b. 逐 block：按几何拆 `data` 个分片（补零）→
+      `codec_cache.get(data as usize, parity as usize, shard_size_k as usize)` →
+      `codec.encode(&shards)` 得 `parity` 个校验分片；
+   c. 把 `N` 个分片按 `dist` 派到各自盘，`push_block(本盘那一份)`；
+   d. 维护每块盘的 `shard_len` 累加值（= 它那份分片的明文总长），写进 `part` 的
+      `PartInfo.size` / `actual_size`。
+   e. 每个块的 `shard_size_k` 不同 → `codec_cache` 会缓存多个 `Codec`，这是预期行为。
+6. 所有 writer `finish()`，收集成功盘数；`< write_quorum` → `WriteQuorum`。
+   **注意这里不要「清理已写的分片」**：失败时留下的暂存目录由对账流程回收
+   （DESIGN §12.2），主动清理反而会把 Task 4.10 想观察的崩溃残留抹掉，
+   让「残留可被识别」那条不变量测试变成空转。
+7. 写 `{staging}/meta.xl`：header 的 `size` / `ec_m` / `ec_n` / `data_dir` / `flags` /
+   `version_id`，body 的
+   `parts = [PartInfo { number: 1, size: shard_len, actual_size: size, etag, index: None }]`、
+   `ec_dist = dist`、`checksum_algo = ChecksumAlgo::Crc32c`、`storage_class = Standard`。
+   **`header.mod_time` 必须写**（`SystemTime::now()` 的纳秒数）——GET 靠它在一个 key
+   存在多个版本目录时选出最新的那个（见 4.7）。全程留 `None` 的话，覆盖写之后
+   「哪一份是新的」就没有比较依据了。
+8. `commit(&set, &staging, &final_rel, write_quorum)`。
+9. 返回 `PutOut { size, etag, data_dir, version_id }`（`version_id` 即 header 的 `version_id`）。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -3670,58 +3938,211 @@ Run: `cargo test -p rstore-store put`
 Expected: PASS
 
 ```bash
-git add crates/store/src/put.rs
+git add crates/store/ Cargo.toml Cargo.lock
 git commit -m "feat(store): PUT path with erasure encoding and inline fast path
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
----
-
 ### Task 4.6: 元数据仲裁
 
 **Files:**
 - Create: `crates/store/src/quorum.rs`
+- Modify: `crates/store/src/lib.rs`（加 `pub mod quorum;`）
+- Modify: `crates/store/Cargo.toml`（`[dev-dependencies]` 加 `rmp-serde.workspace = true`；
+  测试要自己拼 `ObjectBody` 造样本，而 store 的 `[dependencies]` 里没有 rmp-serde）
 - Test: 同文件 `#[cfg(test)]`
+
+#### 身份判定：直接比元数据的**线格式字节**
+
+`resolve_metadata` 要回答的是「这几块盘上的元数据是不是同一份」。判定方式就是
+`rstore_meta::encode(meta)` 的结果做 key —— 两份元数据一字不差时，编码出来必然逐字节相同；
+只要有一个字段不同，编码就不同。
+
+**不要引入额外摘要**（原计划写「SHA-256 over size/flags/mod_time/…」）：那条路要求先把字段
+挑出来再拼一遍，挑漏一个字段就是「两份不同的元数据被当成同一份」，而且要为此新增一个哈希依赖。
+容器的 `encode` 本来就是确定性的（固定数组 + 有序 map），字节相等就是最精确的判定。
+
+> **由此得出一条必须写进 `quorum.rs` 文档注释的规则：`ObjectBody.meta_sys` 里不得放
+> 逐盘可变的字段。** 身份是整份字节相等，任何一块盘上多出一个字节的差异都会被算成
+> 「另一种元数据」，进而把一次本来健康的读打成 `ReadQuorum`。
+> Phase 4 的 heal / purge 状态因此**不能**写进 `meta_sys`，要走 sidecar 文件。
+> 这条规则有测试守着（下面 `meta_sys_differences_split_the_vote`），不是口头约定。
+
+#### 操作契约
+
+```rust
+/// 在 `metas` 上做多数决。`metas` 的长度即盘数 `total`；
+/// `None` 表示该盘**没有返回**（既不计票，也不计为失败——它与「返回了一份不匹配的元数据」
+/// 是完全不同的两件事，而后者要计进各自的组）。
+///
+/// `read_quorum = metas.len() - parity`。票数最高的组达不到它就返回 `ReadQuorum`。
+/// 注意这里**不存在「多数决就返回第一名」的兜底**：3 票对 2 票对 1 票时第一名只有 3 票，
+/// 低于 4 就得以错误收场，不能因为「它最多」就把它扶正——那是把一次不确定的读
+/// 伪装成确定的结果。
+pub fn resolve_metadata(
+    metas: &[Option<ObjectMeta>],
+    parity: u8,
+) -> Result<ObjectMeta, StoreError>;
+```
+
+原计划给了 `resolve_metadata` 与 `resolve_metadata_opt` 两个函数，前者只是后者给每个元素套了
+`Some` —— 两个入口、同一套逻辑，调用方还得先想清楚自己有几种缺失。**合并成一个**。
+
+原计划末尾的「用 `u16` 位图做早停优化（`N ≤ 16`，零分配）」**删掉**：这里的输入本来就是
+一块内存里的 `&[Option<ObjectMeta>]`（所有盘都已经并行读完并反序列化完了），
+「早停」省不掉任何 IO；`N ≤ 16` 的规模下位图与 `Vec` 的差别测不出来。
+留一句注释说明为什么不早停，比留一段没人能验证收益的优化代码好。
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[test]
-fn identical_metadata_wins_quorum() {
-    // total=6, parity=2 → read_quorum=4。4 票 meta_a 达到 quorum。
-    let metas = vec![meta_a(), meta_a(), meta_a(), meta_a(), meta_b(), meta_b()];
-    let r = resolve_metadata(&metas, 6, 2).unwrap();
-    assert_eq!(r, meta_a());
-}
+#[cfg(test)]
+mod tests {
+    // 这些名字都在 `rstore_meta` 的 crate 根上（lib.rs 有 `pub use fileinfo::{…}`），
+    // 不用写 `fileinfo::` 前缀。
+    use rstore_meta::{
+        ChecksumAlgo, FileVersionHeader, Flags, ObjectBody, ObjectMeta, ShallowVersion,
+        StorageClass, VersionType,
+    };
 
-#[test]
-fn minority_metadata_cannot_win() {
-    // 3 票 < read_quorum 4 → 必须报错，不能「多数决」直接返回少数派
-    let metas = vec![meta_a(), meta_a(), meta_a(), meta_b(), meta_c(), meta_b()];
-    assert!(matches!(resolve_metadata(&metas, 6, 2), Err(StoreError::ReadQuorum)));
-}
+    use super::*;
+    use crate::error::StoreError;
 
-#[test]
-fn no_quorum_is_an_error() {
-    let metas = vec![meta_a(), meta_b(), meta_c()];
-    assert!(matches!(resolve_metadata(&metas, 6, 2), Err(StoreError::ReadQuorum)));
-}
+    /// 造一份确定的元数据。`tag` 只改 `meta_user` 里一个键——
+    /// 这是「两个不同版本」的最小可分辨差异。
+    fn meta_with_tag(tag: &str) -> ObjectMeta {
+        let header = FileVersionHeader {
+            size: 1000,
+            ec_m: 4,
+            ec_n: 6,
+            flags: Flags::USES_DATA_DIR,
+            ..Default::default()
+        };
+        let body = ObjectBody {
+            id: None,
+            parts: Vec::new(),
+            ec_dist: vec![1, 2, 3, 4, 5, 6],
+            checksum_algo: ChecksumAlgo::Crc32c,
+            storage_class: StorageClass::Standard,
+            meta_user: [("tag".to_string(), tag.to_string())].into_iter().collect(),
+            meta_sys: Default::default(),
+        };
+        let body_bytes = rmp_serde::to_vec(&body).unwrap();
+        ObjectMeta {
+            versions: vec![ShallowVersion { header, body: body_bytes }],
+            inline: Default::default(),
+            meta_ver: 1,
+        }
+    }
 
-#[test]
-fn volatile_fields_do_not_split_quorum() {
-    // 两个 meta 只有 heal/purge 状态不同，其余相同 → 必须归为同一组
-    let mut b = meta_a();
-    b.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
-    let metas = vec![meta_a(), meta_a(), b, meta_a()];
-    assert!(resolve_metadata(&metas, 6, 2).is_ok());
-}
+    fn some(metas: Vec<ObjectMeta>) -> Vec<Option<ObjectMeta>> {
+        metas.into_iter().map(Some).collect()
+    }
 
-#[test]
-fn missing_disks_are_not_failures() {
-    // 2 块盘返回 NotFound，4 块一致 → 成功
-    let metas = vec![Some(meta_a()), None, Some(meta_a()), None, Some(meta_a()), Some(meta_a())];
-    assert!(resolve_metadata_opt(&metas, 6, 2).is_ok());
+    #[test]
+    fn identical_metadata_wins_quorum() {
+        // total=6, parity=2 → read_quorum=4。4 票 a 达到 quorum。
+        let metas = vec![
+            meta_with_tag("a"), meta_with_tag("a"), meta_with_tag("a"),
+            meta_with_tag("a"), meta_with_tag("b"), meta_with_tag("b"),
+        ];
+        let r = resolve_metadata(&some(metas), 2).unwrap();
+        assert_eq!(r, meta_with_tag("a"));
+    }
+
+    #[test]
+    fn minority_metadata_cannot_win() {
+        // 3 票 < read_quorum 4 → 必须报错，不能「多数决」直接返回少数派。
+        let metas = vec![
+            meta_with_tag("a"), meta_with_tag("a"), meta_with_tag("a"),
+            meta_with_tag("b"), meta_with_tag("c"), meta_with_tag("b"),
+        ];
+        // struct 变体在 `matches!` 里必须带 `{ .. }`（原计划漏了，那样编译不过）。
+        assert!(matches!(
+            resolve_metadata(&some(metas), 2),
+            Err(StoreError::ReadQuorum { achieved: 3, required: 4 })
+        ));
+    }
+
+    #[test]
+    fn no_quorum_is_an_error() {
+        let metas = some(vec![meta_with_tag("a"), meta_with_tag("b"), meta_with_tag("c")]);
+        // total=3, parity=1 → read_quorum = 3 - 1 = 2，三组各 1 票，谁都不够。
+        assert!(matches!(
+            resolve_metadata(&metas, 1),
+            Err(StoreError::ReadQuorum { achieved: 1, required: 2 })
+        ));
+    }
+
+    #[test]
+    fn missing_disks_are_not_failures() {
+        // 2 块盘没返回、4 块一致 → 成功。`None` 不是失败，也不占票。
+        let metas = vec![
+            Some(meta_with_tag("a")), None,
+            Some(meta_with_tag("a")), None,
+            Some(meta_with_tag("a")), Some(meta_with_tag("a")),
+        ];
+        assert!(resolve_metadata(&metas, 2).is_ok());
+    }
+
+    /// 这条守的是「`meta_sys` 不得放逐盘可变字段」这条规则。它断言的**正是**
+    /// 「差异会拆票」这个看起来不友好的行为：等到 Phase 4 有人往 `meta_sys` 里塞
+    /// heal 状态时，这里会先红一次，逼他去看 `quorum.rs` 顶上那段说明。
+    #[test]
+    fn meta_sys_differences_split_the_vote() {
+        let mut healing = meta_with_tag("a");
+        let mut body: ObjectBody = rmp_serde::from_slice(&healing.versions[0].body).unwrap();
+        body.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
+        healing.versions[0].body = rmp_serde::to_vec(&body).unwrap();
+
+        let metas = vec![
+            meta_with_tag("a"), meta_with_tag("a"), meta_with_tag("a"),
+            healing,
+            meta_with_tag("a"), meta_with_tag("a"),
+        ];
+        // 5 票对 1 票，仍然达到 quorum=4——单个盘的差异不会**立刻**打垮读。
+        assert!(resolve_metadata(&some(metas), 2).is_ok());
+
+        // 但只要差异达到 parity+1 块盘，读就失败。这就是为什么逐盘可变字段不能进 meta_sys。
+        let mut all_diff = Vec::new();
+        for _ in 0..3 {
+            all_diff.push(meta_with_tag("a"));
+        }
+        for _ in 0..3 {
+            let mut m = meta_with_tag("a");
+            let mut b: ObjectBody = rmp_serde::from_slice(&m.versions[0].body).unwrap();
+            b.meta_sys.insert("x-rs-healing".into(), b"true".to_vec());
+            m.versions[0].body = rmp_serde::to_vec(&b).unwrap();
+            all_diff.push(m);
+        }
+        assert!(matches!(
+            resolve_metadata(&some(all_diff), 2),
+            Err(StoreError::ReadQuorum { .. })
+        ));
+    }
+
+    /// 身份判定的**全部依据**是「容器编码逐字节相等」。这条钉住编码是确定性的：
+    /// 同一份内存元数据编两次必须一模一样。若哪天有人给容器编码引入时间戳、
+    /// 随机顺序的 map 或指针地址，这里会红——而那时所有读都会开始报 ReadQuorum。
+    #[test]
+    fn identity_is_the_wire_encoding_and_is_deterministic() {
+        let a = meta_with_tag("a");
+        let b = meta_with_tag("a");
+        assert_eq!(rstore_meta::encode(&a).unwrap(), rstore_meta::encode(&b).unwrap());
+        assert_eq!(rstore_meta::encode(&a).unwrap(), rstore_meta::encode(&a).unwrap());
+    }
+
+    /// `VersionType::DeleteMarker` 必须能被编码进容器——DELETE（Task 4.8）靠它。
+    /// 顺带钉住「删除标记也是一份可投票的元数据」。
+    #[test]
+    fn delete_marker_metadata_round_trips() {
+        let mut m = meta_with_tag("a");
+        m.versions[0].header.ty = VersionType::DeleteMarker;
+        m.versions[0].header.size = 0;
+        let bytes = rstore_meta::encode(&m).unwrap();
+        assert_eq!(rstore_meta::decode(&bytes).unwrap(), m);
+    }
 }
 ```
 
@@ -3733,26 +4154,23 @@ Expected: 编译失败
 - [ ] **Step 3: 实现**
 
 ```rust
-/// 全部盘都返回了元数据时使用。
 pub fn resolve_metadata(
-    metas: &[ObjectMeta],
-    total: u8,
-    parity: u8,
-) -> Result<ObjectMeta, StoreError>;
-
-/// 部分盘掉线时使用。`None` 表示该盘未返回（**不计为失败，也不计为票**）。
-pub fn resolve_metadata_opt(
     metas: &[Option<ObjectMeta>],
-    total: u8,
     parity: u8,
-) -> Result<ObjectMeta, StoreError>;
+) -> Result<ObjectMeta, StoreError> {
+    // 用线格式字节当 key。HashMap<Vec<u8>, (u8, &ObjectMeta)> 即可；
+    // 元素个数 ≤ 16，不需要任何优化结构。
+    // 编码失败（理论上不会，但 encode 返回 Result）→ 该盘这一票作废，
+    // 按「未返回」处理，并在 tracing 里记一笔。
+    …
+    let total = metas.len() as u8;
+    let read_quorum = total.saturating_sub(parity);
+    // 票数最高的组若 < read_quorum → ReadQuorum { achieved, required }
+}
 ```
 
-- 身份哈希：SHA-256 over `size / flags / mod_time / version_id / data_dir / parts`，
-  **显式排除** `x-rs-healing`、`x-rs-purge-status` 等易变键；
-- 按身份哈希分组计票，取票数最高组；`< read_quorum` → `StoreError::ReadQuorum`；
-- `None`（盘未返回）**不计为失败**，也**不计为票**——语义与「返回了不匹配的元数据」不同；
-- 早停优化：用 `u16` 位图记录已返回的槽位（`N ≤ 16`，零分配）。
+`achieved` 填**获胜组的票数**（不是「返回了元数据的盘数」）：读失败时运维要看到的是
+「最强的那份共识有多强」，不是「有几块盘活着」。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -3760,59 +4178,276 @@ Run: `cargo test -p rstore-store quorum`
 Expected: PASS
 
 ```bash
-git add crates/store/src/quorum.rs
-git commit -m "feat(store): metadata quorum with identity-hash voting
+git add crates/store/
+git commit -m "feat(store): metadata quorum over wire-encoding identity
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
-
----
 
 ### Task 4.7: GET 路径
 
 **Files:**
 - Create: `crates/store/src/get.rs`
+- Modify: `crates/store/src/error.rs`（**加 `NotFound` 变体**——GET / DELETE / 对账都要用它）
+- Modify: `crates/store/src/lib.rs`（加 `pub mod get;`）
 - Test: 同文件 `#[cfg(test)]`
+
+> **`StoreError` 缺 `NotFound`**：4.1 定的五个变体里没有它，而「对象不存在」既不是
+> 磁盘错误、也不是 quorum 不足、更不是布局或内部错误。硬塞进任何一个都会让调用方
+> 分不清「真的没有」和「读失败」——M5 要把这两者映射成完全不同的 HTTP 状态码
+> （404 vs 500）。所以本任务先把变体补上：
+>
+> ```rust
+> #[error("not found")]
+> NotFound,
+> ```
+
+#### 契约
+
+```rust
+/// 闭区间 `[start, end]`。M5 的 S3 层负责把 `bytes=a-b` / `bytes=a-` / `bytes=-n`
+/// 三种写法解析并裁剪到这个形状，store 层只认闭区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetOut {
+    /// **请求范围内**的字节。不是整个对象。
+    pub data: Vec<u8>,
+    /// 整个对象的原始长度（不是 `data.len()`）——S3 的 `Content-Range` 要它。
+    pub size: u64,
+    pub etag: String,
+    pub data_dir: Uuid,
+}
+
+impl ErasureSet {
+    /// `range` 为 `None` 时返回整个对象。
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<GetOut, StoreError>;
+}
+```
+
+**「发现 + 仲裁 + 选出胜出目录」要抽成一个可复用的函数**，因为 Task 4.8 的 GC 与
+Task 4.10 的对账都要问同一个问题「现在哪个目录是权威的」：
+
+```rust
+/// 找到 `bucket/key` 当前权威的版本目录及其实元数据。
+/// `Ok(None)` = 所有盘上都没有这个对象（或最新版本是删除标记）；`Err(ReadQuorum)` = 有数据但选不出。
+pub(crate) async fn resolve_version(
+    set: &ErasureSet,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(String, rstore_meta::ObjectMeta)>, StoreError>;
+```
+
+`get_object` 的第一步就是调它。**「最新版本是删除标记 → `Ok(None)`」这条语义放在
+`resolve_version` 里**，别让调用方各自判一次：DELETE 之后的 GC（4.8）与对账（4.10）
+对「这个目录还算不算活数据」必须给出同一个答案，两处各写一遍必然分叉。
+
+原计划写的 `set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap()`
+暗示了一个流式 reader 类型——**MVP 不做流式**：分片本来就整份读进内存再解码，
+再包一层 `AsyncRead` 只是给同一块内存加一层接口，还连带要定义「读到一半发现校验失败」
+该怎么办（HTTP 已经 200 发出去了，没法再改状态码）。返回 `Vec<u8>`，
+流式留到 M5 之后按需再做。相应地，原计划那条 `get_inlines_short_circuit_disk_reads`
+的空壳测试也一起重写（见下）。
+
+#### 怎么找到元数据
+
+PUT 把对象放在 `<bucket>/<key>/<data_dir>/meta.xl`，而 **GET 事先不知道 `data_dir`**——
+原计划第 2 步「并行读各盘 meta.xl」没说这个路径从哪来。规则是：
+
+1. 并行对每块可用盘 `list_dir("{bucket}/{key}")`，取**所有盘目录名的并集**作为候选版本目录。
+   一块盘返回 `NotFound`（它压根没这个对象）按「空列表」处理，不是失败。
+   **跳过所有以 `.staging-` 开头的条目**——那些是写到一半、还没提交的目录。
+   不跳的话，一个「6 块盘都写完了暂存 meta、没来得及提交」的现场会在 6 块盘上各得一票、
+   直接越过 `read_quorum`，于是 GET 会把半成品当成正式版本读出来。推导见 Task 4.10。
+2. 候选为空 → `StoreError::NotFound`。
+3. 对**每个候选目录** `c`：收集 `Vec<Option<ObjectMeta>>`（盘 `d` 上存在 `c/meta.xl` 且能解码
+   → `Some`，否则 `None`），跑 `resolve_metadata(&metas, parity)`。能过 quorum 的候选才算「成立」。
+4. 成立的候选可能有多个（覆盖写之后旧目录还没被 GC 掉，或 GC 中途崩溃）。取
+   **最新版本 `header.mod_time` 最大**的那个；`mod_time` 相同（理论上不会）时取 `version_id` 大的。
+   一个都不成立 → `ReadQuorum`。
+
+  > 这条正是「崩溃后至少还能读到一个版本」的实现：旧版本只在少数盘上（多数盘已被覆盖），
+  > 票数过不了 quorum，自然被淘汰；新版本在多数盘上，胜出。
+  > 但也正因为如此，**PUT 必须给 header 写上 `mod_time`**（`SystemTime::now()` 的纳秒数）——
+  > 全是 `None` 的话第 4 步就没有比较依据了。
+
+5. 胜出元数据的最新版本 `ty == VersionType::DeleteMarker` → `NotFound`。
+
+#### 读数据
+
+- **内联分支**：最新版本的 `flags` 含 `INLINE_DATA`（或 body 的 `meta_sys` 有
+  `keys::INLINE_DATA`）→ 直接从 `meta.inline.get(<version key>)` 取数据返回，
+  **一次都不碰 `part.*`**。版本键：无版本化桶是 `"null"`。
+- **分片分支**：对每块盘读 `<winner_dir>/part.1`，得到该盘的整份分片明文
+  （长度应等于 `expected_shard_len(size, data)`）；按 `block_size = shard_step(size, data)`
+  切成 `n` 段，第 `k` 段是 `[k*step, min((k+1)*step, shard_len))`。
+- 每块盘在块 `k` 上的那一段，是**分片号 `j` 满足 `dist[j] == d + 1`** 的那一份。
+- **`part.1` 读取失败（含 `Corrupt(BitrotMismatch)`）不中止整次读取**，只是把该盘的槽位置成
+  `None`：
+  - 一块坏盘对应一个缺失槽位，`decode` 用校验分片补回来——这正是纠删码存在的意义；
+  - 若坏盘多到可用槽位 `< data`，那就是 `ReadQuorum`。
+  - 反过来，**绝不要**把「有一块盘报错」直接上抛成整个 GET 失败：那等于一有 bitrot 就丢可用性。
+- 可用槽位数（成功读回且过了 bitrot 校验的盘数）`< read_quorum`（= `data`）→ `ReadQuorum`。
+  注意 `read_quorum == data == decode` 的最小需求，两者天然一致。
+- `codec = codec_cache.get(data, parity, shard_size_k as usize)`，
+  `slots` 长度必须是 `N`；`codec.decode(&slots)` 得到 `data` 个数据分片 →
+  顺序相接 → **截断到 `L_k`**（补齐的零在最后一个分片尾部）→ 追加到输出。
+- 全部块拼完后，输出长度必须等于 `size`——不等就是 `Internal`（这是本函数自己的
+  不变量，读到了不一致的长度却照常返回，就是在静默丢数据）。
+
+#### Range 的处理与一个明确的限制
+
+MVP 里 `read_all` 是读取器唯一的入口（4.2 特意不暴露 `read_block`，见那节的说明），
+所以 **Range 请求仍然会把整份分片读进来、把所有块解码出来，最后才切出 `[start, end]`**。
+也就是说 Range 省的是网络与 S3 层的内存，没省磁盘 IO。
+
+原计划写的「Range 请求：只读取覆盖请求范围的 block」需要给读取器加一个带明确错误归类的
+区段接口，**这不是 MVP 必需的**——它只是性能优化。这里明确记为已知限制，
+等有真实的读放大数据再说，别为一个没有测量支撑的优化先拆掉 4.2 刚冻结的读取器接口。
+
+`range` 的边界检查：`start > end` 或 `end >= size` → `StoreError::Internal`。
+M5 的 S3 层必须先裁剪（`bytes=0-99999` 打在 1000 字节的对象上要返回 206 + `Content-Range: bytes 0-999/1000`，
+而不是报错），所以走到这里还越界就是 M5 的 bug，不该被 store 悄悄吸收。
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
-#[tokio::test]
-async fn get_returns_what_was_put() {
-    let set = set_with_disks(6, 2).await;
-    let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
-    set.put_object(put_args("b", "k", data.clone())).await.unwrap();
-    let got = set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap();
-    assert_eq!(got, data);
-}
+#[cfg(test)]
+mod tests {
+    use rstore_disk::faulty::Fault;
 
-#[tokio::test]
-async fn get_with_range_reads_only_needed_shards() {
-    // Range: bytes=1000-1999 → 结果等于 data[1000..2000]
-}
+    use super::*;
+    use crate::put::PutArgs;
+    use crate::testutil::set_with_disks;
 
-#[tokio::test]
-async fn get_survives_two_disk_losses() {
-    let set = set_with_disks(6, 2).await;
-    set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
-    set.inject_fault_on(0, Fault::Offline);
-    set.inject_fault_on(1, Fault::Offline);
-    let got = set.get_object("b", "k", None).await.unwrap().read_to_end().await.unwrap();
-    assert_eq!(got.len(), 2_000_000);
-}
+    fn put_args(bucket: &str, key: &str, data: Vec<u8>) -> PutArgs {
+        PutArgs { bucket: bucket.into(), key: key.into(), data }
+    }
 
-#[tokio::test]
-async fn get_fails_closed_below_read_quorum() {
-    let set = set_with_disks(6, 2).await;
-    set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
-    for i in 0..3 { set.inject_fault_on(i, Fault::Offline); }
-    let r = set.get_object("b", "k", None).await;
-    assert!(matches!(r, Err(StoreError::ReadQuorum)), "must not return partial data");
-}
+    #[tokio::test]
+    async fn get_returns_what_was_put() {
+        let set = set_with_disks(6, 2).await;
+        // 跨 3 个 block，且不是 251 的整数倍 → 末块会被补齐，覆盖补零-截断那段几何。
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        set.put_object(put_args("b", "k", data.clone())).await.unwrap();
 
-#[tokio::test]
-async fn get_inlines_short_circuit_disk_reads() {
-    // 小对象应只读 meta.xl，不打开 part.* —— 用 FaultyDisk 让所有 part 读取失败来验证
+        let got = set.get_object("b", "k", None).await.unwrap();
+        assert_eq!(got.size, 3_000_000);
+        assert_eq!(got.data, data);
+    }
+
+    /// 小对象（1000 字节）远低于内联阈值，PUT 时数据进了 meta.xl，盘上**没有** part.1。
+    /// 这里在数据目录里塞一个内容完全错误的 `part.1` 诱饵：如果 GET 走了分片路径，
+    /// 它要么报错、要么返回垃圾；只要它返回正确的内联数据，就证明它确实没碰 part。
+    #[tokio::test]
+    async fn get_inlines_short_circuit_disk_reads() {
+        let set = set_with_disks(6, 2).await;
+        let data = vec![0x5Au8; 1000];
+        let out = set.put_object(put_args("b", "small", data.clone())).await.unwrap();
+
+        for i in 0..2 {
+            let d = set.disks()[i].as_ref().unwrap();
+            d.write_all(&format!("b/small/{}/part.1", out.data_dir), &[0xFFu8; 4096])
+                .await
+                .unwrap();
+        }
+
+        let got = set.get_object("b", "small", None).await.unwrap();
+        assert_eq!(got.data, data);
+    }
+
+    /// 内联对象也要支持 Range（小对象照样能被 `bytes=` 打）。
+    #[tokio::test]
+    async fn get_inline_object_with_range() {
+        let set = set_with_disks(6, 2).await;
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 7) as u8).collect();
+        set.put_object(put_args("b", "small", data.clone())).await.unwrap();
+
+        let got = set
+            .get_object("b", "small", Some(ByteRange { start: 100, end: 199 }))
+            .await
+            .unwrap();
+        assert_eq!(got.size, 1000);
+        assert_eq!(got.data, data[100..200]);
+    }
+
+    #[tokio::test]
+    async fn get_with_range_returns_the_right_slice() {
+        let set = set_with_disks(6, 2).await;
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        set.put_object(put_args("b", "k", data.clone())).await.unwrap();
+
+        let got = set
+            .get_object("b", "k", Some(ByteRange { start: 1000, end: 1999 }))
+            .await
+            .unwrap();
+        assert_eq!(got.size, 3_000_000);
+        assert_eq!(got.data, data[1000..2000]);
+    }
+
+    #[tokio::test]
+    async fn get_survives_two_disk_losses() {
+        let set = set_with_disks(6, 2).await;
+        set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
+        set.inject_fault_on(0, Fault::Offline);
+        set.inject_fault_on(1, Fault::Offline);
+
+        let got = set.get_object("b", "k", None).await.unwrap();
+        assert_eq!(got.data, vec![3u8; 2_000_000]);
+    }
+
+    #[tokio::test]
+    async fn get_fails_closed_below_read_quorum() {
+        let set = set_with_disks(6, 2).await;
+        set.put_object(put_args("b", "k", vec![3u8; 2_000_000])).await.unwrap();
+        for i in 0..3 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        let r = set.get_object("b", "k", None).await;
+        // struct 变体必须带 `{ .. }`。
+        assert!(
+            matches!(r, Err(StoreError::ReadQuorum { .. })),
+            "低于 read_quorum 时绝不能返回部分数据，got {r:?}"
+        );
+    }
+
+    /// 一块盘的 bitrot 不该打垮读——那是纠删码的用武之地。
+    /// 这一条与 `get_fails_closed_below_read_quorum` 一起，把「可用性」和
+    /// 「绝不给错数据」两侧都钉住。
+    #[tokio::test]
+    async fn get_reconstructs_around_one_corrupt_shard() {
+        let set = set_with_disks(6, 2).await;
+        let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 13) as u8).collect();
+        let out = set.put_object(put_args("b", "k", data.clone())).await.unwrap();
+
+        // 直接把 0 号盘上的分片文件内容改坏（这是真·静默损坏：写入者没参与，
+        // 大小都没变，只有 bitrot 校验能发现）。
+        let d = set.disks()[0].as_ref().unwrap();
+        let rel = format!("b/k/{}/part.1", out.data_dir);
+        let len = d.stat(&rel).await.unwrap().unwrap().size as usize;
+        let mut bytes = d.read_exact_at(&rel, 0, len).await.unwrap();
+        bytes[rstore_checksum::HASH_LEN] ^= 0xFF;
+        d.write_all(&rel, &bytes).await.unwrap();
+
+        let got = set.get_object("b", "k", None).await.unwrap();
+        assert_eq!(got.data, data, "一块盘损坏时必须靠校验分片重建，且结果必须正确");
+    }
+
+    #[tokio::test]
+    async fn get_missing_object_is_not_found() {
+        let set = set_with_disks(6, 2).await;
+        let r = set.get_object("b", "nope", None).await;
+        assert!(matches!(r, Err(StoreError::NotFound)), "got {r:?}");
+    }
 }
 ```
 
@@ -3823,16 +4458,14 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-流程（DESIGN §14.4）：
+按上面「怎么找到元数据」与「读数据」两节逐步实现。两个容易写错的地方：
 
-1. 计算 `distribution` 与目标 set；
-2. 并行读各盘 `meta.xl` → `resolve_metadata` 得权威元数据；
-3. 内联对象 → 直接从元数据返回，**不碰 part**；
-4. 否则建 `BitrotShardReader` 并行按需读取，`< read_quorum` → `ReadQuorum`；
-5. `codec.decode` 重构数据分片，按分布排列拼回原顺序；
-6. 若 `available > data`（有多余分片）→ 异步入队读修复（MVP 可先只记录指标，
-   留 TODO 注释指向 Phase 4）；
-7. Range 请求：只读取覆盖请求范围的 block。
+- `list_dir` 对**不存在的目录**返回 `Err(NotFound)`，对**空目录**返回 `Ok(vec![])`。
+  发现逻辑里这两者都按「这块盘上没有版本目录」处理，别让 `Err(NotFound)` 冒泡成整次 GET 的
+  `NotFound`——只有当**所有**盘都找不到候选目录时才是对象不存在。
+- 解码时的 `slots` 长度必须是 `N`（`Codec::decode` 会校验），槽位下标是**分片号**，
+  不是盘号。把盘号当分片号写进去，正常路径下会以 `UnequalShardLength` 或
+  错误的解码结果收场——而后者如果恰好长度对得上，就会安静地返回错数据。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -3840,37 +4473,225 @@ Run: `cargo test -p rstore-store get`
 Expected: PASS
 
 ```bash
-git add crates/store/src/get.rs
-git commit -m "feat(store): GET path with inline fast path and fail-closed quorum
+git add crates/store/
+git commit -m "feat(store): GET path with version discovery, inline fast path, fail-closed quorum
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
-
----
 
 ### Task 4.8: DELETE 与覆盖写
 
 **Files:**
 - Create: `crates/store/src/delete.rs`
+- Modify: `crates/store/src/put.rs`（覆盖写提交成功后调用本模块的 GC）
+- Modify: `crates/store/src/lib.rs`（加 `pub mod delete;`）
 - Test: 同文件 `#[cfg(test)]`
+
+#### 两个机制，一句话各说清
+
+**覆盖写** 走的就是 `put_object` 的完整路径——新的 `data_dir`、新的暂存目录、新的提交。
+**没有「就地改写」这条路**：那样「元数据可见」与「分片可见」就不再是同一个原子事件，
+崩溃后会出现「目录名没变、内容半新半旧」的版本，而那种状态没有任何字段能识别出来。
+提交成功之后，才轮到 GC 去收拾旧目录。
+
+**DELETE** 写的是一个**删除标记版本**（`VersionType::DeleteMarker`，`size = 0`，
+不带 `USES_DATA_DIR`），走同样的暂存目录 + `commit`，quorum 用 `delete_quorum = N/2 + 1`。
+它不是「把文件删掉」，而是「写一个新的、更新的版本，而那个版本表示『没有对象』」。
+这么做的直接好处：`resolve_version`（4.7）发现最新版本是删除标记就返回「没有对象」，
+于是**并发读**不会出现「一半盘上新数据已提交、一半盘上旧数据刚被删」这种谁都读不出来的窗口。
+
+#### GC 规则（一条，写死，别再加特例）
+
+> **只在一块盘同时持有「胜出目录」时才删它上面别的目录。**
+
+逐盘执行：列出 `{bucket}/{key}` 下的所有目录；如果其中**包含胜出目录**，就把其余目录
+`remove_dir_all`；否则**一个都不动**。
+
+- 为什么要有「同时持有胜出目录」这个前提：覆盖写提交时可能有盘 rename 失败（落后盘）。
+  落后盘上只有旧目录，此时删掉旧目录会让这块盘变成**彻底没有这个对象**——
+  而它本来还能为读提供一份有效分片。留着的代价只是磁盘占用，删掉的代价是丢失一份冗余。
+- GC 是 **best-effort**：删除失败只记日志，不上抛。残留由对账（4.10）兜底。
+- GC **幂等**：`remove_dir_all` 对不存在的目录返回 `Ok`（`fsx::remove_dir_all` 已经这么实现了）。
+- 顺序不可颠倒：**先让 `commit` 成功，再 GC**。反过来就是在删还没提交的数据。
+
+```rust
+impl ErasureSet {
+    /// `delete_quorum = N/2 + 1`。
+    /// 对不存在的 key 也照样写删除标记并返回 `Ok`——这是 S3 的语义
+    /// （DELETE 是幂等的，重复删同一 key 都是 204）。
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StoreError>;
+}
+```
+
+#### 测试辅助
+
+GC 之后谁该在、谁不该在，要能一眼看出来。加一个测试专用的列举函数（放在 `delete.rs`
+的 `#[cfg(test)]` 里，4.10 用不到就不必提升到 `testutil`）：
+
+```rust
+/// 某块盘上 `bucket/key` 下还剩下哪些版本目录（已排序）。
+async fn dirs_on(set: &TestSet, disk_idx: usize, key_rel: &str) -> Vec<String> {
+    let d = set.disks()[disk_idx].as_ref().expect("该盘应当在线");
+    match d.list_dir(key_rel).await {
+        Ok(v) => v,
+        Err(DiskError::NotFound) => Vec::new(),
+        Err(e) => panic!("disk {disk_idx} list_dir 失败: {e:?}"),
+    }
+}
+```
 
 - [ ] **Step 1: 写失败测试**
 
+原计划这四条测试**全部只有一个 `/* … */` 注释，没有一行代码**——那不是测试，
+是待办事项列表。下面把它们写成真正的断言。
+
 ```rust
-#[tokio::test]
-async fn overwrite_replaces_latest() { /* put A, put B, get == B */ }
+#[cfg(test)]
+mod tests {
+    use rstore_common::error::DiskError;
+    use rstore_disk::faulty::Fault;
 
-#[tokio::test]
-async fn delete_makes_get_return_not_found() { /* put, delete, get → NotFound */ }
+    use super::*;
+    use crate::put::PutArgs;
+    use crate::testutil::{set_with_disks, TestSet};
 
-#[tokio::test]
-async fn delete_marks_before_gc() {
-    // 删除是「写新的元数据标记」而不是立即删数据；确认标记先落地
-}
+    fn put_args(bucket: &str, key: &str, data: Vec<u8>) -> PutArgs {
+        PutArgs { bucket: bucket.into(), key: key.into(), data }
+    }
 
-#[tokio::test]
-async fn gc_only_after_old_dir_outvoted() {
-    // 覆盖写后，旧 data_dir 在多数盘上被确认取代，才允许删除
+    async fn dirs_on(set: &TestSet, disk_idx: usize, key_rel: &str) -> Vec<String> { … }
+
+    #[tokio::test]
+    async fn overwrite_replaces_latest() {
+        let set = set_with_disks(6, 2).await;
+        let a = vec![1u8; 1_500_000];
+        let b = vec![2u8; 1_500_000];
+        set.put_object(put_args("b", "k", a)).await.unwrap();
+        let out_b = set.put_object(put_args("b", "k", b.clone())).await.unwrap();
+
+        assert_eq!(set.get_object("b", "k", None).await.unwrap().data, b);
+
+        // 覆盖写之后，每块盘上**只剩**胜出的那个目录。这条同时钉住 GC 真的跑了，
+        // 以及它没把胜出目录自己也一起删掉。
+        for i in 0..6 {
+            assert_eq!(
+                dirs_on(&set, i, "b/k").await,
+                vec![out_b.data_dir.to_string()],
+                "disk {i}"
+            );
+        }
+    }
+
+    /// GC 的安全边界：**只在一块盘也持有胜出目录时才删它的旧目录**。
+    /// 2 块盘在第二次 PUT 时掉线，它们只留下旧目录——那两份旧分片是有效冗余，
+    /// 删掉就等于把「6 副本 4+2」降级成「4 副本」。
+    #[tokio::test]
+    async fn gc_keeps_old_dir_where_the_new_meta_never_landed() {
+        let set = set_with_disks(6, 2).await;
+        set.put_object(put_args("b", "k", vec![1u8; 2_000_000])).await.unwrap();
+
+        for i in 0..2 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        let out_b = set.put_object(put_args("b", "k", vec![2u8; 2_000_000])).await.unwrap();
+        for i in 0..2 {
+            set.clear_fault_on(i);
+        }
+        // 覆盖写仍然成功：4 块盘 ≥ write_quorum(4)。
+        assert_eq!(set.get_object("b", "k", None).await.unwrap().data, vec![2u8; 2_000_000]);
+
+        for i in 0..2 {
+            let dirs = dirs_on(&set, i, "b/k").await;
+            assert_eq!(dirs.len(), 1, "disk {i} 应只留旧目录，got {dirs:?}");
+            assert_ne!(dirs[0], out_b.data_dir.to_string(), "disk {i} 上不该有胜出目录");
+        }
+        for i in 2..6 {
+            assert_eq!(
+                dirs_on(&set, i, "b/k").await,
+                vec![out_b.data_dir.to_string()],
+                "disk {i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_makes_get_return_not_found() {
+        let set = set_with_disks(6, 2).await;
+        set.put_object(put_args("b", "k", vec![3u8; 1_000_000])).await.unwrap();
+        assert!(set.get_object("b", "k", None).await.is_ok());
+
+        set.delete_object("b", "k").await.unwrap();
+        let r = set.get_object("b", "k", None).await;
+        assert!(matches!(r, Err(StoreError::NotFound)), "got {r:?}");
+    }
+
+    /// 删除标记是「先落地、后回收」：标记还没在多数盘上落地的那些盘，
+    /// 它们的分片**必须还在**。这条证明 DELETE 不是一个「先删数据再写标记」的
+    /// 危险实现——那样一旦标记写失败，数据就没了。
+    #[tokio::test]
+    async fn delete_marks_before_gc() {
+        let set = set_with_disks(6, 2).await;
+        let out = set.put_object(put_args("b", "k", vec![4u8; 1_000_000])).await.unwrap();
+
+        // 让 2 块盘写不了：删除标记只能在 4 块盘上落地，恰好等于 delete_quorum(6) = 4。
+        for i in 0..2 {
+            set.inject_fault_on(i, Fault::Offline);
+        }
+        set.delete_object("b", "k").await.unwrap();
+        for i in 0..2 {
+            set.clear_fault_on(i);
+        }
+
+        assert!(matches!(
+            set.get_object("b", "k", None).await,
+            Err(StoreError::NotFound)
+        ));
+        // 没拿到删除标记的那 2 块盘上，原始数据目录必须原样留着（它们是有效冗余，
+        // 而且此时删掉就真没东西可回收了）。有删除标记的 4 块盘上它才被回收。
+        for i in 0..2 {
+            let dirs = dirs_on(&set, i, "b/k").await;
+            assert_eq!(dirs, vec![out.data_dir.to_string()], "disk {i} 不该回收旧数据");
+        }
+        for i in 2..6 {
+            let dirs = dirs_on(&set, i, "b/k").await;
+            assert_eq!(dirs.len(), 1, "disk {i}, got {dirs:?}");
+            assert_ne!(dirs[0], out.data_dir.to_string(), "disk {i} 应只剩删除标记目录");
+        }
+    }
+
+    /// DELETE 幂等：S3 语义下重复删同一个 key 都是成功，删不存在的 key 也是成功。
+    #[tokio::test]
+    async fn delete_is_idempotent_and_ok_on_missing_key() {
+        let set = set_with_disks(6, 2).await;
+        set.delete_object("b", "never-existed").await.unwrap();
+        assert!(matches!(
+            set.get_object("b", "never-existed", None).await,
+            Err(StoreError::NotFound)
+        ));
+
+        set.put_object(put_args("b", "k", vec![5u8; 1_000_000])).await.unwrap();
+        set.delete_object("b", "k").await.unwrap();
+        set.delete_object("b", "k").await.unwrap();
+        assert!(matches!(
+            set.get_object("b", "k", None).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    /// 空目录清理是幂等的：对一个已经被 GC 干净的 key 再跑一次 GC 不该报错。
+    /// （`fsx::remove_dir_all` 对不存在的路径返回 `Ok`，这条钉住这条约定没被改掉。）
+    #[tokio::test]
+    async fn gc_is_idempotent() {
+        let set = set_with_disks(6, 2).await;
+        set.put_object(put_args("b", "k", vec![6u8; 1_000_000])).await.unwrap();
+        set.delete_object("b", "k").await.unwrap();
+        // 再删一次会写新的删除标记并再跑一轮 GC。
+        set.delete_object("b", "k").await.unwrap();
+        assert!(matches!(
+            set.get_object("b", "k", None).await,
+            Err(StoreError::NotFound)
+        ));
+    }
 }
 ```
 
@@ -3881,12 +4702,40 @@ Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-- **覆盖写**：新版本走与 PUT 完全相同的路径（新 `data_dir`）；
-  提交成功后，对旧 `data_dir` 执行「多盘投票」——若多数盘的当前元数据已不指向它，
-  才在**各盘**删除旧目录。投票未达多数 → 留着，交给对账；
-- **DELETE**：MVP 无版本化，语义是「写入一个删除记录作为最新版本，并触发旧数据 GC」；
-  删除记录本身也走 `commit`，quorum 用 `delete_quorum = N/2 + 1`；
-- **GC 幂等**：删除不存在的目录返回 `Ok`。
+`delete.rs` 里：
+
+```rust
+/// GC 掉 `bucket/key` 下除 `winner_dir` 之外的版本目录。
+/// **只在一块盘同时持有 `winner_dir` 时才动手**——见上文规则。
+pub(crate) async fn gc_superseded(
+    set: &ErasureSet,
+    bucket: &str,
+    key: &str,
+    winner_dir: &str,
+);
+```
+
+`delete_object` 流程：
+
+1. `txid = Uuid::new_v4()`、`marker_dir = Uuid::new_v4()`；
+   `staging = format!("{bucket}/{key}/.staging-{txid}")`、
+   `final_rel = format!("{bucket}/{key}/{marker_dir}")`。
+   （`.staging-` 前缀见 Task 4.5 的布局说明：没有它，未提交的半成品目录会在仲裁里胜出。）
+2. 构造删除标记 `ObjectMeta`：一个版本，`header.ty = VersionType::DeleteMarker`、
+   `size = 0`、`flags` 为空（**不要**置 `USES_DATA_DIR`，没有数据目录）、
+   `data_dir = None`、`mod_time = Some(now_nanos)`（`resolve_version` 靠它比新旧）。
+3. `rstore_meta::encode` → 逐盘 `write_all("{staging}/meta.xl", &bytes)`。
+4. `commit(set, &staging, &final_rel, delete_quorum(total))`。
+5. 失败 → `WriteQuorum { achieved, required: delete_quorum }`（复用变体即可，
+   `required` 字段本身就把数字说清楚了；为它单开一个变体只会让 M5 的错误映射多一个分支）。
+6. 成功 → `gc_superseded(set, bucket, key, &marker_dir.to_string()).await`。
+
+`put_object`（覆盖写）在 `commit` 成功之后加同一句
+`gc_superseded(set, bucket, key, &data_dir.to_string()).await`。
+
+> **`final_rel` 必须是本次写入独有的路径**（4.4 已经强调过）：因为「删除标记」也是一次
+> 正常的提交，它同样要 rename 到一个**新**目录。若两次删除共用同一个目录名，
+> 第二次的 rename 会因目标已存在而失败（`std::fs::rename` 对非空目录会报错）。
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
@@ -3894,151 +4743,551 @@ Run: `cargo test -p rstore-store delete`
 Expected: PASS
 
 ```bash
-git add crates/store/src/delete.rs
-git commit -m "feat(store): overwrite and delete with outvote-based GC
+git add crates/store/
+git commit -m "feat(store): overwrite and delete via tombstone commit with outvote-based GC
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
----
-
 ### Task 4.9: Quorum 边界测试套件
 
 **Files:**
-- Create: `crates/store/tests/quorum_boundaries.rs`
-- Modify: `crates/store/Cargo.toml`（`[dev-dependencies]` 加
-  `rstore-disk = { workspace = true, features = ["fault-injection"] }`）
+- Create: `crates/store/src/quorum_boundaries.rs`（模块顶部 `#![cfg(test)]`）
+- Modify: `crates/store/src/lib.rs`（加 `#[cfg(test)] mod quorum_boundaries;`）
+
+> **改位置：不再放 `crates/store/tests/`。** 集成测试是**独立编译的 crate**，
+> 它看不到 store 内部的 `#[cfg(test)] mod testutil`——而本任务要用
+> `set_with_disks` / `TestSet::inject_fault_on`。原计划把文件放在 `tests/` 下，
+> 那里的代码一行都编译不过。
+>
+> 想让它留在 `tests/` 只有两条路：把 `testutil` 变成永远公开的发布代码
+> （把测试夹具塞进对外 API），或者用 feature 门控（那样 `cargo test --workspace`
+> 不带 feature 时整个文件变成空的，测试**静默不跑**——比编译失败更糟）。
+> 所以跟 `testutil` 一样放 `src/` 里、用 `#![cfg(test)]` 门控。
+
+> **`[dev-dependencies]` 不用再动**：`rstore-disk = { workspace = true, features = ["fault-injection"] }`
+> 在 Task 4.3 已经加过了。原计划这里又列了一遍「Modify Cargo.toml」，
+> 照着做会出现第二处同名依赖声明。
+>
+> **注意**：`cargo test --workspace`**不带** `--features fault-injection` 时，
+> `rstore-disk` 的 `faulty` 模块对 store 可见吗？——可见。4.3 把它声明在 store 的
+> dev-dependencies 上并开了 feature，而 `cargo test --workspace` 会为 store 的测试构建
+> 启用该 feature（dev-dependencies 的 feature 在测试构建里生效）。这也是为什么必须在
+> dev-dependencies 里开 feature，而不是靠 `--features` 命令行。
 
 - [ ] **Step 1: 写测试（这是 DESIGN §19.2 的落地）**
 
 ```rust
+//! DESIGN §19.2 的边界矩阵。与其余测试的分工：这里**只回答**「掉几块盘、
+//! 哪种操作、该成功还是该失败」，具体数据是否正确由 4.7/4.8 各自的用例负责。
+#![cfg(test)]
+
+use rstore_disk::faulty::Fault;
+
+use crate::error::StoreError;
+use crate::get::ByteRange;
+use crate::put::PutArgs;
+use crate::testutil::{set_with_disks, TestSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Read,
+    Write,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    Ok,
+    ReadQuorum,
+    WriteQuorum,
+}
+
+/// 对象大小固定 2 MiB：跨 2 个 block，既走真编码路径又不至于让 7 个用例跑太久。
+const BODY: usize = 2 * 1024 * 1024;
+
+fn body(seed: u8) -> Vec<u8> {
+    let mut v = vec![0u8; BODY];
+    for (i, b) in v.iter_mut().enumerate() {
+        *b = (i as u8) ^ seed;
+    }
+    v
+}
+
+/// 建 set → 先健康地 PUT 一份 → 注入 `offline` 块掉线 → 执行 `op` → 断言结果类别。
+///
+/// **Read / Delete 用例必须先有一份成功写入的对象**：否则「读不存在的对象」
+/// 会以 `NotFound` 收场，而 `Expect::Ok` 的断言根本到不了——那是一种
+/// 「看起来测了，其实测的是别的东西」的假绿。PUT 阶段掉线数必须是 0。
+async fn run_case(offline: usize, op: Op, expect: Expect) {
+    let set = set_with_disks(6, 2).await;
+    let data = body(7);
+
+    if matches!(op, Op::Read | Op::Delete) {
+        set.put_object(PutArgs { bucket: "b".into(), key: "k".into(), data: data.clone() })
+            .await
+            .expect("健康状态下 PUT 必须成功");
+    }
+
+    for i in 0..offline {
+        set.inject_fault_on(i, Fault::Offline);
+    }
+
+    let r = match op {
+        Op::Read => set.get_object("b", "k", None).await.map(|out| {
+            // **`Ok` 必须是「内容正确」的 `Ok`。** 只断言 `is_ok()` 的话，
+            // 一个返回全零缓冲区的实现也能过。
+            assert_eq!(out.data, data, "offline={offline} 读回的内容不对");
+        }),
+        Op::Write => set
+            .put_object(PutArgs { bucket: "b".into(), key: "w".into(), data: body(9) })
+            .await
+            .map(|_| ()),
+        Op::Delete => set.delete_object("b", "k").await,
+    };
+
+    match (expect, r) {
+        (Expect::Ok, Ok(())) => {}
+        (Expect::Ok, Err(e)) => panic!("offline={offline} {op:?}: 期望成功，got {e:?}"),
+        (Expect::Ok, _) => unreachable!(),
+        (Expect::ReadQuorum, Err(StoreError::ReadQuorum { .. })) => {}
+        (Expect::WriteQuorum, Err(StoreError::WriteQuorum { .. })) => {}
+        (expect, Err(e)) => panic!("offline={offline} {op:?}: 期望 {expect:?}，got {e:?}"),
+        (expect, Ok(())) => panic!("offline={offline} {op:?}: 期望 {expect:?}，却成功了"),
+    }
+}
+
 /// 4+2 配置下的完整边界矩阵。每行是一个独立用例。
 #[tokio::test]
 async fn matrix_4_plus_2() {
     let cases = [
         // (掉线盘数, 操作, 期望)
-        (0, Op::Read,  Expect::Ok),
-        (2, Op::Read,  Expect::Ok),            // N-data = 2，刚好还能读
-        (3, Op::Read,  Expect::ReadQuorum),    // 低于 read_quorum
-        (2, Op::Write, Expect::Ok),            // parity = 2，刚好还能写
+        (0, Op::Read, Expect::Ok),
+        (2, Op::Read, Expect::Ok),          // read_quorum = 6 - 2 = 4，刚好还能读
+        (3, Op::Read, Expect::ReadQuorum),  // 低于 read_quorum
+        (0, Op::Write, Expect::Ok),
+        (2, Op::Write, Expect::Ok),         // write_quorum = data = 4
         (3, Op::Write, Expect::WriteQuorum),
-        (1, Op::Delete, Expect::Ok),
-        (4, Op::Delete, Expect::WriteQuorum),  // delete_quorum = 3
+        (1, Op::Delete, Expect::Ok),          // delete_quorum = 6/2 + 1 = 4，5 可用 ≥ 4
+        (3, Op::Delete, Expect::WriteQuorum), // 3 可用 < 4
+        (4, Op::Delete, Expect::WriteQuorum), // 2 可用 < 4
     ];
     for (offline, op, expect) in cases {
-        run_case(set_with_disks(6, 2).await, offline, op, expect).await;
+        run_case(offline, op, expect).await;
+    }
+}
+```
+
+> **原计划这张表里 `Delete` 那三行是错的**（`(1, Ok)`、注释写「delete_quorum = 3」、
+> `(4, WriteQuorum)`），上面已经按**定义**重算：`delete_quorum(6) = 6/2 + 1 = 4`。
+> 把这个缺陷记在这里不是留痕，是因为它属于一类反复出现的错：
+> **照抄手写注释里的常量**，而不是从 `consts` 里的定义重新算。
+> 以后要加行（比如 `(0, Op::Delete, …)`）同样按定义算，别信任何注释里的数字。
+
+```rust
+/// 少数盘静默损坏：读必须成功，而且结果必须正确。
+/// 「少数」的界是 `parity`——损坏盘数 ≤ parity 时纠删码能把数据重建出来。
+#[tokio::test]
+async fn bitrot_on_minority_still_reads_correctly() {
+    let set = set_with_disks(6, 2).await;
+    let data = body(3);
+    let out = set
+        .put_object(PutArgs { bucket: "b".into(), key: "k".into(), data: data.clone() })
+        .await
+        .unwrap();
+
+    for i in 0..2 {
+        corrupt_shard(&set, i, &out.data_dir).await;
+    }
+
+    let got = set.get_object("b", "k", None).await.unwrap();
+    assert_eq!(got.data, data, "损坏盘数 == parity 时必须靠校验分片重建");
+}
+
+/// **DESIGN §2 的 P1**：宁可报错，绝不返回错数据。
+/// 损坏盘数 > parity 时，能用于解码的份数已经不够，此时任何「尽力而为」的重建
+/// 都会产生一段**看起来正常但没有校验能发现**的字节。
+#[tokio::test]
+async fn bitrot_on_majority_exposes_corruption_not_wrong_data() {
+    let set = set_with_disks(6, 2).await;
+    let data = body(5);
+    let out = set
+        .put_object(PutArgs { bucket: "b".into(), key: "k".into(), data: data.clone() })
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        corrupt_shard(&set, i, &out.data_dir).await;
+    }
+
+    match set.get_object("b", "k", None).await {
+        Err(StoreError::ReadQuorum { .. }) => {}
+        // 宁可在这里因为「实现了某种超出 MVP 范围的恢复」而红，也不要放过
+        // 一个返回了错误字节却报成功的实现。
+        Ok(out) => panic!("损坏超过 parity 时返回了 {} 字节数据，未报错", out.data.len()),
+        Err(e) => panic!("期望 ReadQuorum，got {e:?}"),
     }
 }
 
-#[tokio::test]
-async fn bitrot_on_minority_still_reads_correctly() {
-    // 1 块盘写入静默损坏 → 读成功，且结果是正确的
-}
+/// 直接对盘上的分片文件做读-改-写，制造**真·静默损坏**：文件长度不变、
+/// 没有任何 API 报错，只有 bitrot 摘要能发现它。
+///
+/// 不用 `Fault::CorruptBytes` 的原因：那是在**写入时**变换 payload，
+/// 而这里要损坏的是**已经提交在地上**的数据——两者是完全不同的故障场景
+/// （前者模拟坏盘，后者模拟 bit rot / 静默错写），后者才是 heal 的触发条件。
+async fn corrupt_shard(set: &TestSet, disk_idx: usize, data_dir: &uuid::Uuid) {
+    use rstore_checksum::HASH_LEN;
 
-#[tokio::test]
-async fn bitrot_on_majority_exposes_corruption_not_wrong_data() {
-    // 3 块盘静默损坏 → 绝不返回错误数据：要么 ReadQuorum，要么能校验出不一致
+    let d = set.disks()[disk_idx].as_ref().expect("该盘应当在线");
+    let rel = format!("b/k/{data_dir}/part.1");
+    let len = d.stat(&rel).await.unwrap().expect("分片必须存在").size as usize;
+    let mut bytes = d.read_exact_at(&rel, 0, len).await.unwrap();
+    bytes[HASH_LEN] ^= 0xFF;
+    d.write_all(&rel, &bytes).await.unwrap();
 }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p rstore-store --test quorum_boundaries`
-Expected: 编译失败（`run_case` 未实现）
+Run: `cargo test -p rstore-store quorum_boundaries`
+Expected: 编译失败
 
-- [ ] **Step 3: 实现测试辅助函数并让测试通过**
+- [ ] **Step 3: 实现**
 
-`run_case` 负责：建 set → 注入对应数量的故障 → 执行操作 → 断言错误类型。
-**特别注意最后一条**：它验证的是 DESIGN §2 的 P1——宁可报错，不可返回错数据。
+本任务**没有产品代码要写**——它只写测试。唯一要动的是 `lib.rs` 里的模块声明。
+若某条用例红了，先按下面的顺序怀疑：
+
+1. 是 `run_case` 的用例表算错了（重新按 `read_quorum` / `write_quorum` / `delete_quorum`
+   的**定义**手算一遍，不要信注释）；
+2. 才是被测代码有 bug。
 
 - [ ] **Step 4: 提交**
 
-Run: `cargo test -p rstore-store --test quorum_boundaries`
+Run: `cargo test -p rstore-store quorum_boundaries`
 Expected: 全部 PASS
 
 ```bash
-git add crates/store/tests/quorum_boundaries.rs crates/store/Cargo.toml
+git add crates/store/
 git commit -m "test(store): quorum boundary matrix across failure modes
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
----
-
 ### Task 4.10: 崩溃点状态机测试
 
-**Files:** Create `crates/store/tests/commit_crash.rs`
+**Files:**
+- Create: `crates/store/src/reconcile.rs`（`scan_orphans` / `reclaim_orphans` 与 `#![cfg(test)]` 的用例）
+- Modify: `crates/store/src/lib.rs`（加 `pub mod reconcile;`）
+- Modify: `crates/store/src/put.rs` / `get.rs` / `delete.rs`（按 `scan_orphans` 的需要微调，见 Step 3）
+
+> **不再放 `crates/store/tests/`**，理由同 Task 4.9：集成测试看不到 crate 内的
+> `testutil`。用 `#![cfg(test)]` 模块放在 `src/`。
+>
+> 原计划第 4 步的 `git add crates/store/src/pool.rs` 也是错的——`pool.rs` 在 Task 4.3
+> 就建好了，本任务不动它。
+
+#### 先补一个洞：未提交的暂存目录能在仲裁里胜出
+
+原来的布局把暂存目录写成 `<bucket>/<key>/<txid>`，与最终目录 `<bucket>/<key>/<data_dir>`
+**只在名字上不同，形状完全一样**。于是这条路径是通的：
+
+> PUT 把 `meta.xl` 写进了 6 块盘的暂存目录，**还没提交**就崩了。
+> 重启后 `resolve_version`（4.7）列出 `bucket/key` 下的目录，看到这个 txid 目录在
+> **6 块盘**上都存在、内容还一模一样 → **6 票**，轻松越过 `read_quorum = 4`；
+> 它的 `mod_time` 又最新 → 胜出。然后去读它的 `part.1`——那是半截的。
+
+也就是说「可见性」不变量会直接破掉，而且破法是「读到一个半成品」而不是报错。
+
+修法是让两者在**发现阶段就不可混淆**：
+
+```
+<bucket>/<key>/.staging-<txid>/     ← 暂存目录：以 `.staging-` 开头
+<bucket>/<key>/<data_dir>/          ← 已提交的版本目录
+```
+
+- `resolve_version` 的发现阶段（4.7）**跳过所有以 `.staging-` 开头的条目**；
+- `reclaim_orphans` 把 `.staging-*` 一律删除——按定义它们就是没提交成功的；
+- 于是「至少有 `read_quorum` 块盘上存在**且已提交**」这个前提才成立，投票才有意义。
+
+> **对账不得与写入并发运行。** MVP 的实现是「列出 `.staging-*` 就删」，
+> 它分不清「上次崩溃留下的」和「此刻正在写的」。这条约束要写进
+> `reclaim_orphans` 的文档注释：对账是离线/运维动作，不是随写随跑的 GC。
+> 真要并发，得给暂存目录带上 pid/时间戳并按年龄判断——Phase 3 再说。
+
+这一步要改的地方：`put.rs` 与 `delete.rs` 里 `staging` 的拼法改成
+`format!("{bucket}/{key}/.staging-{txid}")`，`get.rs` 的发现阶段加前缀过滤。
+（4.4 的 `commit` 只是把人给的路径 `rename` 过去，不关心名字，不用改；
+它那几条测试里用的 `"b/o/tx1"` 是纯粹的字面路径，也不用改。）
+
+#### 崩溃怎么模拟，以及为什么不能只用 `FailAfter`
+
+`Fault::FailAfter` 让调用**返回错误**，而真的崩溃是**进程没了**。两者的差别很实在：
+返回错误之后代码还有机会跑清理逻辑（4.4 的回滚就是），而真崩溃没有。
+所以**不能**去断言「崩溃点之后必然留有残骸」——那是在断言一个实现细节。
+
+能断言的是两条**两种情况下都必须成立**的不变量：
+
+1. **可见性**：对象要么完全可见且内容正确，要么 `NotFound`。
+   绝不出现「可读但内容不对」、「读一半报错」、「读到半成品」。
+2. **对账不改观测结果**：跑一遍 `reclaim_orphans` 之后，每个对象的可读结果
+   （内容或 `NotFound`）必须与跑之前**完全一致**。
+   这条就是「垃圾回收不删活数据」的可执行定义——比「每个孤儿都能被回收」强得多：
+   后者几乎是同义反复（孤儿按定义就是能删的），前者才真的会抓到 GC 误删。
+
+> 因此下面用**中断调度**而不是「第一阶段/第二阶段」来编号用例：`FailAfter` 计的是
+> 「任意 `DiskAPI` 方法的调用次数」（见 `rstore_disk::faulty` 的文档），
+> 各盘的调用序列并不对齐，所以「第 k 次调用」落在哪个逻辑阶段本来就是不确定的。
+> 与其假装它精确，不如把它当成「在一批任意位置被打断」——而不变量恰好不依赖位置。
+
+#### 契约
+
+```rust
+impl ErasureSet {
+    /// 列出 `bucket` 下**没有被任何权威元数据引用**的目录（含 `.staging-*`）。
+    /// 返回的是相对 `bucket` 的路径（如 `k/.staging-3f2a…`），便于报错时直接看。
+    pub async fn scan_orphans(&self, bucket: &str) -> Result<Vec<String>, StoreError>;
+
+    /// 删除孤儿。**绝不删除活数据**：只在一块盘同时持有该 key 的权威目录时才动手
+    /// （与 Task 4.8 的 GC 同一条规则，直接复用 `gc_superseded`）。
+    /// 不与写入并发运行——见上文。
+    pub async fn reclaim_orphans(&self, bucket: &str) -> Result<(), StoreError>;
+}
+```
 
 - [ ] **Step 1: 写测试**
 
-把提交协议建模为一个可注入「崩溃点」的状态机。每个崩溃点执行「kill → 重建 Pool → 断言」：
-
 ```rust
-#[derive(Debug, Clone, Copy)]
-enum CrashPoint {
-    BeforeStagingWrite,
-    AfterShardWriteBeforeSync,
-    AfterSyncBeforeRename,
-    AfterPartialRename,
-    AfterRenameBeforeOldGc,
-    DuringOldGc,
-}
+#[cfg(test)]
+mod tests {
+    use rstore_disk::faulty::{Fault, FaultKind};
 
-#[tokio::test]
-async fn crash_recovery_invariants() {
-    for point in ALL_CRASH_POINTS {
-        let dir = tempfile::TempDir::new().unwrap();
-        let crashed = run_put_until_crash(&dir, point).await;
-        // 模拟重启：重新打开同一个目录
-        let pool = Pool::open(&dir.path()).await.unwrap();
-        let got = pool.get_object("b", "k").await;
+    use super::*;
+    use crate::error::StoreError;
+    use crate::put::PutArgs;
+    use crate::testutil::{set_with_disks, TestSet};
 
-        // 不变量 1（可见性）：对象要么完全可见且内容正确，要么 NotFound
-        match got {
-            Ok(r) => assert_eq!(r.read_to_end().await.unwrap(), EXPECTED_DATA, "point={point:?}"),
+    /// 对象内容取一段与长度绑定的可辨识字节，读到半截时断言能看出来。
+    fn expected() -> Vec<u8> {
+        (0..2_000_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// 在一批任意位置制造中断。**不声称每一个都落在某个特定阶段**——
+    /// 用 `FailAfter` 模拟的是「调用序列在某处断掉」，而各盘的调用计数本来就不对齐。
+    const POINTS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+
+    /// 一次中断之后，世界必须满足两条不变量。
+    async fn assert_invariants_hold(set: &TestSet, key: &str, tag: &str) {
+        let before = set.get_object("b", key, None).await;
+        match &before {
+            Ok(out) => assert_eq!(out.data, expected(), "{tag}: 读到了内容但内容不对"),
             Err(StoreError::NotFound) => {}
-            Err(e) => panic!("unexpected error at {point:?}: {e:?}"),
+            Err(e) => panic!("{tag}: 既不是可见也不是不存在: {e:?}"),
         }
 
-        // 不变量 2（可回收性）：任何残留都能被对账流程识别
-        let leftovers = pool.scan_orphans().await.unwrap();
-        for l in leftovers {
-            assert!(pool.can_reclaim(&l), "unreclaimable orphan at {point:?}: {l}");
+        set.reclaim_orphans("b").await.unwrap();
+
+        let after = set.get_object("b", key, None).await;
+        match (before, after) {
+            (Ok(a), Ok(b)) => assert_eq!(a.data, b.data, "{tag}: 对账改变了可读内容"),
+            (Err(StoreError::NotFound), Err(StoreError::NotFound)) => {}
+            (a, b) => panic!("{tag}: 对账改变了可见性: {a:?} -> {b:?}"),
         }
     }
-}
 
-#[tokio::test]
-async fn old_gc_crash_never_loses_both_versions() {
-    // 覆盖写两个版本后，在 GC 各阶段崩溃，重启后至少能读到其中一个版本
+    #[tokio::test]
+    async fn interrupted_put_leaves_a_consistent_world() {
+        // 守卫，跟 4.4 的 `ok_count` 是同一个用途：若没有任何一个中断点真的让
+        // PUT 成功过，「可见性」的 `Ok` 分支一次都进不去，整轮测试就是空转。
+        let mut ok_count = 0usize;
+
+        for &calls in POINTS {
+            let set = set_with_disks(6, 2).await;
+            for i in 0..6 {
+                set.inject_fault_on(
+                    i,
+                    Fault::FailAfter { calls, kind: FaultKind::Transient },
+                );
+            }
+            // 结果本身不关心（可能就是失败了），关心的是失败之后世界的状态。
+            let r = set
+                .put_object(PutArgs {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    data: expected(),
+                })
+                .await;
+            for i in 0..6 {
+                set.clear_fault_on(i);
+            }
+            if r.is_ok() {
+                ok_count += 1;
+            }
+
+            assert_invariants_hold(&set, "k", &format!("中断点 calls={calls}")).await;
+        }
+
+        // `calls = 0` 时一次调用都不放行，PUT 必失败；随着 `calls` 变大总会有几次放行到底。
+        // 若这里恒为 0，说明中断点设置得让整轮测试都是空转。
+        assert!(ok_count > 0, "没有任何一个中断点让 PUT 成功过，这轮测试没测到东西");
+    }
+
+    /// 覆盖写两个版本，在第二次写入（含 GC）的各处中断。
+    /// **至少能读到其中一个版本**——一个都不剩就是真丢数据。
+    #[tokio::test]
+    async fn gc_interruption_never_loses_both_versions() {
+        for &calls in POINTS {
+            let set = set_with_disks(6, 2).await;
+            set.put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                data: vec![1u8; 2_000_000],
+            })
+            .await
+            .unwrap();
+
+            for i in 0..6 {
+                set.inject_fault_on(
+                    i,
+                    Fault::FailAfter { calls, kind: FaultKind::Transient },
+                );
+            }
+            let _ = set
+                .put_object(PutArgs {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    data: vec![2u8; 2_000_000],
+                })
+                .await;
+            for i in 0..6 {
+                set.clear_fault_on(i);
+            }
+
+            // 第一个版本是**成功提交过**的，所以「两个都读不到」是硬失败。
+            match set.get_object("b", "k", None).await {
+                Ok(out) => assert!(
+                    out.data == vec![1u8; 2_000_000] || out.data == vec![2u8; 2_000_000],
+                    "calls={calls}: 读到的内容两个版本都不是"
+                ),
+                Err(StoreError::NotFound) => {
+                    panic!("calls={calls}: 两个版本都丢了")
+                }
+                Err(e) => panic!("calls={calls}: {e:?}"),
+            }
+
+            set.reclaim_orphans("b").await.unwrap();
+            assert!(
+                set.get_object("b", "k", None).await.is_ok(),
+                "calls={calls}: 对账之后对象反而不见了"
+            );
+        }
+    }
+
+    /// 暂存目录绝不能被当成一个版本候选。这条直接盯住 Step 3 修的那个洞：
+    /// 把 `meta.xl` 写进 `.staging-*` 之后不提交，GET 必须说「没有这个对象」，
+    /// 而不是把半成品读出来。
+    #[tokio::test]
+    async fn uncommitted_staging_dir_is_invisible_and_reclaimable() {
+        let set = set_with_disks(6, 2).await;
+
+        // 手工造一个「写完了 meta、没提交」的现场：6 块盘上都有同一个暂存目录。
+        let staging = "b/k/.staging-00000000-0000-0000-0000-000000000001";
+        let probe = rstore_meta::encode(&rstore_meta::ObjectMeta {
+            versions: vec![rstore_meta::ShallowVersion {
+                header: rstore_meta::FileVersionHeader {
+                    size: 2_000_000,
+                    ec_m: 4,
+                    ec_n: 6,
+                    ..Default::default()
+                },
+                body: rmp_serde::to_vec(&rstore_meta::ObjectBody {
+                    id: None,
+                    parts: Vec::new(),
+                    ec_dist: vec![1, 2, 3, 4, 5, 6],
+                    checksum_algo: rstore_meta::ChecksumAlgo::Crc32c,
+                    storage_class: rstore_meta::StorageClass::Standard,
+                    meta_user: Default::default(),
+                    meta_sys: Default::default(),
+                })
+                .unwrap(),
+            }],
+            inline: Default::default(),
+            meta_ver: 1,
+        })
+        .unwrap();
+        for i in 0..6 {
+            set.disks()[i]
+                .as_ref()
+                .unwrap()
+                .write_all(&format!("{staging}/meta.xl"), &probe)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            matches!(
+                set.get_object("b", "k", None).await,
+                Err(StoreError::NotFound)
+            ),
+            "未提交的暂存目录被当成了版本"
+        );
+
+        let orphans = set.scan_orphans("b").await.unwrap();
+        assert!(
+            orphans.iter().any(|o| o.contains(".staging-")),
+            "对账没把暂存目录认成孤儿: {orphans:?}"
+        );
+
+        set.reclaim_orphans("b").await.unwrap();
+        for i in 0..6 {
+            let entries = set.disks()[i]
+                .as_ref()
+                .unwrap()
+                .list_dir("b/k")
+                .await
+                .unwrap_or_default();
+            assert!(entries.is_empty(), "disk {i} 上还有残留: {entries:?}");
+        }
+    }
 }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p rstore-store --test commit_crash`
+Run: `cargo test -p rstore-store reconcile`
 Expected: 编译失败
 
 - [ ] **Step 3: 实现**
 
-需要：
-- `run_put_until_crash`：用 `FaultyDisk` 的 `FailAfter` 精确控制崩溃时机；
-- `Pool::scan_orphans` / `can_reclaim`：MVP 阶段实现为「识别 `.staging-*` 与
-  无对应元数据的 data-dir，且能安全删除」。这是 DESIGN §12.2 中「残留由对账清理」的最小实现。
+```rust
+pub async fn scan_orphans(&self, bucket: &str) -> Result<Vec<String>, StoreError> {
+    // 1. 列出 bucket 下的所有 key（每块盘各列一次，取并集——某块盘可能缺某些 key）。
+    // 2. 对每个 key 调 `get::resolve_version` 拿权威目录 `winner`。
+    // 3. 再列一次该 key 下的目录：`name != winner` 的一律是孤儿，
+    //    包含所有 `.staging-*`（它们永远不会是 winner，因为发现阶段就跳过了）。
+    // 4. 注意 `resolve_version` 返回 `Ok(None)`（删除了 / 从来没有过）时，
+    //    **该 key 下的所有目录都是孤儿**——这是 DELETE 之后 GC 没跑完的正常情形。
+}
+
+pub async fn reclaim_orphans(&self, bucket: &str) -> Result<(), StoreError> {
+    // 逐盘逐 key：只在这块盘**同时持有 winner 目录**时才删该盘上的非 winner 目录。
+    // 直接复用 `delete::gc_superseded`，不要再写一份判定。
+}
+```
+
+> **`ok_count` 那个守卫不能省。** 参考 Task 4.4 的 `never_reports_success_below_quorum`——
+> 那里踩过的坑一模一样：缺了守卫，`Ok` 分支一次都没进，测试却是绿的。
 
 - [ ] **Step 4: 提交**
 
-Run: `cargo test -p rstore-store --test commit_crash`
+Run: `cargo test -p rstore-store reconcile`
 Expected: 全部 PASS
 
 ```bash
-git add crates/store/tests/commit_crash.rs crates/store/src/pool.rs
-git commit -m "test(store): commit protocol crash-point invariant tests
+git add crates/store/
+git commit -m "test(store): interruption-point invariants and orphan reconciliation
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
-
----
 
 ## M5 — S3 接入
 
@@ -4049,13 +5298,64 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/s3/src/lib.rs`、`crates/s3/src/auth.rs`
 - Create: `crates/s3/src/impl_s3.rs`
 
-- [ ] **Step 1: 定义 api 契约**
+> **先看护栏脚本的 allowlist**（`scripts/check_layer_deps.py`）：
+> ```python
+> "rstore-store": {"rstore-common", "rstore-checksum", "rstore-erasure",
+>                  "rstore-meta", "rstore-disk"},
+> "rstore-api":   {"rstore-common"},
+> ```
+> 也就是说 **`store` 与 `api` 是兄弟，谁也不能依赖谁**——
+> `scripts/tests/test_check_layer_deps.py` 里有一条测试直接把
+> `rstore-api -> rstore-store` 钉成 `FORBIDDEN EDGE`。
+> 原计划这一步有两处直接违反它：
 
-`crates/api/src/lib.rs` 定义 `ObjectStore` trait（`put_object` / `get_object` /
-`head_object` / `delete_object` / `list_objects` / multipart 系列）与领域错误 `StoreError`。
+**（1）`StoreError` 不能由 api 定义。** 原计划写「api 定义 `ObjectStore` trait 与领域错误
+`StoreError`」，而 4.1 已经把 `StoreError` 定在 `rstore-store` 里了。api 看不到 store，
+所以 api 必须定义**自己的**错误类型，由组合根做一次映射：
 
-**绑定实现的位置是 `rstore-server/src/wiring.rs`，不是 `rstore-s3`**（DESIGN §5 规则 R4）。
-`rstore-s3` 只持有 `Arc<dyn ObjectStore>`，由构造参数注入：
+```rust
+// crates/api/src/error.rs
+/// API 层错误。**不是** `rstore_store::StoreError` 的别名——store 与 api 之间没有依赖边，
+/// 两者只能各定一份，再由 `rstore-server` 映射。
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("not found")]
+    NotFound,
+    #[error("read quorum not reached")]
+    Unavailable,
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("internal: {0}")]
+    Internal(String),
+}
+```
+
+M5 的 `Task 5.8: 错误映射` 就是把 `ApiError` 映到 S3 错误码；`StoreError → ApiError`
+的转换写在组合根（`rstore-server`），它是唯一同时看得见两边的 crate。
+
+**（2）绑定实现不能直接 `impl ObjectStore for ErasureSet`。** 原计划说「绑定实现的位置是
+`rstore-server/src/wiring.rs`」——位置对，但**孤儿规则不允许**：`ObjectStore` 是外部 trait、
+`ErasureSet` 是外部类型，第三方 crate 里给「外 trait + 外类型」写 impl 编译不过。
+正确做法是在组合根里定义一个**本地**适配器类型：
+
+```rust
+// crates/server/src/wiring.rs
+struct EngineAdapter {
+    set: Arc<ErasureSet>,   // rstore-server 允许依赖 store
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for EngineAdapter {   // trait 外部、类型本地 → 合法
+    ...
+    // 每个方法把 StoreError 映射成 ApiError（越界/内部错误在这里归位）
+}
+```
+
+于是约束没变，还更强了：**`rstore-s3` 只持有 `Arc<dyn ObjectStore>`**，
+它的 `Cargo.toml` 永远不需要 `rstore-store`（allowlist 里 `rstore-s3` 只有
+`rstore-common` 与 `rstore-api`），可以拿 mock `ObjectStore` 单独测试。
+
+构造参数注入：
 
 ```rust
 pub struct RstoreFs {
@@ -4063,10 +5363,6 @@ pub struct RstoreFs {
     auth:  Arc<dyn AuthProvider>,
 }
 ```
-
-这样 `rstore-s3` 可以脱离引擎单独测试（传入 mock `ObjectStore`），
-且 `crates/s3/Cargo.toml` 永远不需要加 `rstore-store` 依赖——
-否则会与 DESIGN §5 的依赖表及 Task 0.2 的护栏脚本直接冲突。
 
 - [ ] **Step 2: 写集成测试（用 s3s 的测试工具或直接打 HTTP）**
 
