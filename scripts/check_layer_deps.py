@@ -90,13 +90,31 @@ def main():
             print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    # 明确按 UTF-8 解码，不用 sys.stdin。JSON 规范即要求 UTF-8，cargo 也按 UTF-8
+    # 输出；而 sys.stdin 用的是**区域编码**（Windows 上是 GBK）。依赖它意味着
+    # 解码行为随环境漂移，两种结果都是坏的：
+    #   - 解不开：checkout 路径里出现「一」(U+4E00) 这类常见汉字，GBK 就会在
+    #     E4 B8 80 的尾字节 0x80 上抛 UnicodeDecodeError；
+    #   - 解得开：字节碰巧凑成合法 GBK 对，于是静默乱码。当前 check() 只读
+    #     name/dependencies（纯 ASCII），乱码落在 manifest_path 之类字段上时
+    #     没有可见症状——但「护栏读到的输入随本机区域设置漂移」本身就是缺陷，
+    #     哪天多读一个字段就会变成误报或漏报。
+    # 前者以退出码 1 结束，正是最容易被误读成「发现违规」的那种失败。
+    # CI 在 Linux 上永远是 UTF-8，这类问题只在本机出现，最难发现。
     try:
-        meta = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
+        meta = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
         print(f"ERROR: 无法解析 cargo metadata 输出：{e}", file=sys.stderr)
         return 2
 
-    violations = check(meta)
+    # 合法 JSON 不等于预期的结构。cargo 若改了输出格式，这里必须落回 2
+    # （护栏故障），而不是让 KeyError/TypeError 冒出去变成 1。
+    try:
+        violations = check(meta)
+    except (KeyError, TypeError) as e:
+        print(f"ERROR: cargo metadata 结构不符合预期：{e!r}", file=sys.stderr)
+        return 2
+
     for v in violations:
         print(v)
     return 1 if violations else 0

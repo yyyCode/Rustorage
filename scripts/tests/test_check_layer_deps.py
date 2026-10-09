@@ -6,10 +6,13 @@
 
 运行：python3 scripts/tests/test_check_layer_deps.py
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
@@ -51,8 +54,6 @@ CASES = [
         pkg("rstore-scratch"),
         pkg("rstore-api", "rstore-store"),
     ]}, 1, "FORBIDDEN EDGE: rstore-api -> rstore-store"),
-
-    ("输入不是合法 JSON", None, 2, None),
 ]
 
 
@@ -72,6 +73,68 @@ def run_checker(payload):
         input=stdin, capture_output=True, text=True,
         encoding="utf-8", env=env,
     )
+
+
+def run_fixture_cases():
+    """执行全部 fixture 用例，返回失败描述列表。供 main() 与 pytest 共用。"""
+    failures = []
+    for label, payload, want_code, want_substr in CASES:
+        proc = run_checker(payload)
+        problems = []
+        if proc.returncode != want_code:
+            problems.append(f"退出码 {proc.returncode}，期望 {want_code}")
+        if want_substr is not None and want_substr not in (proc.stdout or ""):
+            problems.append(f"stdout 缺少 {want_substr!r}（实际 {proc.stdout!r}）")
+        if want_substr is None and want_code == 0 and (proc.stdout or "").strip():
+            problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
+        # 每个用例**至多**记一条：main() 的通过计数按「用例数 - 失败数」算，
+        # 一个用例记多条会让计数变成负数或虚高。
+        if problems:
+            failures.append(f"{label}: {'；'.join(problems)}")
+    return failures
+
+
+def test_fixture_cases():
+    """pytest 入口。
+
+    这 6 个 fixture 用例原本直接写在 main() 里，那样 `pytest` 只会收集到
+    几个 test_* 函数，子进程用例一条都不跑——测试看着全绿，实测只覆盖了
+    一小部分。整进一个 test_* 函数后，两种跑法覆盖同一批用例。
+    """
+    failures = run_fixture_cases()
+    assert not failures, "\n".join(failures)
+
+
+def test_invalid_json_reports_on_stderr_only():
+    """退出码 2 的路径必须只写 stderr。
+
+    诊断若混进 stdout，CI 里会被当成违规清单。
+    """
+    proc = run_checker(None)
+    assert proc.returncode == 2, f"期望退出码 2，实际 {proc.returncode}"
+    assert (proc.stdout or "").strip() == "", f"stdout 必须为空，实际 {proc.stdout!r}"
+    assert "无法解析" in (proc.stderr or ""), f"stderr 缺少诊断：{proc.stderr!r}"
+
+
+def test_non_closed_table_makes_main_exit_2():
+    """白名单不自洽时 main 必须以 2 退出（护栏故障），而不是 1（发现违规）。
+
+    这条分支在 table_errors 之后、读 stdin 之前，所以 stdin 内容无关紧要。
+
+    stderr 必须捕获：main 会往那里打诊断，不拦的话自测跑绿也会在终端上
+    印出一行 `ERROR: 白名单引用了未登记的 crate`，看着像失败。
+    """
+    original_table, original_stdin = chk.ALLOWED, sys.stdin
+    chk.ALLOWED = {"rstore-api": {"rstore-typo"}}
+    sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(b""))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = chk.main()
+    finally:
+        chk.ALLOWED = original_table
+        sys.stdin = original_stdin
+    assert code == 2, f"期望退出码 2，实际 {code}"
+    assert "rstore-typo" in err.getvalue(), f"stderr 应指出违规项：{err.getvalue()!r}"
 
 
 def test_real_table_is_closed():
@@ -108,20 +171,13 @@ def test_dangling_reference_is_a_table_error():
 
 
 def main():
-    failures = []
+    failures = run_fixture_cases()
 
-    for label, payload, want_code, want_substr in CASES:
-        proc = run_checker(payload)
-        problems = []
-        if proc.returncode != want_code:
-            problems.append(f"退出码 {proc.returncode}，期望 {want_code}")
-        if want_substr is not None and want_substr not in proc.stdout:
-            problems.append(f"stdout 缺少 {want_substr!r}（实际 {proc.stdout!r}）")
-        if want_substr is None and want_code == 0 and proc.stdout.strip():
-            problems.append(f"合规输入不该有 stdout 输出，却有 {proc.stdout!r}")
-        failures += [f"{label}: {p}" for p in problems]
-
+    # 刻意不含 test_fixture_cases——它只是 run_fixture_cases 的 pytest 包装，
+    # 放进来会把同一批 fixture 用例跑两遍、并重复计数。
     unit_tests = (
+        test_invalid_json_reports_on_stderr_only,
+        test_non_closed_table_makes_main_exit_2,
         test_real_table_is_closed,
         test_closure_check_catches_non_closed_table,
         test_dangling_reference_is_a_table_error,

@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # 所有分支的 push 都跑：PR 触发只覆盖"开/更新 PR"这条路径，
+  # 而"推上去先看看红不红"是更早、更常用的一环。限定 branches: [main]
+  # 会让功能分支在开 PR 之前完全没有反馈。
   push:
-    branches: [main]
   pull_request:
 
 env:
@@ -30,13 +32,27 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # 护栏排在最前：架构违规要第一条报出来，不要等 build 跑完。
-      # 注意本任务假定 CI 镜像里有 python3。ubuntu-latest 自带；
-      # 若日后换成 slim 镜像，这一步会以退出码 2 硬失败。
+      # 解释器探测在 check-layer-deps.sh 里自己做，找不到会以退出码 2 硬失败。
       - name: 架构护栏（依赖方向）
         run: bash scripts/check-layer-deps.sh
 
+      # 这里刻意不复用上面那个 shell 包装器：它跑的是护栏本身，不是自测。
+      # 所以探测逻辑必须在这里重来一遍——直接写 `python3` 会把 Windows 上
+      # 那套 Store 别名问题原样搬进 CI（该假设偶然成立一次，不代表成立）。
       - name: 护栏自测
-        run: python3 scripts/tests/test_check_layer_deps.py
+        run: |
+          PYTHON=""
+          for cand in python3 python; do
+              if command -v "$cand" >/dev/null 2>&1 \
+                 && [ "$("$cand" -c 'print(1)' 2>/dev/null)" = "1" ]; then
+                  PYTHON="$cand"; break
+              fi
+          done
+          if [ -z "$PYTHON" ]; then
+              echo "ERROR: 找不到可用的 Python 解释器" >&2
+              exit 2
+          fi
+          "$PYTHON" scripts/tests/test_check_layer_deps.py
 
       - name: 格式
         run: cargo fmt --all -- --check
