@@ -7823,8 +7823,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 > 与 `create_canonical_request` / `calculate_signature` 这些拼装函数，
 > **没有「对一段字节算 SHA256」的公开函数**（`s3s::Sha256Sum` 只有
 > `from_hex` / `from_bytes` / `ct_equal`，也不能算）。所以给
-> `crates/s3/Cargo.toml` 的 `[dev-dependencies]` 加一行 `sha2 = "0.10"`，
-> 在测试里算 `hex(SHA256(body))`；空体仍可直接用 `EMPTY_STRING_SHA256_HASH`。
+> `crates/s3/Cargo.toml` 的 `[dev-dependencies]` 加一行 **`sha2 = "0.11"`**
+> ——**写 `0.10` 是错的**：`Cargo.lock` 里已经有 `sha2 0.11.0`（`s3s-sigv4` 的依赖），
+> 要 `0.10` 会让锁文件里同时存在两份 sha2（两份 `digest`、两份 `generic-array`/
+> `hybrid-array`），纯属白涨编译时间。在测试里用
+> `sha2::Digest::digest(&body)` 取出字节后**手写十六进制循环**拼字符串，
+> 不要指望 `LowerHex`（`digest 0.11` 的输出类型有没有实现它不确定，手写循环
+> 两版都成立）；空体仍可直接用 `EMPTY_STRING_SHA256_HASH`。
 > （另一条路是给 `x-amz-content-sha256` 填 `UNSIGNED-PAYLOAD`——`AmzContentSha256::parse`
 > 接受它，但 s3s 的**校验**路径是否放行未经核实，别把测试赌在这上面。）
 
@@ -7848,15 +7853,37 @@ async fn path_style_still_works_when_base_domain_is_set() {
 }
 
 #[tokio::test]
-async fn host_outside_base_domain_falls_back_to_cname_style() {
+async fn domain_outside_base_domain_becomes_its_own_bucket() {
     // **这条记录的是一个反直觉的行为，不是我们想要的功能。**
-    // base_domain = Some("example.com") 时，`Host: 127.0.0.1:9000` 既不等于
-    // base、也不是它的子域 → `SingleDomain` 的 CNAME 回退把**整个 host**
-    // 当成桶名（`127.0.0.1`）→ 404 NoSuchBucket。
-    // 断言的就是这个 404 + `NoSuchBucket`——把它钉成「已知行为」而不是意外。
-    // 它正是 Task 6.3 里 `--base-domain` 默认值必须留空的原因（见那里的说明）。
+    // base_domain = Some("example.com") 时，`Host: other.example.net` 既不等于
+    // base、也不是它的子域 → `SingleDomain` 的 CNAME 回退（默认开）把**整个 host**
+    // 当成桶名 → 404 `NoSuchBucket`。
+    //
+    // **用 `DELETE /`（DeleteBucket）而不是 `GET /`**：`MockStore::list_objects`
+    // 对不存在的桶回 `Ok(vec![])`（它不查桶是否存在），`GET /` 会得到 200，
+    // 根本区分不出桶名对不对；只有 `head_bucket` / `delete_bucket` 会真的回
+    // `NoSuchBucket`。`DELETE` 没有请求体，签名直接用 `EMPTY_STRING_SHA256_HASH`。
+    // （`HEAD /` 也能拿到 404，但 s3s 会剥掉 HEAD 的响应体，断言不了 `<Code>`。）
+    //
     // 若哪天 CNAME 回退被关掉，这条会失败，那时应当**同时**回来核对
-    // `--base-domain` 的默认值论证是否还成立。
+    // Task 6.3 里 `--base-domain` 默认值的论证是否还成立。
+}
+
+#[tokio::test]
+async fn ip_host_is_path_style_even_with_base_domain() {
+    // `Host: 127.0.0.1:9000` + base_domain = Some("example.com")。
+    //
+    // `parse_request_host`（`ops/mod.rs:511`）的条件是
+    // `if let (Some(host_header), Some(s3_host)) = .. && !is_socket_addr_or_ip_addr(host_header)`，
+    // **IP / socket 形式的 host 会把虚拟主机解析整段跳过**——`SingleDomain`
+    // 根本不会被调用，`Host` 头被丢弃，请求按纯 path-style 解析。
+    // 所以 `GET /` 仍然 200 且正文含 `ListAllMyBucketsResult`。
+    //
+    // 这条是 Task 6.3「脚本用 `127.0.0.1:9000`，不受 `--base-domain` 影响」那个
+    // 论证的依据。**它和上面那条一起读**：`127.0.0.1` 不会变成桶名，
+    // 而 `localhost:9000`（不是合法 `SocketAddr`/`IpAddr`）会——那时
+    // `SingleDomain` 的回退拿的是**没剥过端口的整个 host**（`host.rs:360-377`），
+    // 桶名成了 `localhost:9000`，桶名校验失败 → 400 `InvalidBucketName`。
 }
 
 #[tokio::test]
@@ -8199,15 +8226,27 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 | `--base-domain <str>` | 否 | **不给（= 纯 path-style）** | 传给 `build_service(.., base_domain)`（Task 5.11）开启虚拟主机寻址 |
 | `--metrics` | 否 | 关闭 | 打开 `/metrics`（6.2） |
 
-> **`--base-domain` 的默认值是「不给」，这条必须保持。** `tests/compat/*.sh` 与
-> `tests/acceptance.sh` 全部走 path-style（`mc` 与 `rclone` 都显式配了
-> `FORCE_PATH_STYLE=true`）。给它一个非空默认值之后，客户端发来的
-> `Host: 127.0.0.1:9000` 既不等于是 base domain、也不是它的子域，于是走
-> `SingleDomain` 的 **CNAME 回退**——**桶名变成 `127.0.0.1`**，四个脚本里
-> 每一个请求都 404 `NoSuchBucket`，而错误信息里不会出现「base-domain」这个词。
-> （注意机制不是「域名校验失败」：`strip_port_suffix` 会把端口剥掉，
-> `is_valid_domain` 也接受 `127.0.0.1:9000`。所以别想着靠
-> `with_cname_fallback(false)` 去救一个错误的默认值——那只是把另一个行为改掉。）
+> **`--base-domain` 的默认值是「不给」，这条必须保持。** 理由按重要性排：
+>
+> 1. **它是新能力，默认开启等于静默改变所有客户端的寻址语义**，哪怕绝大多数
+>    部署恰好不受影响，也不该由服务端替客户端做这个决定。
+> 2. **`SingleDomain` 的 CNAME 回退（默认开）会把任何「非 base、非 IP」的 host
+>    整个当成桶名**。最典型的是 `Host: localhost:9000`——它既不是合法
+>    `SocketAddr` 也不是 `IpAddr`，所以**不**走下面的豁免；`SingleDomain` 的回退
+>    拿的是**没剥过端口的整个 host**（`host.rs:360-377` 那一处 `parse_host_header`
+>    与自由函数不同，没有 `strip_port_suffix`），桶名成了 `localhost:9000`，
+>    桶名校验失败 → 每个请求 400 `InvalidBucketName`。运维看到的是「客户端全挂」，
+>    而报错里不会出现「base-domain」这个词。
+> 3. **换成 IP 也救不了**——`Host: 127.0.0.1:9000` **不受** `--base-domain` 影响：
+>    `parse_request_host`（`ops/mod.rs:511`）里 `!is_socket_addr_or_ip_addr(host_header)`
+>    这个条件会把 IP/socket 形式的 host 整段跳过，永远按 path-style 解析
+>    （Task 5.11 的 `ip_host_is_path_style_even_with_base_domain` 钉住它）。
+>    所以四个 shell 脚本虽然都用 `127.0.0.1:9000`，**改这个默认值并不会让它们变红**
+>    ——别把「脚本会红」当成这条默认值的依据，那个依据是错的。
+>
+> 也别想着靠 `with_cname_fallback(false)` 去救一个错误的默认值：那只是把
+> 反直觉的行为换成另一个反直觉的行为（「用别的域名指进来」的部署会静默变成
+> path-style），而 `build_service` 保留 CNAME 回退是刻意的决定。
 >
 > `build_service` 返回的 `Err`（域名不合法）**必须让进程以非零码退出并打印那条信息**，
 > 不要 `unwrap()`：Task 5.11 的 `invalid_base_domain_is_rejected_at_construction`
@@ -8637,7 +8676,7 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **默认凭据三处不一致**（Task 6.3 的 `--access-key`/`--secret-key` 默认值、`tests/compat/*.sh`、`tests/acceptance.sh`） | 三处写的是同一个 `rustorage` / `rustorage-secret`，但**没有任何东西能强制它们一致**——编译器看不见 shell 脚本。不一致的表现是三个脚本齐刷刷 403 `SignatureDoesNotMatch`。改动任一处时三处同改；6.4 的验收脚本是全链路唯一会同时用到它们的地方 |
 | **`--parity` 默认值与验收脚本的期望不一致** | `default_parity(6) = 3`（有测试钉住），而 6.4 要的是 4+2。所以 6.4 的脚本**必须显式**传 `--parity 2`；漏掉的话「掉 2 块」离边界还很远，那条最关键的容错验收会退化成一次普通读 |
 | **Task 5.9 的冒烟脚本依赖 Task 6.3 的启动编排** | 本计划里唯一一处 M5 依赖 M6。5.9 的 Step 2 只有在 6.3 落地后才能跑；这不是可以「先欠着」的排序，别在 5.9 里临时写一次性 main 绕过 |
-| **`--base-domain` 一旦有非空默认值，四个 shell 脚本全红** | Task 5.11 的能力由 `--base-domain` 门控，默认「不给」= 纯 path-style。**失败机制是 `SingleDomain` 的 CNAME 回退，不是域名校验失败**（端口会被 `strip_port_suffix` 剥掉，`is_valid_domain` 也接受带端口的 host）：给了 `--base-domain example.com` 之后，脚本发来的 `Host: 127.0.0.1:9000` 既不等于是 base、也不是它的子域，于是走 CNAME 回退，**桶名变成 `127.0.0.1`**，全部请求 404 `NoSuchBucket`——而报错里不会出现「base-domain」这个词。改这个默认值 = 同时改四个脚本的寻址模式 |
+| **`--base-domain` 一旦有非空默认值，用域名访问的客户端会被静默改变语义** | Task 5.11 的能力由 `--base-domain` 门控，默认「不给」= 纯 path-style。给了之后，**任何非 base、非 IP 的 host 都会被 `SingleDomain` 的 CNAME 回退整个当成桶名**：`Host: localhost:9000` → 桶名 `localhost:9000`（回退那处**不剥端口**，`host.rs:360-377`）→ 全部请求 400 `InvalidBucketName`，报错里没有「base-domain」这个词。**注意 `127.0.0.1:9000` 不受影响**（`parse_request_host` 的 `!is_socket_addr_or_ip_addr` 会整段跳过虚拟主机解析）——所以「四个脚本会红」这个论证是**错的**，别拿它当依据（正确论证见 Task 6.3 的启动契约表） |
 | **`validate_object_key` 的两条规则必须同时生效**（Task 5.7） | 规则 1（保留前缀）漏了 → 用户在 `.rstore*` 里写数据；规则 2（空段 / `.` / `..`）漏了 → 两个不同的 S3 key 落到同一个文件上**静默互相覆盖**。规则 2 还必须接在**读路径**上：只接写路径的话 `GET /b/../x` 会从盘层的 `Fatal(PathEscape)` 变成 500，而不是 400 |
 | **M6 的三个 task 各自都要改 `crates/server/src/lib.rs`** | 该文件在 M0 建骨架时只写了一行文档注释，**没有任何 `pub mod` 声明**。漏掉的话新文件根本不参与编译：`cargo test` 会显示全绿（只是少了几条用例），而 `readiness.rs` / `metrics.rs` 里的代码一行都没跑过。三个 task 的 `Files` 与 `git add` 里都已经列出它 |
 | **组合根 `wiring.rs` 原计划没有任何任务** | `rstore-api` 的 `ObjectStore` trait 与 `rstore-store` 的 `ErasureSet` 固有方法是两套类型，而 `api -> store` 是 FORBIDDEN EDGE——**只有 `rstore-server` 同时看得见两边**。没有这个适配器，6.3 的「构造 `ErasureSet`」之后没有任何东西能交给 `build_service`。已作为 Task 6.3 的第一个文件写进计划 |
