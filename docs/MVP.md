@@ -132,8 +132,6 @@ crates/server/
 # 根 tests/ 不会被 cargo 编译。根 tests/ 只放 shell 脚本。
 crates/disk/tests/
   faulty_disk.rs                    # Task 3.4
-crates/s3/tests/
-  compat_smoke.rs                   # Task 5.9 的 Rust 侧冒烟
 
 # **store 没有 tests/ 目录**：Task 4.9 / 4.10 原计划把用例放在
 # crates/store/tests/ 下，但集成测试是独立编译的 crate，看不到内部的
@@ -7155,6 +7153,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 > `head -c 1048576` 是刻意的；**不要**为了「测得更充分」把它调大，
 > 那会让冒烟脚本以「测到 multipart 的 501」的形式失败，而那个失败不是 compat 层能修的。
 
+> **aws-cli 的大版本不同，默认校验行为也不同，别把观察到的差异当成脚本 bug。**
+> **v2 从 2.23 起，`s3 cp` 默认发 `--checksum-algorithm CRC32`**（请求带
+> `x-amz-checksum-crc32`，并**要求响应把它回显回来**）；v1 默认不发任何校验和头。
+> 装了 v2 时跑出 `Checksum mismatch` 一类的错误，那是**真实的不兼容点**——正是本任务
+> 要收集的失败项，而不是脚本写错了。v1/v2 都试一遍，两者的差集才说明问题。
+> （本项目的开发机上装的是 **v1.46.1**，因为它能用 `pip install --user` 免管理员装。）
+
+
 > **执行顺序是 6.1~6.3 → 本任务 → 6.4，三段，不只是「6.3 之后」。**
 > 三个脚本都打 `http://127.0.0.1:9000`，需要一个**已经跑起来的服务**——而「启动编排 +
 > `--volumes/--port` 命令行」是 Task 6.3 才做的（`crates/server/src/main.rs` 由它创建）。
@@ -7256,7 +7262,11 @@ rclone mkdir rs/test-bucket
 mkdir -p "$WORK/src"
 head -c 1048576 /dev/urandom > "$WORK/src/1m.bin"
 rclone copy "$WORK/src" rs/test-bucket/
-rclone copy rs/test-bucket/1m.bin "$WORK/roundtrip.bin"
+# **必须是 `copyto`，不能写 `copy`。** `rclone copy <文件> <路径>` 把目标当**目录**，
+# 实际产出 `$WORK/roundtrip.bin/1m.bin`，而且**退出码是 0**（已实测：`rclone copy
+# src/a.bin dst/out.bin` 建出 `dst/out.bin/a.bin`，静默成功）。下面那行 `cmp` 于是
+# 变成「拿文件比目录」而失败，报错完全指不到真正的原因。`copyto` 是文件到文件的语义。
+rclone copyto rs/test-bucket/1m.bin "$WORK/roundtrip.bin"
 cmp "$WORK/src/1m.bin" "$WORK/roundtrip.bin"
 # `check` 会比对大小与 **ETag**——它正是 #3 那个「HEAD 的 ETag 必须与 LIST 的一致」
 # 的验收点。ETag 两处算法分叉时，这条会失败而 `cmp` 不会。
