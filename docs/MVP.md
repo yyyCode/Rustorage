@@ -262,7 +262,28 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 # 白名单语义：只允许表中列出的内部依赖边。表已按传递闭包补齐。
 set -euo pipefail
 
-cargo metadata --format-version 1 --no-deps | python3 - <<'PY'
+# 解释器探测：必须真正执行一段程序并核对输出，退出码不可信。
+# Windows 上 python3 可能是 Store/MSIX 别名：`python3 --version` 正常、
+# `python3 -c ''` 返回 0，但 `python3 -c 'print(1)'` 却是 Permission denied(126)。
+# 所以判据是「跑得出 1」，而不是「命令存在」或「退出码为 0」。
+PYTHON=""
+for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1 \
+       && [ "$("$cand" -c 'print(1)' 2>/dev/null)" = "1" ]; then
+        PYTHON="$cand"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: 未找到可用的 python3/python 解释器" >&2
+    exit 2
+fi
+
+# 注意：这里必须写成 python3 -c "$(cat <<'PY' ... PY)"。
+# 不能写成 `cargo metadata ... | python3 - <<'PY'`——管道虽先绑定 fd 0，
+# 但同一条命令上的 heredoc 重定向会覆盖它，于是 python 从 heredoc 读"程序"，
+# 而 json.load(sys.stdin) 读到 EOF。这是 shell 重定向语义，与平台无关。
+cargo metadata --format-version 1 --no-deps | "$PYTHON" -c "$(cat <<'PY'
 import json, sys
 
 ALLOWED = {
@@ -302,6 +323,7 @@ for pkg in meta["packages"]:
 
 sys.exit(1 if fail else 0)
 PY
+)"
 ```
 
 - [ ] **Step 2: 验证脚本在当前（合规）状态下通过**
@@ -345,9 +367,14 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
 await_holding_lock = "deny"
 ```
+
+> `all = { level = "warn", priority = -1 }` 的 `priority` 不能省。`await_holding_lock`
+> 本身属于 `all` 这个 lint group，而 Cargo **忽略表中的书写顺序**。两者同优先级时
+> clippy 报 `lint_groups_priority`（同优先级下的设置二义），`-D warnings` 会把它升级成
+> 硬错误，`clippy` 直接失败。降一档优先级才能让 `deny` 真正压住 group 的 `warn`。
 
 > `await_holding_lock = "deny"` 是刻意的：本项目大量使用锁保护磁盘状态，
 > 跨 `.await` 持有锁会静默造成死锁。让编译器替我们拦住它。
