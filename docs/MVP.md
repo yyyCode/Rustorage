@@ -96,27 +96,37 @@ crates/api/
   src/lib.rs                        # ObjectStore trait、领域错误、boundary 别名
 
 crates/s3/
-  src/lib.rs                        # s3s S3Service 装配
-  src/impl_s3.rs                    # impl S3 for RstoreFs
+  src/lib.rs                        # s3s S3Service 装配（构造时接收 Arc<dyn ObjectStore>，见 DESIGN §5 R4）
+  src/impl_s3.rs                    # impl S3 for RstoreFs —— 只持有 api trait，不依赖 rstore-store
   src/auth.rs                       # 静态 root 凭证的 AuthProvider
   src/errors.rs                     # 领域错误 → S3 错误码
+  src/validate.rs                   # 桶名 / 对象 key 校验（Task 5.7）
 
 crates/s3-compat/
   src/lib.rs                        # compat 中间件栈（按 §DESIGN 15.3 准入）
 
 crates/server/
-  src/main.rs                       # 入口
+  src/lib.rs                        # 可测试的服务装配（供集成测试调用）
+  src/main.rs                       # 瘦二进制入口，只调 lib（Task 6.3 创建）
+  src/wiring.rs                     # 组合根：把 rstore-store 的实现绑定到 rstore-api trait（DESIGN §5 R4）
   src/startup.rs                    # 启动编排
   src/readiness.rs
   src/metrics.rs
   src/config_load.rs
 
-tests/                              # workspace 级集成测试
-  faulty_disk.rs
-  quorum_boundaries.rs
-  commit_crash.rs
-  compat/aws_cli.sh
-  compat/mc.sh
+# 集成测试放在各自 crate 的 tests/ 下 —— 根目录是虚拟 workspace（无 [package]），
+# 根 tests/ 不会被 cargo 编译。根 tests/ 只放 shell 脚本。
+crates/disk/tests/
+  faulty_disk.rs                    # Task 3.4
+crates/store/tests/
+  quorum_boundaries.rs              # Task 4.9
+  commit_crash.rs                   # Task 4.10
+crates/s3/tests/
+  compat_smoke.rs                   # Task 5.9 的 Rust 侧冒烟
+tests/compat/                       # 仓库根，仅 shell 脚本，不参与 cargo 编译
+  aws_cli.sh
+  mc.sh
+  rclone.sh
 ```
 
 **设计单元边界：** 每个文件单一职责。`store/` 下按**操作**分文件（put/get/delete）而非按层，
@@ -176,7 +186,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 reed-solomon-simd = "3"
 proptest = "1"
 tempfile = "3"
+futures = "0.3"
+async-trait = "0.1"
+lru = "0.12"
 ```
+
+> `proptest` / `tempfile` 目前暂无引用方，它们会在 M1/M3 作为 `[dev-dependencies]` 加入。
+> 这是有意保留的，不是遗漏。
 
 - [ ] **Step 2: 写 rust-toolchain.toml**
 
@@ -223,56 +239,69 @@ git commit -m "chore: scaffold workspace with per-domain crates"
 
 ---
 
-### Task 0.2: 依赖方向护栏脚本
+### Task 0.2: 依赖方向护栏 + workspace 清单加固
 
 **Files:**
 - Create: `scripts/check-layer-deps.sh`
-- Create: `tests/layer_deps.rs`
+- Modify: `Cargo.toml`（`[workspace.package]` 加 `publish = false`；新增 `[workspace.lints]`）
+- Modify: 10 × `crates/*/Cargo.toml`（各加 `[lints] workspace = true`）
+- Modify: `rust-toolchain.toml`（固定版本）
 
-- [ ] **Step 1: 写护栏脚本**
+- [ ] **Step 1: 写**白名单**护栏脚本**
 
-脚本用 `cargo metadata` 取出依赖图，检查以下禁止边（对应 DESIGN §5 的 R1–R4）：
+**不要写成黑名单。** 黑名单（「这些边禁止」）有两个缺陷：新增跨层依赖时默认放行，
+以及看不见传递违规。改为**白名单**：为每个内部 crate 声明它允许直接依赖的内部 crate 集合。
+
+集合**已按传递闭包补齐**，因此只要每条直接边都在白名单内，就不可能存在
+「`api → X → store`」这类绕道违规——闭包完备性由本脚本的静态表保证。
+新增 crate 或新增跨层依赖都必须显式修改本表，改动会出现在 review diff 里。
 
 ```bash
 #!/usr/bin/env bash
+# 校验 DESIGN §5 的依赖方向规则（R1–R4）。
+# 白名单语义：只允许表中列出的内部依赖边。表已按传递闭包补齐。
 set -euo pipefail
 
-meta=$(cargo metadata --format-version 1 --no-deps)
+cargo metadata --format-version 1 --no-deps | python3 - <<'PY'
+import json, sys
 
-# 禁止边： from -> to
-FORBIDDEN=(
-  "rstore-api:rstore-store"
-  "rstore-api:rstore-disk"
-  "rstore-api:rstore-s3"
-  "rstore-common:rstore-meta"
-  "rstore-common:rstore-store"
-  "rstore-checksum:rstore-meta"
-  "rstore-checksum:rstore-store"
-  "rstore-erasure:rstore-store"
-  "rstore-disk:rstore-store"
-  "rstore-meta:rstore-store"
-  "rstore-s3:rstore-store"
-)
+ALLOWED = {
+    "rstore-common":    set(),
+    "rstore-checksum":  {"rstore-common"},
+    "rstore-erasure":   {"rstore-common"},
+    "rstore-meta":      {"rstore-common", "rstore-checksum"},
+    "rstore-disk":      {"rstore-common", "rstore-meta", "rstore-checksum"},
+    "rstore-store":     {"rstore-common", "rstore-checksum", "rstore-erasure",
+                         "rstore-meta", "rstore-disk"},
+    "rstore-api":       {"rstore-common"},
+    "rstore-s3":        {"rstore-common", "rstore-api"},
+    "rstore-s3-compat": {"rstore-common"},
+    # 组合根：允许看见全部（DESIGN §5 R4 规定绑定实现只在这里发生）
+    "rstore-server":    {"rstore-common", "rstore-checksum", "rstore-erasure",
+                         "rstore-meta", "rstore-disk", "rstore-store",
+                         "rstore-api", "rstore-s3", "rstore-s3-compat"},
+}
 
-fail=0
-for edge in "${FORBIDDEN[@]}"; do
-  from="${edge%%:*}"; to="${edge##*:}"
-  if echo "$meta" | python3 -c "
-import json,sys
-m=json.load(sys.stdin)
-name='$from'; dep='$to'
-for p in m['packages']:
-    if p['name']==name:
-        for d in p['dependencies']:
-            if d['name']==dep: sys.exit(0)
-sys.exit(1)
-"; then
-    echo "FORBIDDEN EDGE: $from -> $to"
-    fail=1
-  fi
-done
+meta = json.load(sys.stdin)
+fail = False
 
-exit $fail
+for pkg in meta["packages"]:
+    name = pkg["name"]
+    if name not in ALLOWED:
+        print(f"UNKNOWN CRATE: {name} 未在护栏表中登记 —— 新增 crate 必须显式登记其允许依赖")
+        fail = True
+        continue
+    for dep in pkg["dependencies"]:
+        dep_name = dep["name"]
+        if not dep_name.startswith("rstore-"):
+            continue                      # 只约束内部 crate
+        if dep_name not in ALLOWED[name]:
+            kind = dep.get("kind") or "normal"
+            print(f"FORBIDDEN EDGE: {name} -> {dep_name}  (kind={kind})")
+            fail = True
+
+sys.exit(1 if fail else 0)
+PY
 ```
 
 - [ ] **Step 2: 验证脚本在当前（合规）状态下通过**
@@ -280,20 +309,77 @@ exit $fail
 Run: `bash scripts/check-layer-deps.sh`
 Expected: 退出码 0，无输出
 
-- [ ] **Step 3: 验证脚本能抓到违规**
+- [ ] **Step 3: 验证脚本能抓到违规（两个用例，后者是黑名单会漏掉的）**
 
-临时在 `crates/api/Cargo.toml` 的依赖里加上 `rstore-store.workspace = true`，然后：
+用例 A —— 明显的违规。临时给 `crates/api/Cargo.toml` 加 `rstore-store.workspace = true`：
 
 Run: `bash scripts/check-layer-deps.sh`
-Expected: 输出 `FORBIDDEN EDGE: rstore-api -> rstore-store`，退出码 1
+Expected: `FORBIDDEN EDGE: rstore-api -> rstore-store  (kind=normal)`，退出码 1
 
-然后**撤销**这次实验性修改。
+撤销后，用例 B —— 旧黑名单漏掉的边。临时给 `crates/s3-compat/Cargo.toml` 加
+`rstore-store.workspace = true`：
 
-- [ ] **Step 4: 提交**
+Run: `bash scripts/check-layer-deps.sh`
+Expected: `FORBIDDEN EDGE: rstore-s3-compat -> rstore-store  (kind=normal)`，退出码 1
+
+撤销后，用例 C —— 未登记的 crate。临时新建 `crates/scratch/`（含 `Cargo.toml` 与空的 `src/lib.rs`）：
+
+Run: `bash scripts/check-layer-deps.sh`
+Expected: `UNKNOWN CRATE: rstore-scratch 未在护栏表中登记`，退出码 1
+
+三个用例全部**撤销**后，再跑一次确认回到退出码 0。
+
+- [ ] **Step 4: 清单加固**
+
+在根 `Cargo.toml` 的 `[workspace.package]` 中加一行（这些 crate 不发布，
+现在就设好，避免日后改 10 个清单文件）：
+
+```toml
+publish = false
+```
+
+在根 `Cargo.toml` 末尾新增共享 lint 配置：
+
+```toml
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+await_holding_lock = "deny"
+```
+
+> `await_holding_lock = "deny"` 是刻意的：本项目大量使用锁保护磁盘状态，
+> 跨 `.await` 持有锁会静默造成死锁。让编译器替我们拦住它。
+
+然后在**每一个** `crates/*/Cargo.toml` 末尾加：
+
+```toml
+[lints]
+workspace = true
+```
+
+把 `rust-toolchain.toml` 的 channel 从浮动的 `"stable"` 固定到已验证的版本：
+
+```toml
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+```
+
+- [ ] **Step 5: 验证加固后仍然全绿**
+
+Run: `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: 均通过，无 warning
+
+Run: `bash scripts/check-layer-deps.sh`
+Expected: 退出码 0
+
+- [ ] **Step 6: 提交**
 
 ```bash
-git add scripts/check-layer-deps.sh
-git commit -m "chore: add layer dependency guard script"
+git add scripts/check-layer-deps.sh Cargo.toml rust-toolchain.toml crates/
+git commit -m "chore: allowlist-based layer guard and workspace lint hardening"
 ```
 
 ---
@@ -1238,8 +1324,14 @@ git commit -m "feat(meta): format.json with shared identity quorum and strict in
 ### Task 3.4: FaultyDisk 测试基础设施
 
 **Files:**
-- Create: `crates/disk/src/faulty.rs`（`#[cfg(any(test, feature = "fault-injection"))]`）
-- Test: `tests/faulty_disk.rs`
+- Create: `crates/disk/src/faulty.rs`
+- Create: `crates/disk/tests/faulty_disk.rs`
+- Modify: `crates/disk/Cargo.toml`（新增 `[features] fault-injection = []`）
+
+> **为什么要 feature**：`FaultyDisk` 必须能被 `rstore-store` 的集成测试用到，
+> 而集成测试是**独立编译的 crate**，`#[cfg(test)]` 在那里不生效。
+> 因此模块门控写作 `#[cfg(any(test, feature = "fault-injection"))]`：
+> crate 内单测自动可见，跨 crate 由 feature 显式开启。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1282,7 +1374,7 @@ async fn can_fail_after_n_calls() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --test faulty_disk`
+Run: `cargo test -p rstore-disk --features fault-injection --test faulty_disk`
 Expected: 编译失败
 
 - [ ] **Step 3: 实现**
@@ -1297,11 +1389,11 @@ Expected: 编译失败
 
 - [ ] **Step 4: 跑测试确认通过并提交**
 
-Run: `cargo test --test faulty_disk`
+Run: `cargo test -p rstore-disk --features fault-injection --test faulty_disk`
 Expected: 全部 PASS
 
 ```bash
-git add crates/disk/src/faulty.rs tests/faulty_disk.rs
+git add crates/disk/
 git commit -m "test(disk): FaultyDisk fault injection harness"
 ```
 
@@ -1926,7 +2018,10 @@ git commit -m "feat(store): overwrite and delete with outvote-based GC"
 
 ### Task 4.9: Quorum 边界测试套件
 
-**Files:** Create `tests/quorum_boundaries.rs`
+**Files:**
+- Create: `crates/store/tests/quorum_boundaries.rs`
+- Modify: `crates/store/Cargo.toml`（`[dev-dependencies]` 加
+  `rstore-disk = { workspace = true, features = ["fault-injection"] }`）
 
 - [ ] **Step 1: 写测试（这是 DESIGN §19.2 的落地）**
 
@@ -1962,7 +2057,7 @@ async fn bitrot_on_majority_exposes_corruption_not_wrong_data() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --test quorum_boundaries`
+Run: `cargo test -p rstore-store --test quorum_boundaries`
 Expected: 编译失败（`run_case` 未实现）
 
 - [ ] **Step 3: 实现测试辅助函数并让测试通过**
@@ -1972,11 +2067,11 @@ Expected: 编译失败（`run_case` 未实现）
 
 - [ ] **Step 4: 提交**
 
-Run: `cargo test --test quorum_boundaries`
+Run: `cargo test -p rstore-store --test quorum_boundaries`
 Expected: 全部 PASS
 
 ```bash
-git add tests/quorum_boundaries.rs
+git add crates/store/tests/quorum_boundaries.rs crates/store/Cargo.toml
 git commit -m "test(store): quorum boundary matrix across failure modes"
 ```
 
@@ -1984,7 +2079,7 @@ git commit -m "test(store): quorum boundary matrix across failure modes"
 
 ### Task 4.10: 崩溃点状态机测试
 
-**Files:** Create `tests/commit_crash.rs`
+**Files:** Create `crates/store/tests/commit_crash.rs`
 
 - [ ] **Step 1: 写测试**
 
@@ -2033,7 +2128,7 @@ async fn old_gc_crash_never_loses_both_versions() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --test commit_crash`
+Run: `cargo test -p rstore-store --test commit_crash`
 Expected: 编译失败
 
 - [ ] **Step 3: 实现**
@@ -2045,11 +2140,11 @@ Expected: 编译失败
 
 - [ ] **Step 4: 提交**
 
-Run: `cargo test --test commit_crash`
+Run: `cargo test -p rstore-store --test commit_crash`
 Expected: 全部 PASS
 
 ```bash
-git add tests/commit_crash.rs crates/store/src/pool.rs
+git add crates/store/tests/commit_crash.rs crates/store/src/pool.rs
 git commit -m "test(store): commit protocol crash-point invariant tests"
 ```
 
@@ -2064,12 +2159,24 @@ git commit -m "test(store): commit protocol crash-point invariant tests"
 - Create: `crates/s3/src/lib.rs`、`crates/s3/src/auth.rs`
 - Create: `crates/s3/src/impl_s3.rs`
 
-- [ ] **Step 1: 定义 api 契约（boundary 规则 R4）**
+- [ ] **Step 1: 定义 api 契约**
 
 `crates/api/src/lib.rs` 定义 `ObjectStore` trait（`put_object` / `get_object` /
 `head_object` / `delete_object` / `list_objects` / multipart 系列）与领域错误 `StoreError`。
-`rstore-s3` 中**唯一**的 boundary 文件 `rstore-s3/src/boundary.rs` 负责把
-`rstore-store` 的实现绑定到该 trait。
+
+**绑定实现的位置是 `rstore-server/src/wiring.rs`，不是 `rstore-s3`**（DESIGN §5 规则 R4）。
+`rstore-s3` 只持有 `Arc<dyn ObjectStore>`，由构造参数注入：
+
+```rust
+pub struct RstoreFs {
+    store: Arc<dyn ObjectStore>,   // 不是 Arc<ECStore> —— s3 看不到引擎类型
+    auth:  Arc<dyn AuthProvider>,
+}
+```
+
+这样 `rstore-s3` 可以脱离引擎单独测试（传入 mock `ObjectStore`），
+且 `crates/s3/Cargo.toml` 永远不需要加 `rstore-store` 依赖——
+否则会与 DESIGN §5 的依赖表及 Task 0.2 的护栏脚本直接冲突。
 
 - [ ] **Step 2: 写集成测试（用 s3s 的测试工具或直接打 HTTP）**
 

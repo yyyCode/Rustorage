@@ -172,7 +172,7 @@ rstore-server        二进制入口，唯一的装配点
 | `rstore-checksum` | bitrot 哈希（keyed BLAKE3）与 KAT 自检 | common |
 | `rstore-meta` | `format.json` + `meta.xl` 容器编解码、`FileInfo` 模型 | common, checksum |
 | `rstore-erasure` | 纠删编解码、workspace 复用、编解码器缓存 | common |
-| `rstore-disk` | `DiskAPI` trait、`LocalDisk`、路径与 fsync 原语 | meta, checksum |
+| `rstore-disk` | `DiskAPI` trait、`LocalDisk`、路径与 fsync 原语 | common, meta, checksum |
 | `rstore-store` | 引擎核心（见上） | 以上全部 |
 | `rstore-api` | `ObjectStore` 等契约 trait、领域错误 | common |
 | `rstore-s3` | s3s 集成：`S3` trait 实现、SigV4 接入、错误映射 | api, common |
@@ -182,7 +182,13 @@ rstore-server        二进制入口，唯一的装配点
 **规则 R1**：外部只能通过 `rstore-api` 的 trait 访问引擎，不得直接依赖 `rstore-store`。
 **规则 R2**：`rstore-api` 不得反向依赖任何实现 crate。
 **规则 R3**：`common` 不得依赖任何内部 crate；`checksum` / `erasure` 只允许依赖 `common`。
-**规则 R4**：每个上层 crate 只允许有**一个** boundary 文件把 api trait 别名化并绑定实现。
+**规则 R4**：把实现绑定到 `rstore-api` trait 的**唯一**位置是 `rstore-server/src/wiring.rs`（组合根）。
+上层 crate（`rstore-s3`、`rstore-s3-compat`）**只接收**已经装配好的 `Arc<dyn ObjectStore>`，
+自己不得出现 `rstore-store` 的依赖。
+
+> R4 是关于「谁能看见实现」的硬约束。它使 `s3` 可以独立于引擎测试
+> （传入一个 mock `ObjectStore`），也保证了 DESIGN §5 的依赖表是自洽的——
+> 否则「`s3` 只依赖 `api, common`」与「`s3` 里绑定 `store` 的实现」会直接冲突。
 
 ---
 
@@ -830,7 +836,7 @@ enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
 | 改提交协议 | §12 + §19.3 的状态机测试 |
 | 加变换层（压缩/加密） | §13，只改 `pipeline.rs` 的装配点 |
 | 加指标 | §18.2，常量集中定义 |
-| 加跨 crate 调用 | §5 规则 R1：先加 `rstore-api` 契约，再在唯一的 boundary 文件里绑定实现 |
+| 加跨 crate 调用 | §5 规则 R1+R4：先在 `rstore-api` 加契约，再在 `rstore-server/src/wiring.rs` 绑定实现 |
 
 ---
 
