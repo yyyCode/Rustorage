@@ -6897,10 +6897,15 @@ Expected: 首次运行**允许失败**——失败项就是 compat 层的需求�
 > - 如果三个脚本**一次就全过**（很可能是这个结果，因为 5.2~5.8 已经按客户端真实行为写了），
 >   那 `crates/s3-compat/src/lib.rs` 就保持空的、只留一句模块文档，
 >   **不要**为了「让这个 crate 有点内容」去写没人调用的中间件。这是 YAGNI。
-> - 如果确实观察到失败、需要加中间件，**先改 `scripts/check_layer_deps.py` 的 allowlist**
->   给 `rstore-s3` 加上 `rstore-s3-compat`（并同步 `scripts/tests/test_check_layer_deps.py`
->   里对表结构的断言），再把中间件接进 `impl_s3.rs`。
->   `rstore-s3-compat` 只依赖 `rstore-common`，这条边不会引入环，是干净的。
+> - 如果确实观察到失败、需要加中间件，**首选在组合根接**：
+>   `rstore-server` 的 allowlist 里**同时**有 `rstore-s3` 与 `rstore-s3-compat`，
+>   所以它可以在 `crates/server/src/lib.rs` 里把中间件当作 tower 层套在
+>   `S3Service` 外面。**这条路不需要改 allowlist**，也符合「绑定与装配只在组合根发生」
+>   （DESIGN §5 R4）——本来是首选，只是因为改动位置不在 `rstore-s3` 里，容易被忽略。
+> - 只有当中间件必须在 `impl_s3.rs` **内部**才能生效（例如要读 `S3Request` 里
+>   s3s 私有的解析中间态）时，才退而改 allowlist：给 `rstore-s3` 加上
+>   `rstore-s3-compat`，并同步 `scripts/tests/test_check_layer_deps.py` 里对表结构的断言。
+>   `rstore-s3-compat` 只依赖 `rstore-common`，这条边不会引入环。
 
 - [ ] **Step 4: 三个脚本全部通过后提交**
 
