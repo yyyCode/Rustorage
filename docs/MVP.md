@@ -8069,8 +8069,15 @@ fn health_is_independent_of_readiness() {
 - [ ] **Step 2-4: 实现、跑测试、提交**
 
 ```rust
+// `Debug + PartialEq + Eq` 是 `assert_eq!(r.stage(), SystemStage::Booting)` 要求的，
+// 少一个上面两条测试就编译不过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
 
+/// `#[derive(Default)]` 不是可选项：`AtomicU8` 的 `Default` 就是 0（= `Booting`），
+/// 而少了它 `clippy::new_without_default` 会在 `-D warnings` 下**直接挡死门禁**
+/// （workspace 里 `clippy::all = warn`，门禁又是 `-D warnings`）。
+#[derive(Default)]
 pub struct Readiness { stage: AtomicU8 }
 
 impl Readiness {
@@ -8085,14 +8092,23 @@ impl Readiness {
 }
 ```
 
+`stage()` 要能把 `u8` 还原成枚举：加一个私有 `fn from_u8(v: u8) -> Self`（未知值一律当
+`Booting`，`load()` 读到的只可能是我们写过的值，不需要 `None` 分支去污染 API）。
+
 `mark_stage` 的实现要点：用 `fetch_max` 而不是 `store`——比较与写入必须是**一步**原子操作，
 「先 `load` 再比较再 `store`」在并发下会让两个请求双双通过，而这条规则恰恰是给并发路径用的。
 
 `/health` 为存活探针（进程活着即 200）；`/ready` 受 stage 控制，未就绪返回
 `503` + `Retry-After: 5`。
 
+> **加完依赖要先更新 `Cargo.lock`。** 门禁是 `--locked` 的，而多一条依赖边会让
+> 锁文件过期，`--locked` 会直接报「the lock file needs to be updated」。
+> 加完 `http` / `bytes` 之后先跑一次**不带 `--locked`** 的 `cargo test -p rstore-server`
+> （或者 `cargo build -p rstore-server`）让 cargo 把锁文件改好，再把 `Cargo.lock`
+> 一起提交。6.3 加 `clap` / `tokio-util` / `async-trait` 时同理。
+
 ```bash
-git add crates/server/src/readiness.rs crates/server/src/lib.rs crates/server/Cargo.toml
+git add crates/server/src/readiness.rs crates/server/src/lib.rs crates/server/Cargo.toml Cargo.lock
 git commit -m "feat(server): staged readiness with health/ready endpoints
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -8198,18 +8214,25 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify `crates/server/src/lib.rs`（加 `pub mod config; pub mod startup; pub mod wiring;`；
   **注意 `main.rs` 不是 lib 的一部分**，它是独立的 crate root，要用
   `use rstore_server::...` 而不是 `use crate::...`）
-- Modify `crates/server/Cargo.toml`（加 `clap`、`tokio-util`）
+- Modify `crates/server/Cargo.toml`（加 **`async-trait`**、`clap`、`tokio-util`）
 - Modify `crates/store/src/get.rs`（加 `HeadOut` 与 `ErasureSet::head_object`；`GetOut` 加 `mod_time`）
 - Modify 根 `Cargo.toml`（`[workspace.dependencies]` 加 `clap`、`tokio-util`）
 
 > 原计划把文件名写成 `config_load.rs`，但这里**不读配置文件**——MVP 的配置全部来自命令行
 > 参数（见下面的「启动契约」）。名字跟着职责走，叫 `config.rs`。
 >
-> **两个依赖必须显式加，工作区里现在都没有**：`clap`（`derive` + `cargo` feature）
-> 用来解析下面那张启动契约表里的七个参数——`--volumes` 是 `nargs(1..)`，
-> 手写解析要为它实现「吃到下一个 `--xxx` 为止」的扫描，而这条规则错了的后果是
-> 验收脚本以「unrecognized option」失败；`tokio-util`（`rt` feature）提供
-> 「启动顺序」一节里要求的 `CancellationToken`。
+> **依赖要加三个，且都不在 `crates/server/Cargo.toml` 里**：
+>
+> - **`async-trait`**（`async-trait.workspace = true`）——`wiring.rs` 要写
+>   `#[async_trait] impl ObjectStore for Wiring`。它已经在根 `Cargo.toml` 的
+>   `[workspace.dependencies]` 里（`rstore-api` 用的就是它），但 `crates/server`
+>   **没有把这条边加进去**，漏掉的表现是 `wiring.rs` 直接编译不过。
+> - **`clap`**（`derive` + `cargo` feature，工作区里**完全没有**，根 `Cargo.toml`
+>   也要加）用来解析下面那张启动契约表里的七个参数——`--volumes` 是 `nargs(1..)`，
+>   手写解析要为它实现「吃到下一个 `--xxx` 为止」的扫描，而这条规则错了的后果是
+>   验收脚本以「unrecognized option」失败。
+> - **`tokio-util`**（`rt` feature，工作区里也**完全没有**，根 `Cargo.toml` 也要加）
+>   提供「启动顺序」一节里要求的 `CancellationToken`。
 
 #### 启动契约（原计划完全没有这一段）
 
@@ -8471,7 +8494,7 @@ pub async fn serve(cfg: &Config) -> anyhow::Result<()>;  // main.rs 调它
 ```bash
 git add crates/server/src/wiring.rs crates/server/src/config.rs crates/server/src/startup.rs \
         crates/server/src/main.rs crates/server/src/lib.rs crates/server/Cargo.toml \
-        crates/store/src/get.rs Cargo.toml
+        crates/store/src/get.rs Cargo.toml Cargo.lock
 git commit -m "feat(server): startup/shutdown orchestration with format validation
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -8679,6 +8702,8 @@ Task 负责、以及日后要补时该动哪里。最后那次整体复审拿这
 | **`--base-domain` 一旦有非空默认值，用域名访问的客户端会被静默改变语义** | Task 5.11 的能力由 `--base-domain` 门控，默认「不给」= 纯 path-style。给了之后，**任何非 base、非 IP 的 host 都会被 `SingleDomain` 的 CNAME 回退整个当成桶名**：`Host: localhost:9000` → 桶名 `localhost:9000`（回退那处**不剥端口**，`host.rs:360-377`）→ 全部请求 400 `InvalidBucketName`，报错里没有「base-domain」这个词。**注意 `127.0.0.1:9000` 不受影响**（`parse_request_host` 的 `!is_socket_addr_or_ip_addr` 会整段跳过虚拟主机解析）——所以「四个脚本会红」这个论证是**错的**，别拿它当依据（正确论证见 Task 6.3 的启动契约表） |
 | **`validate_object_key` 的两条规则必须同时生效**（Task 5.7） | 规则 1（保留前缀）漏了 → 用户在 `.rstore*` 里写数据；规则 2（空段 / `.` / `..`）漏了 → 两个不同的 S3 key 落到同一个文件上**静默互相覆盖**。规则 2 还必须接在**读路径**上：只接写路径的话 `GET /b/../x` 会从盘层的 `Fatal(PathEscape)` 变成 500，而不是 400 |
 | **M6 的三个 task 各自都要改 `crates/server/src/lib.rs`** | 该文件在 M0 建骨架时只写了一行文档注释，**没有任何 `pub mod` 声明**。漏掉的话新文件根本不参与编译：`cargo test` 会显示全绿（只是少了几条用例），而 `readiness.rs` / `metrics.rs` 里的代码一行都没跑过。三个 task 的 `Files` 与 `git add` 里都已经列出它 |
+| **新增依赖不提交 `Cargo.lock`，门禁 `--locked` 立刻红** | 5.11（`sha2`）、6.1（`http`/`bytes`）、6.3（`async-trait`/`clap`/`tokio-util`）都会改锁文件，而门禁是 `cargo test --workspace --locked` / `cargo clippy --locked`。另外**加完依赖要先跑一次不带 `--locked` 的构建**让 cargo 改写锁文件——直接在 `--locked` 下跑只会得到「the lock file needs to be updated」。三处的 `git add` 里都已经带上 `Cargo.lock` |
+| **`crates/server/Cargo.toml` 缺 `async-trait`** | `wiring.rs` 要写 `#[async_trait] impl ObjectStore for Wiring`，而 `async-trait` 虽然在根 `Cargo.toml` 的 `[workspace.dependencies]` 里（`rstore-api` 在用），`crates/server` **没有把这条边加进去**。漏掉的表现是 `wiring.rs` 编译不过（至少是响亮地失败，不像 `lib.rs` 那种静默失败）。6.3 的 `Files` 与依赖说明里都已经列出 |
 | **组合根 `wiring.rs` 原计划没有任何任务** | `rstore-api` 的 `ObjectStore` trait 与 `rstore-store` 的 `ErasureSet` 固有方法是两套类型，而 `api -> store` 是 FORBIDDEN EDGE——**只有 `rstore-server` 同时看得见两边**。没有这个适配器，6.3 的「构造 `ErasureSet`」之后没有任何东西能交给 `build_service`。已作为 Task 6.3 的第一个文件写进计划 |
 | **条件请求的求值顺序不能重排**（Task 5.10） | RFC 9110 §13.2.2 的两处「缺席时才看」（`If-Match` 挡住 `If-Unmodified-Since`、`If-None-Match` 挡住 `If-Modified-Since`）漏掉任何一处，表现都是「两个头都发的客户端偶尔拿到 200 而它期望 304」——这种 bug 在单头测试里完全看不见，所以 5.10 的矩阵里专门有两条「两个都发、结论不同」的用例 |
 
