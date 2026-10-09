@@ -7211,6 +7211,13 @@ command -v mc >/dev/null || { echo "mc 未安装" >&2; exit 1; }
 EP="http://127.0.0.1:9000"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
+# **把 mc 的配置目录也隔离到 `$WORK` 里**（`--config-dir` 是 mc 的全局参数）。
+# 裸跑 `mc alias set` 会写开发机的 `~/.mc/config.json`：既会永久留下一个指向
+# 一次性测试服务的别名，也可能**覆盖掉使用者自己已有的 `rs` 别名**——那是这个
+# 冒烟脚本最不该有的副作用。rclone 那边用环境变量达到了同样的隔离，这里用
+# `--config-dir`（全局参数必须写在子命令**之前**，所以包一层函数，别写成别名）。
+mc() { command mc --config-dir "$WORK/mc" "$@"; }
+
 mc alias set rs "$EP" rustorage rustorage-secret
 mc mb --ignore-existing rs/test-bucket
 head -c 1048576 /dev/urandom > "$WORK/1m.bin"
@@ -8741,6 +8748,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+
+# 前置检查：**挨个查工具名**。没有这一段时，缺 `aws` 会以「command not found」
+# 失败、看起来像是服务端的问题；而本脚本第 2 步起自己直接调 `aws`，
+# 另外还要 `curl`（轮询 /ready）与 `cmp`（**唯一**有诊断价值的比对）。
+for tool in aws curl cmp; do
+    command -v "$tool" >/dev/null || { echo "$tool 未安装，无法跑验收" >&2; exit 1; }
+done
+
 ENDPOINT=http://127.0.0.1:9000
 ROOT=/tmp/rs
 WORK=$(mktemp -d)          # 载荷与比对结果放服务端数据目录**之外**
@@ -8760,15 +8775,28 @@ AWS="aws --endpoint-url $ENDPOINT"
 # 那样 read_quorum = 6-3 = 3，下面「掉 2 块」还剩 4 块，离边界很远，测不到那条边界。
 # 给 2 之后 read_quorum = 6-2 = 4，掉 2 块恰好**只剩 4 块**——一步不多、一步不少，
 # 这是纠删码最有价值的那个用例；而下面引用的「4+2」注释也才对得上。
-mkdir -p $ROOT/{d1,d2,d3,d4,d5,d6}
+#
+# **每次都从空目录开始**，否则脚本不可重跑：上一次若在第 3 步中途失败（那时 d5/d6
+# 已被 `mv` 成 `d5.off`/`d6.off`），残留目录会让下一次的 `mv $ROOT/d5 $ROOT/d5.off`
+# 变成「把一个目录移进已存在的目录里」，`set -e` 于是在**服务启动之前**就退出，
+# 报错还完全看不出是残留目录造成的。
+rm -rf "$ROOT"
+mkdir -p "$ROOT"/{d1,d2,d3,d4,d5,d6}
 # **先单独构建，再起进程。** `cargo run` 会把冷构建时间算进下面那段轮询窗口里：
 # 干净的 CI 上全工作区冷编译远超 30 秒，脚本会以「server did not become ready」
 # 失败——而这跟服务端毫无关系。构建放在启动之前，轮询窗口就只覆盖真正的启动。
 cargo build -p rstore-server
-cargo run -p rstore-server -- --volumes $ROOT/d{1,2,3,4,5,6} --parity 2 --port 9000 &
+# **直接跑构建产物，不要 `cargo run`。** `cargo run` 后面还挂着一个 cargo 进程，
+# `kill $SERVER_PID` 杀掉的是 cargo，真正的服务进程很可能继续占着 9000 端口——
+# 下一次运行就会以「server did not become ready」失败，而端口是被上一次占着的。
+# Windows 上产物名带 `.exe`，两种都试。
+BIN=target/debug/rstore-server
+[ -e "$BIN" ] || BIN="$BIN.exe"
+[ -e "$BIN" ] || { echo "找不到构建产物 rstore-server" >&2; exit 1; }
+"$BIN" --volumes "$ROOT"/d{1,2,3,4,5,6} --parity 2 --port 9000 &
 SERVER_PID=$!
-# 无论从哪一条 `set -e` 退出，都别把服务留在后台占着 9000：
-trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+# 无论从哪一条 `set -e` 退出，都别把服务留在后台占着 9000，也别留下临时目录：
+trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 # 不要 `sleep 3`：慢机器上会假失败，快机器上白等。轮询 /ready 直到 200。
 # (`curl … && break` 里 curl 不是 `&&` 列表中的最后一条，所以失败不会触发 errexit。)
@@ -8836,9 +8864,17 @@ cmp $WORK/payload.bin $WORK/healed.bin
 echo "ACCEPTANCE: OK"
 ```
 
-> **前置检查也要写**：`command -v aws >/dev/null || { echo "aws CLI 未安装" >&2; exit 1; }`
-> 放在 `set -euo pipefail` 之后。没有这一段时，缺 aws 会以「command not found」失败，
-> 看起来像是服务端的问题。
+> **前置检查写在脚本开头**（`aws` / `curl` / `cmp` 三个都要查）。缺 `aws` 时若只靠
+> 「command not found」，看起来像是服务端的问题，而本脚本从第 2 步起自己直接调 `aws`；
+> 轮询 `/ready` 靠 `curl`；`cmp` 是整份脚本里唯一真能发现「读成功但内容不对」的东西。
+> 别把它退化成「只查 aws」。
+>
+> **端口 9000 被占时的表现**是「轮询 60 秒后 server did not become ready」，
+> 而真正的原因（`bind: address already in use`）只出现在服务的 stderr 里——
+> 排错时先看那里，不要去查 `format.json` 或盘目录。
+>
+> **脚本必须可重跑**：起点那句 `rm -rf "$ROOT"` 不是可选的（理由见上面那段注释）。
+> 同理，`kill` 的是**构建产物本身**而不是 `cargo run` 的 shell。
 
 > **两条比对（第 3、4 步）是这份脚本里唯一真正有诊断价值的部分**，别把它们退化成
 > `curl -f` 或者 `aws … >/dev/null`。`cmp` 失败会带出首个不同字节的偏移，
