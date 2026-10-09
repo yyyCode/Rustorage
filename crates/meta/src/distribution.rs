@@ -52,11 +52,18 @@ mod tests {
     }
 
     #[test]
-    fn null_ordering_for_known_key() {
-        // N=4 时，任意 key 都应产出 1..=4 的排列，且首元素为 start+1
-        let d = distribution("bucket/object", 4).unwrap();
-        assert!(is_valid_distribution(&d));
-        assert_eq!(d.len(), 4);
+    fn is_valid_distribution_rejects_malformed_slices() {
+        // distribution() 输出的守门人，DESIGN §9.3 要求它绝不 panic。
+        // 属性测试只喂 distribution() 的合法输出，拒绝路径完全没被覆盖——
+        // 而畸形输入正是它唯一会被真正调用的场合，所以边界要在这里钉住。
+        assert!(is_valid_distribution(&[1])); // 长度 1 合法
+        assert!(is_valid_distribution(&[3, 1, 2])); // 循环移位合法
+        assert!(!is_valid_distribution(&[])); // 空
+        assert!(!is_valid_distribution(&[0])); // 0 不在 1..=len 内
+        assert!(!is_valid_distribution(&[1, 1])); // 重复
+        assert!(!is_valid_distribution(&[1, 3])); // 3 > len = 2
+        let seventeen: Vec<u8> = (1..=17).collect();
+        assert!(!is_valid_distribution(&seventeen)); // len > 16
     }
 
     proptest! {
