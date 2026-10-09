@@ -53,10 +53,19 @@ const RECORD_MIN_BYTES: usize = HEADER_MIN_BYTES + 4;
 ///
 /// `ObjectMeta::meta_ver` 写入容器的 `major` 字段；`minor` 恒为 [`MINOR`]。
 /// 容器不在别处承载 `meta_ver`。
+///
+/// `meta_ver != MAJOR` 一律拒绝（`UnsupportedVersion`）——见下方注释。
 pub fn encode(meta: &ObjectMeta) -> Result<Vec<u8>, DiskError> {
+    // 拒绝写出自己读不回来的容器。若放任 `meta_ver` 原样落盘，`decode` 会把它报成
+    // `Corrupt(UnsupportedVersion)`——而 DESIGN §17 规定「观察到 Corrupt 即触发 repair」，
+    // 一个编码期的错误就会伪装成盘损坏，去对健康数据做修复。
+    if u16::from(meta.meta_ver) != MAJOR {
+        return Err(DiskError::Corrupt(CorruptKind::UnsupportedVersion));
+    }
+
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    // meta_ver 即容器 major 版本；MVP 恒为 1。
+    // meta_ver 即容器 major 版本，已在上方校验与 MAJOR 一致。
     out.extend_from_slice(&u16::from(meta.meta_ver).to_le_bytes());
     out.extend_from_slice(&MINOR.to_le_bytes());
 
@@ -261,6 +270,28 @@ mod tests {
     fn rejects_truncated_buffer() {
         let bytes = encode(&sample_meta()).unwrap();
         assert!(decode(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_unsupported_meta_ver() {
+        // encode 不许写出自己 decode 读不回来的容器：若放任 meta_ver 落盘，
+        // decode 会报 Corrupt(UnsupportedVersion)，而 DESIGN §17 规定观察到 Corrupt
+        // 即触发 repair——编码期的错误就会伪装成盘损坏，对健康数据发起修复。
+        let mut m = sample_meta();
+        m.meta_ver = 2;
+        let err = encode(&m).unwrap_err();
+        assert!(
+            matches!(&err, DiskError::Corrupt(CorruptKind::UnsupportedVersion)),
+            "got {err:?}"
+        );
+
+        // 与 decode 侧对齐：两者必须报同一个错误，否则守卫就拦偏了。
+        let mut raw = encode(&sample_meta()).unwrap();
+        raw[4] = 2; // major 是偏移 4..6 的 u16 LE
+        assert!(matches!(
+            decode(&raw),
+            Err(DiskError::Corrupt(CorruptKind::UnsupportedVersion))
+        ));
     }
 
     #[test]

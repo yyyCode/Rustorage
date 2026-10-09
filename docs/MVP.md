@@ -1897,8 +1897,13 @@ DESIGN §8.1 有意如此：CRC 只保护结构部分，且让「只读前缀即
 2. magic 不符 → `Corrupt(BadMagic)`；
 3. `major != 1` → `Corrupt(UnsupportedVersion)`；
 4. `minor > 0` → `Corrupt(UnsupportedVersion)`（DESIGN §8.1：minor 过新也是确定性损坏）；
-5. 读 `version_count`（偏移 10..12）。**在分配之前**用「剩余字节数 / 最小记录尺寸」
-   做上界检查 → `Corrupt(LengthMismatch)`；
+5. 读 `version_count`（偏移 **8..10**：`magic(4) + major(2) + minor(2)` 之后）。
+   **在分配之前**用「剩余字节数 / 最小记录尺寸」做上界检查 → `Corrupt(LengthMismatch)`。
+   记录从偏移 10 开始；上面那个 `bytes.len() < 14` 正是 `10 + 4`（4 = trailer CRC），
+   任何把 `version_count` 读在 10..12 的实现都会让这个下限自相矛盾。
+   下界用**真下界**：`HEADER_MIN_BYTES = 15`（`FileVersionHeader::default()` 的实测
+   编码长度，由 `record_min_bytes_is_a_true_lower_bound` 钉住——**只能调小不能调大**，
+   调大就会误拒合法输入）；
 6. 逐条解析记录：用 `rmp_serde::from_read::<_, FileVersionHeader>(&mut cursor)`
    从 `&mut Cursor` 读一个 header（msgpack 自描述，读完 `cursor.position()` 就是边界，
    **不需要长度前缀**）；随后读 `body_len u32 BE`，**分配之前**检查
@@ -1910,6 +1915,16 @@ DESIGN §8.1 有意如此：CRC 只保护结构部分，且让「只读前缀即
    （空切片 → 空 map）。失败 → `Corrupt(MalformedHeader)`。
 
 `encode` 侧对称：记录写完后写 u32 LE 的 CRC，再写 `rmp_serde::to_vec(&meta.inline)`。
+
+> **`meta_ver` 映射到容器的 `major`，不是 `minor`。** 容器只有 major/minor 两个版本位，
+> 而 `ObjectMeta.meta_ver` 必须落在其中之一。取 `major`：它与魔数 `RSM1` 里的 `1` 同源，
+> 也与样例里的 `meta_ver: 1` 一致。`minor` 承载兼容性的字段增删（DESIGN §8.3），
+> 不在 `ObjectMeta` 里暴露。
+>
+> **`encode` 必须校验 `meta_ver == MAJOR`（= 1），不符返回 `UnsupportedVersion`。**
+> 不校验的话，`encode` 会写出自己 `decode` 读不回来的字节——而 `decode` 把它报成
+> `Corrupt`，DESIGN §17 又规定「观察到 Corrupt 即触发 repair」，于是编码期的错误
+> 会伪装成盘损坏，对健康数据发起修复。这是一处必须堵死的不对称。
 
 > 这里直接调 `rmp_serde::to_vec`（Task 2.3 才会给 `InlineData` 加上
 > `encode`/`decode` 方法）。等 2.3 落地后，把这一处和对应的解码处替换成

@@ -205,7 +205,11 @@ pub struct ShallowVersion {
     pub body: OpaqueBody,
 }
 
-/// 一个对象的全部版本 + 内联数据 + 容器格式 minor 版本。
+/// 一个对象的全部版本 + 内联数据 + 容器格式**主**版本（major）。
+///
+/// 注意是 major 而非 minor：容器 `major` 只在不兼容变更时递增，与魔数 `RSM1` 里的
+/// `1` 同源；`minor` 承载兼容性的字段增删（DESIGN §8.3），不在这里暴露。
+/// `container::encode` 会拒绝 `meta_ver != 1`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     pub versions: Vec<ShallowVersion>,
