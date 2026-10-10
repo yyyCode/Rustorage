@@ -3,6 +3,7 @@
 //! **盘数与分片数一一对应：每块盘持有一份分片。** 例如 `total = 6, parity = 2`
 //! 即 4+2 配置，需要 6 块盘。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rstore_common::modes::IoModes;
@@ -56,6 +57,13 @@ pub struct ErasureSet {
     /// 版本解析缓存。**只在 `metadata_cache` 打开时才存在**——
     /// 关掉模式时它是 `None`，`resolve_version_cached` 于是走原路径，一次都不碰缓存。
     resolve_cache: Option<ResolveCache>,
+    /// 分片缓冲的**显式增长次数**，累计值。**只为基准存在**——
+    /// `pooled_write_buffers` 不减少任何一次 IO，只有这个计数能显示它的作用。
+    /// 随模式开关一起删除（设计文档 §10）。
+    ///
+    /// `pub(crate)` 是因为写入路径在**兄弟模块** `put.rs` 里——字段可见性是按模块
+    /// 划的，不加就编不过。对外仍然只是一个 `take_scratch_allocs()` 读取口。
+    pub(crate) scratch_allocs: AtomicU64,
 }
 
 impl ErasureSet {
@@ -95,6 +103,7 @@ impl ErasureSet {
             parity,
             codec_cache: CodecCache::new(CODEC_CACHE_CAPACITY),
             resolve_cache: modes.metadata_cache.then(ResolveCache::new),
+            scratch_allocs: AtomicU64::new(0),
             modes,
         })
     }
@@ -102,6 +111,14 @@ impl ErasureSet {
     /// 本 set 的模式开关。
     pub fn modes(&self) -> IoModes {
         self.modes
+    }
+
+    /// 取走累计的分配次数并归零。
+    ///
+    /// **`pub` 而不是 `pub(crate)`**：读它的是 `benches/io_modes.rs`，那是独立编译的
+    /// crate，看不到 `pub(crate)` 的东西。这个可见性只活到基准跑完。
+    pub fn take_scratch_allocs(&self) -> u64 {
+        self.scratch_allocs.swap(0, Ordering::Relaxed)
     }
 
     /// 版本解析缓存。`None` = 模式关着（或没开 `metadata_cache`）。
