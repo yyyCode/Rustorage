@@ -13,6 +13,7 @@ pub mod quorum;
 mod quorum_boundaries;
 pub mod reader;
 pub mod reconcile;
+mod resolve_cache;
 pub mod set;
 #[cfg(test)]
 mod testutil;

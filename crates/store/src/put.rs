@@ -204,7 +204,24 @@ impl ErasureSet {
     ///
     /// **流式**：请求体逐块读入、逐块编码落盘，峰值内存与对象大小无关（上界
     /// `BLOCK_SIZE` + 一份分片）。
+    ///
+    /// 本函数是 [`Self::put_object_inner`] 的薄包装，只多一件事：**提交成功后
+    /// 让元数据缓存里这个 key 作废**。放在唯一的成功出口上，两个返回分支
+    /// （内联 / 分片）与将来新增的分支都不会漏掉它。
     pub async fn put_object(&self, args: PutArgs) -> Result<PutOut, StoreError> {
+        let bucket = args.bucket.clone();
+        let key = args.key.clone();
+        let out = self.put_object_inner(args).await?;
+        // **只在成功时失效**：失败（含低于 quorum）没有改变任何权威版本，
+        // 此时清掉条目只会白白少一次命中。
+        if let Some(cache) = self.resolve_cache() {
+            cache.invalidate(&bucket, &key);
+        }
+        Ok(out)
+    }
+
+    /// 真正的写入逻辑。语义与签名都与引入缓存之前一致。
+    async fn put_object_inner(&self, args: PutArgs) -> Result<PutOut, StoreError> {
         let PutArgs {
             bucket,
             key,

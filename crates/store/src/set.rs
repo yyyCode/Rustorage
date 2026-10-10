@@ -10,6 +10,7 @@ use rstore_disk::DiskAPI;
 use rstore_erasure::CodecCache;
 
 use crate::error::StoreError;
+use crate::resolve_cache::ResolveCache;
 
 /// `CodecCache` 的容量。一个 set 的分片几何（`data`/`parity`/`shard_size`）组合很少，
 /// 常数容量足够；取与 DESIGN §10.2 默认值同量级的 64。
@@ -52,6 +53,9 @@ pub struct ErasureSet {
     codec_cache: CodecCache,
     /// 读写路径的模式开关。基准专用，量完即删（设计文档 §10）。
     modes: IoModes,
+    /// 版本解析缓存。**只在 `metadata_cache` 打开时才存在**——
+    /// 关掉模式时它是 `None`，`resolve_version_cached` 于是走原路径，一次都不碰缓存。
+    resolve_cache: Option<ResolveCache>,
 }
 
 impl ErasureSet {
@@ -90,6 +94,7 @@ impl ErasureSet {
             data: total - parity,
             parity,
             codec_cache: CodecCache::new(CODEC_CACHE_CAPACITY),
+            resolve_cache: modes.metadata_cache.then(ResolveCache::new),
             modes,
         })
     }
@@ -97,6 +102,11 @@ impl ErasureSet {
     /// 本 set 的模式开关。
     pub fn modes(&self) -> IoModes {
         self.modes
+    }
+
+    /// 版本解析缓存。`None` = 模式关着（或没开 `metadata_cache`）。
+    pub(crate) fn resolve_cache(&self) -> Option<&ResolveCache> {
+        self.resolve_cache.as_ref()
     }
 
     /// 槽位视图，下标即分片下标。`None` = 该盘掉线。Task 4.4/4.6/4.7 都要按槽位遍历。

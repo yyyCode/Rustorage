@@ -222,6 +222,31 @@ pub(crate) async fn resolve_version(
     })
 }
 
+/// [`resolve_version`] 的缓存版，**只给 `get_object` / `head_object` 用**。
+///
+/// 模式关着的时候它一次都不碰缓存，直接走原路径——所以调用方不必自己判断模式，
+/// **决策点就在这个 `let Some(..) else` 上，只有一处**。
+///
+/// **错误不进缓存**：`ReadQuorum` 是暂时状态，把它记下来只会让一次抖动变成持续失败。
+/// `Absent` **进缓存**——「这个 key 不存在」正是 HEAD 密集负载里最有价值的一类命中，
+/// 而它被写入改变时由 `invalidate` 兜住。
+pub(crate) async fn resolve_version_cached(
+    set: &ErasureSet,
+    bucket: &str,
+    key: &str,
+) -> Result<Arc<Resolved>, StoreError> {
+    let Some(cache) = set.resolve_cache() else {
+        return Ok(Arc::new(resolve_version(set, bucket, key).await?));
+    };
+    let gen = cache.generation(bucket, key);
+    if let Some(hit) = cache.get(bucket, key, gen) {
+        return Ok(hit);
+    }
+    let fresh = Arc::new(resolve_version(set, bucket, key).await?);
+    cache.store(bucket, key, gen, Arc::clone(&fresh));
+    Ok(fresh)
+}
+
 /// Range 的边界检查与裁剪。**走到这里还越界就是 M5 的 bug**，不该被 store 悄悄吸收。
 fn apply_range(full: Vec<u8>, size: u64, range: Option<ByteRange>) -> Result<Vec<u8>, StoreError> {
     match range {
@@ -454,7 +479,7 @@ impl ErasureSet {
     ) -> Result<GetOut, StoreError> {
         // `live()` 借用 `resolved`，所以必须先绑定再 let-else；不能写成
         // `resolve_version(…).await?.live()`——那是借一个临时值。
-        let resolved = resolve_version(self, bucket, key).await?;
+        let resolved = resolve_version_cached(self, bucket, key).await?;
         let Some((winner_dir, meta)) = resolved.live() else {
             return Err(StoreError::NotFound);
         };
@@ -536,7 +561,7 @@ impl ErasureSet {
     /// 与 GET 用同一处版本发现（`resolve_version`）与同一处 etag 算法
     /// （`etag_of_meta`），保证 HEAD 与 LIST/GET 的 ETag 不分叉。
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadOut, StoreError> {
-        let resolved = resolve_version(self, bucket, key).await?;
+        let resolved = resolve_version_cached(self, bucket, key).await?;
         let Some((_dir, meta)) = resolved.live() else {
             return Err(StoreError::NotFound); // 不存在，或最新版本是删除标记
         };
@@ -801,5 +826,89 @@ mod tests {
             set.head_object("b", "nope").await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    /// 缓存必须**在覆盖写之后立刻失效**：读到旧版本就是错数据。
+    #[tokio::test]
+    async fn metadata_cache_sees_a_new_version_after_put() {
+        let set = set_with_modes(6, 2, IoModes::ALL).await;
+        set.put_object(put_args("b", "k", vec![1u8; 1_500_000]))
+            .await
+            .unwrap();
+        // 先读一次把条目填上。
+        assert_eq!(set.head_object("b", "k").await.unwrap().size, 1_500_000);
+
+        set.put_object(put_args("b", "k", vec![2u8; 700_000]))
+            .await
+            .unwrap();
+        assert_eq!(
+            set.head_object("b", "k").await.unwrap().size,
+            700_000,
+            "覆盖写之后缓存必须失效"
+        );
+        assert_eq!(
+            set.get_object("b", "k", None).await.unwrap().data,
+            vec![2u8; 700_000]
+        );
+    }
+
+    /// 删除之后必须立刻读到 `NotFound`，而不是缓存里的旧对象。
+    #[tokio::test]
+    async fn metadata_cache_sees_a_delete_immediately() {
+        let set = set_with_modes(6, 2, IoModes::ALL).await;
+        set.put_object(put_args("b", "k", vec![1u8; 1_500_000]))
+            .await
+            .unwrap();
+        assert_eq!(set.head_object("b", "k").await.unwrap().size, 1_500_000);
+
+        set.delete_object("b", "k").await.unwrap();
+        let r = set.head_object("b", "k").await;
+        assert!(
+            matches!(r, Err(StoreError::NotFound)),
+            "删除之后缓存必须失效，got {r:?}"
+        );
+    }
+
+    /// **不存在的 key 也要缓存**（HEAD 密集负载里那是最有价值的一类命中），
+    /// 而且 PUT 之后必须立刻可见——否则缓存会把「不存在」永久钉住。
+    #[tokio::test]
+    async fn metadata_cache_caches_absent_and_uncaches_on_put() {
+        let set = set_with_modes(6, 2, IoModes::ALL).await;
+        assert!(matches!(
+            set.head_object("b", "k").await,
+            Err(StoreError::NotFound)
+        ));
+
+        set.put_object(put_args("b", "k", vec![1u8; 1_500_000]))
+            .await
+            .unwrap();
+        assert_eq!(set.head_object("b", "k").await.unwrap().size, 1_500_000);
+    }
+
+    /// 读失败（`ReadQuorum`）**不进缓存**：一次抖动不该变成持续失败。
+    /// 恢复一块盘之后必须立刻能读到。
+    #[tokio::test]
+    async fn metadata_cache_does_not_cache_errors() {
+        let set = set_with_modes(6, 2, IoModes::ALL).await;
+        set.put_object(put_args("b", "k", vec![1u8; 1_500_000]))
+            .await
+            .unwrap();
+
+        for i in 0..4 {
+            set.inject_fault_on(i, rstore_disk::faulty::Fault::Offline);
+        }
+        assert!(matches!(
+            set.head_object("b", "k").await,
+            Err(StoreError::ReadQuorum { .. })
+        ));
+
+        for i in 0..4 {
+            set.clear_fault_on(i);
+        }
+        assert_eq!(
+            set.head_object("b", "k").await.unwrap().size,
+            1_500_000,
+            "错误不该被缓存，恢复之后必须立刻可读"
+        );
     }
 }

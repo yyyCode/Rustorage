@@ -76,7 +76,19 @@ impl ErasureSet {
     ///
     /// 对不存在的 key 也照样写标记并返回 `Ok`——这是 S3 的语义
     /// （DELETE 幂等，重复删同一 key、删一个从没存在过的 key 都成功）。
+    ///
+    /// 与 `put_object` 同构的薄包装：提交成功后让元数据缓存里这个 key 作废。
+    /// 少了这一步，删除之后 HEAD 还会从缓存里读到那个已被标记删掉的对象。
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StoreError> {
+        self.delete_object_inner(bucket, key).await?;
+        if let Some(cache) = self.resolve_cache() {
+            cache.invalidate(bucket, key);
+        }
+        Ok(())
+    }
+
+    /// 真正的删除逻辑。语义与签名都与引入缓存之前一致。
+    async fn delete_object_inner(&self, bucket: &str, key: &str) -> Result<(), StoreError> {
         let total = self.total();
         let txid = Uuid::new_v4();
         // `marker_dir`（目录名）与 `marker_version_id`（header 里的 version_id）必须是

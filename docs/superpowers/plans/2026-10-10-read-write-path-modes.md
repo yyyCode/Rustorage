@@ -1255,10 +1255,15 @@ const SHARDS: usize = 16;
 /// 所以这里不需要真正的 LRU 语义。
 const SHARD_CAPACITY: usize = 1024;
 
+/// 缓存键：`(bucket, key)`。
+type CacheKey = (String, String);
+/// 缓存值：`(写入时的分片计数, 解析结果)`。
+type CacheEntry = (u64, Arc<Resolved>);
+
 struct Shard {
     /// 单调递增。**只增不减**——见模块文档里的 ABA 论证。
     generation: AtomicU64,
-    entries: Mutex<HashMap<(String, String), (u64, Arc<Resolved>)>>,
+    entries: Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 /// 按 `(bucket, key)` 缓存的版本解析结果。
@@ -1322,6 +1327,11 @@ impl ResolveCache {
     }
 }
 ```
+
+**（执行时补记）** `Shard::entries` 的类型若直接写成
+`Mutex<HashMap<(String, String), (u64, Arc<Resolved>)>>`，`clippy` 的
+`type_complexity` 会以 `-D warnings` 直接报错。上面已改为 `CacheKey` / `CacheEntry`
+两个别名——不是风格问题，是这一关过不去。
 
 - [ ] **Step 2: 注册模块并给 `ErasureSet` 加字段**
 
