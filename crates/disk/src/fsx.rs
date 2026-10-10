@@ -113,6 +113,29 @@ pub fn write_all_fsync(root: &Path, rel: &str, data: &[u8]) -> Result<(), DiskEr
     Ok(())
 }
 
+/// 追加写文件（自动创建父目录），**不 fsync**。
+///
+/// 与 [`write_all_fsync`] 的两点差别都是刻意的：
+///
+/// 1. `OpenOptions::append(true)` 而不是 `File::create`——后者**创建即截断**，
+///    逐块追加会把前一块抹掉，而且每次调用都返回 `Ok`，调用方看不出任何异常。
+/// 2. **不 fsync**：`append` 会被调用成百上千次（每次一个块），逐次 fsync 等于
+///    把整个写路径钉在磁盘转速上。耐久性由调用方在最后一块之后用
+///    [`sync_file_and_parent`] 统一负责。
+pub fn append_all(root: &Path, rel: &str, data: &[u8]) -> Result<(), DiskError> {
+    let path = resolve(root, rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(map_io)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(map_io)?;
+    file.write_all(data).map_err(map_io)?;
+    Ok(())
+}
+
 /// 原子重命名，并 fsync 目标父目录，保证 rename 在崩溃后仍可见。
 pub fn rename_fsync(root: &Path, from_rel: &str, to_rel: &str) -> Result<(), DiskError> {
     let from = resolve(root, from_rel)?;
@@ -229,6 +252,21 @@ fn walk_rec(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), DiskEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_concatenates_while_write_all_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        append_all(root, "p", b"aa").unwrap();
+        append_all(root, "p", b"bb").unwrap();
+        assert_eq!(std::fs::read(root.join("p")).unwrap(), b"aabb");
+        write_all_fsync(root, "p", b"cc").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("p")).unwrap(),
+            b"cc",
+            "write_all 必须仍然是截断语义"
+        );
+    }
 
     #[test]
     fn resolve_rejects_escapes_and_accepts_normal() {

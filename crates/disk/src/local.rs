@@ -67,6 +67,13 @@ impl DiskAPI for LocalDisk {
         run_blocking(move || fsx::write_all_fsync(&root, &rel, &data)).await
     }
 
+    async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
+        let root = Arc::clone(&self.root);
+        let rel = rel_path.to_owned();
+        let data = data.to_vec();
+        run_blocking(move || fsx::append_all(&root, &rel, &data)).await
+    }
+
     async fn read_exact_at(
         &self,
         rel_path: &str,
