@@ -2,6 +2,21 @@
 
 use rstore_api::ApiError;
 
+/// 桶名校验。返回 `ApiError::InvalidBucketName`（→ 对外 400 `InvalidBucketName`）。
+///
+/// **只加一条规则**：首字符不得为 `_`。这不是「桶名校验已完整」——长度、字符集、
+/// 大小写、`..` 等一概**尚未校验**，本函数刻意不顺手补上（那是一次与本设计无关、
+/// 影响面更大的兼容性变更）。这一条规则的存在只为让 `/_console` 成为**任何合法桶名
+/// 都构不成**的路径（设计 §3.2/§3.3）。
+///
+/// 注意：`console`（不带下划线）**必须继续合法**。
+pub fn validate_bucket_name(bucket: &str) -> Result<(), ApiError> {
+    if bucket.starts_with('_') {
+        return Err(ApiError::InvalidBucketName);
+    }
+    Ok(())
+}
+
 /// 对象 key 校验。返回 `ApiError::InvalidObjectName`（→ 对外 400 `InvalidArgument`）。
 ///
 /// 两条独立规则，都由安全/数据正确性而来：
@@ -69,6 +84,26 @@ mod tests {
         assert!(validate_object_key("a/b/c").is_ok());
         assert!(validate_object_key("a/..b").is_ok(), "`..b` 只是普通名字");
         assert!(validate_object_key("a/b.").is_ok(), "`b.` 只是普通名字");
+    }
+
+    #[test]
+    fn rejects_bucket_name_with_leading_underscore() {
+        // 设计 §3.2：只有「首字符是 `_`」这一条被禁，**不做**完整的 DNS 风格校验。
+        // 理由是 `/_console` 要成为任何合法桶名都构不成的路径，而扩大校验面是
+        // 与本设计无关的兼容性变更，会掩盖真正的改动。
+        assert!(validate_bucket_name("_console").is_err());
+        assert!(validate_bucket_name("_x").is_err());
+        assert!(validate_bucket_name("_").is_err());
+    }
+
+    #[test]
+    fn accepts_ordinary_bucket_names() {
+        // `console` 必须**继续合法**：这正是选用 `/_console`（而不是 `/console`）
+        // 的全部意义——不把一个正常名字变成禁词。这条断言是那个决定的门闩，
+        // 谁把规则改成「禁止 console」都会在这里红。
+        for ok in ["console", "x_y", "test-bucket", "a", "my.bucket", "123"] {
+            assert!(validate_bucket_name(ok).is_ok(), "{ok} 应当合法");
+        }
     }
 
     #[test]
