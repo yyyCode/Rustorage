@@ -13,6 +13,9 @@ pub mod impl_s3;
 pub(crate) mod validate;
 
 #[cfg(test)]
+mod testutil;
+
+#[cfg(test)]
 mod mock;
 
 pub use impl_s3::RstoreFs;

@@ -487,13 +487,9 @@ mod tests {
 
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
-    use http_body_util::{BodyExt, Full};
-    use s3s::auth::SimpleAuth;
     use s3s::service::S3ServiceBuilder;
-    use s3s_sigv4::{AmzDate, Payload};
-    use tower::ServiceExt;
 
-    use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
+    use rstore_api::ObjectStore;
 
     use super::*;
     use crate::build_service;
@@ -510,88 +506,12 @@ mod tests {
         }
     }
 
-    const ACCESS_KEY: &str = "testkey";
-    const SECRET_KEY: &str = "testsecret";
-    const REGION: &str = "us-east-1";
-    const HOST: &str = "s3.example.com";
-
-    /// 一个什么都没做的 `ObjectStore`：本节只测认证，不测业务。
-    ///
-    /// 桩方法**一律写出来**，不用 `todo!()` / `unimplemented!()`：panic 的桩会污染
-    /// 测试输出，而且一个 panic 的桩会让「测试绿了」这件事失去意义。
-    struct NopStore;
-
-    #[async_trait::async_trait]
-    impl ObjectStore for NopStore {
-        async fn create_bucket(&self, _bucket: &str) -> Result<(), ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn delete_bucket(&self, _bucket: &str) -> Result<(), ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn head_bucket(&self, _bucket: &str) -> Result<(), ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn list_buckets(&self) -> Result<Vec<String>, ApiError> {
-            Ok(Vec::new())
-        }
-        async fn put_object(&self, _req: PutRequest) -> Result<ObjectInfo, ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn get_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _range: Option<ByteRange>,
-        ) -> Result<ObjectData, ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn head_object(&self, _bucket: &str, _key: &str) -> Result<ObjectInfo, ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<(), ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-        async fn list_objects(
-            &self,
-            _bucket: &str,
-            _prefix: Option<&str>,
-        ) -> Result<Vec<ObjectEntry>, ApiError> {
-            Err(ApiError::Internal("nop".into()))
-        }
-    }
-
-    fn service() -> s3s::service::S3Service {
-        let mut b = S3ServiceBuilder::new(RstoreFs {
-            store: Arc::new(NopStore),
-        });
-        b.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY));
-        b.build()
-    }
-
-    type TestBody = Full<Bytes>;
-
-    /// 打一个请求进**指定的** service，返回 (状态码, 响应头, 响应体字节)。零端口、零等待。
-    async fn call_on(
-        service: s3s::service::S3Service,
-        req: http::Request<TestBody>,
-    ) -> (StatusCode, HeaderMap, Bytes) {
-        let resp = service.oneshot(req).await.expect("service call failed");
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .expect("collect body failed")
-            .to_bytes();
-        (status, headers, bytes)
-    }
-
-    /// 打一个请求进 5.1 的认证 service（`NopStore` + `SimpleAuth`）。
-    async fn call(req: http::Request<TestBody>) -> (StatusCode, HeaderMap, Bytes) {
-        call_on(service(), req).await
-    }
+    // 签名与请求辅助都搬到 `testutil.rs` 了——`iam.rs` 的权限矩阵测试要用
+    // 同一套（复制第二份就等于放弃了对校验的测试）。
+    use crate::testutil::{
+        call, call_on, error_code, request, signed_list_buckets, signed_request, TestBody,
+        ACCESS_KEY, SECRET_KEY,
+    };
 
     /// 业务测试用的 service：挂 `MockStore`，**不设 auth**。
     ///
@@ -600,114 +520,6 @@ mod tests {
     /// 5.2 只测操作翻译，不必给每个请求再签一遍名。
     fn mock_service(store: Arc<MockStore>) -> s3s::service::S3Service {
         S3ServiceBuilder::new(RstoreFs { store }).build()
-    }
-
-    /// 构造一个（通常不签名的）请求。`path` 用 origin-form，如 `/test-bucket`。
-    fn request(method: &str, path: &str, body: &[u8]) -> http::Request<TestBody> {
-        http::Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", HOST)
-            .body(Full::new(Bytes::copy_from_slice(body)))
-            .expect("build request")
-    }
-
-    /// 解析错误响应体的 `<Code>`，例如 `"SignatureDoesNotMatch"`。
-    fn error_code(body: &[u8]) -> String {
-        let xml = std::str::from_utf8(body).expect("error body is utf-8 xml");
-        let start = xml.find("<Code>").expect("no <Code> in error body") + "<Code>".len();
-        let end = start
-            + xml[start..]
-                .find("</Code>")
-                .expect("no </Code> in error body");
-        xml[start..end].to_string()
-    }
-
-    /// 用 `s3s` 自带的 SigV4 工具签一个请求，`secret` 显式给出（便于故意签错）。
-    ///
-    /// 签名实现来自 `s3s-sigv4`（`s3s` 的直接依赖），**不是**自己另写一份：
-    /// 用与被测代码不同一条路径的签名实现来生成请求，才是真的在测「服务端的校验」。
-    ///
-    /// `host` 会同时进 URI 的 authority、`Host` 头和被签的 `SignedHeaders`——
-    /// 三者必须一致，否则服务端校验时按声明的顺序读到的值对不上签名（虚拟主机
-    /// 寻址的关键恰恰是 `Host`，只改它而不重签会先撞 `SignatureDoesNotMatch`）。
-    fn signed_request_with_secret(
-        secret: &str,
-        method: &str,
-        path: &str,
-        host: &str,
-        body: &[u8],
-    ) -> http::Request<TestBody> {
-        let date = jiff::Timestamp::now()
-            .strftime("%Y%m%dT%H%M%SZ")
-            .to_string();
-        let amz_date = AmzDate::parse(&date).expect("valid amz date");
-        let payload_hash = sha256_hex(body);
-
-        // 顺序必须与 `SignedHeaders` 完全一致：s3s 校验时按声明的顺序读头、不做排序。
-        let signed_headers = [
-            ("host", host),
-            ("x-amz-content-sha256", payload_hash.as_str()),
-            ("x-amz-date", date.as_str()),
-        ];
-        let query: &[(String, String)] = &[];
-        let canonical = s3s_sigv4::create_canonical_request(
-            method,
-            path,
-            query,
-            signed_headers,
-            Payload::SingleChunk(&payload_hash),
-        );
-        let string_to_sign = s3s_sigv4::create_string_to_sign(&canonical, &amz_date, REGION, "s3");
-        let signature =
-            s3s_sigv4::calculate_signature(&string_to_sign, secret, &amz_date, REGION, "s3");
-
-        // Credential 范围里的日期是 `YYYYMMDD`，不是完整的 ISO8601 时间戳。
-        let scope_date = &date[..8];
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{scope_date}/{REGION}/s3/aws4_request, \
-             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
-        );
-
-        http::Request::builder()
-            .method(method)
-            .uri(format!("http://{host}{path}"))
-            .header("host", host)
-            .header("x-amz-content-sha256", &payload_hash)
-            .header("x-amz-date", &date)
-            .header("authorization", authorization)
-            .body(Full::new(Bytes::copy_from_slice(body)))
-            .expect("build request")
-    }
-
-    /// 用正式密钥签一个请求（5.1 与 5.11 的业务用例都用它）。
-    fn signed_request(
-        method: &str,
-        path: &str,
-        host: &str,
-        body: &[u8],
-    ) -> http::Request<TestBody> {
-        signed_request_with_secret(SECRET_KEY, method, path, host, body)
-    }
-
-    /// 5.1 的认证测试要故意用**错误的** secret 签名，所以保留这个可传 secret 的薄封装。
-    fn signed_list_buckets(secret: &str) -> http::Request<TestBody> {
-        signed_request_with_secret(secret, "GET", "/", HOST, b"")
-    }
-
-    /// 请求体的 `x-amz-content-sha256`。空体直接用 `s3s-sigv4` 提供的常量。
-    fn sha256_hex(body: &[u8]) -> String {
-        if body.is_empty() {
-            return s3s_sigv4::EMPTY_STRING_SHA256_HASH.to_string();
-        }
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(body);
-        // 手写十六进制：`digest 0.11` 的输出类型是否实现 `LowerHex` 不确定，手写循环两版都成立。
-        digest.iter().fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{:02x}", *b);
-            s
-        })
     }
 
     #[tokio::test]
