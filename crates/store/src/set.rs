@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use rstore_common::modes::IoModes;
 use rstore_disk::DiskAPI;
 use rstore_erasure::CodecCache;
 
@@ -49,14 +50,30 @@ pub struct ErasureSet {
     data: u8,   // = total - parity
     parity: u8, // = total - data
     codec_cache: CodecCache,
+    /// 读写路径的模式开关。基准专用，量完即删（设计文档 §10）。
+    modes: IoModes,
 }
 
 impl ErasureSet {
-    /// 从槽位视图构造。`disks.len()` 即 `total = data + parity`；
+    /// **旧路径**：四个机制全关。
+    ///
+    /// 签名与语义都与引入模式开关之前完全一致，因此所有现存调用点（含全部既有
+    /// 测试）一个字节都不用改。**「旧模式」的定义就是这个构造函数。**
+    pub fn new(disks: Vec<Option<Arc<dyn DiskAPI>>>, parity: u8) -> Result<Self, StoreError> {
+        Self::with_modes(disks, parity, IoModes::default())
+    }
+
+    /// 指定模式构造。`disks.len()` 即 `total = data + parity`；
     /// `parity` 必须 `< total`，否则没有数据分片，任何编码都无意义。
     ///
     /// `Vec` 里的 `None` 表示该槽位的盘已经掉线（这类槽位仍占据一个分片下标）。
-    pub fn new(disks: Vec<Option<Arc<dyn DiskAPI>>>, parity: u8) -> Result<Self, StoreError> {
+    ///
+    /// **构造期的校验一条都不因为模式而放松**：这两个判据是几何正确性的前提。
+    pub fn with_modes(
+        disks: Vec<Option<Arc<dyn DiskAPI>>>,
+        parity: u8,
+        modes: IoModes,
+    ) -> Result<Self, StoreError> {
         let len = disks.len();
         // `total` 以 u8 参与几何运算；超过 255 块盘无法表示，直接在构造期拒绝，
         // 胜过把截断后的盘数带到读取/编码路径里再出问题。
@@ -73,7 +90,13 @@ impl ErasureSet {
             data: total - parity,
             parity,
             codec_cache: CodecCache::new(CODEC_CACHE_CAPACITY),
+            modes,
         })
+    }
+
+    /// 本 set 的模式开关。
+    pub fn modes(&self) -> IoModes {
+        self.modes
     }
 
     /// 槽位视图，下标即分片下标。`None` = 该盘掉线。Task 4.4/4.6/4.7 都要按槽位遍历。
@@ -199,6 +222,22 @@ mod tests {
     #[test]
     fn rejects_empty_set() {
         assert!(ErasureSet::new(vec![], 0).is_err());
+    }
+
+    /// `new` 就是「全关」，`with_modes` 原样保留模式，且**几何校验在两处都生效**。
+    /// 最后两条尤其重要：新路径不该因为「只是多了个开关」就少掉一道几何闸。
+    #[test]
+    fn new_is_old_mode_and_with_modes_keeps_geometry_checks() {
+        let set = ErasureSet::new(vec![None; 6], 2).unwrap();
+        assert_eq!(set.modes(), IoModes::default());
+
+        let set = ErasureSet::with_modes(vec![None; 6], 2, IoModes::ALL).unwrap();
+        assert_eq!(set.modes(), IoModes::ALL);
+        assert_eq!(set.data(), 4, "模式不该影响几何");
+        assert_eq!(set.read_quorum(), 4);
+
+        assert!(ErasureSet::with_modes(vec![None; 2], 2, IoModes::ALL).is_err());
+        assert!(ErasureSet::with_modes(vec![], 0, IoModes::ALL).is_err());
     }
 
     /// parity = 0 合法（纯镜像），data 等于 total。

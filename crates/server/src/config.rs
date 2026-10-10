@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use rstore_common::modes::IoModes;
 use rstore_store::set::default_parity;
 
 /// 启动参数。6.4 的验收脚本与 5.9 的冒烟脚本都依赖这里的参数名与默认值。
@@ -52,6 +53,16 @@ pub struct Config {
     /// 不允许以 `.rstore` 开头，所以桶/对象**结构上够不到**这份配置。
     #[arg(long)]
     pub(crate) iam_dir: Option<PathBuf>,
+
+    /// 读写路径模式：`old` = 今天的实现；`new` = 四个加速机制全开。
+    ///
+    /// **默认 `old`**：新路径还没跑过完整接受度验证，不该在无人察觉时成为默认。
+    /// 这是性能对比用的开关，基准做完后整体删除（见设计文档 §10）。
+    ///
+    /// **只暴露两档**，不做逐位开关：CLI 面上出现「半新半旧」的组合只会让
+    /// 每一次测量都需要额外解释自己开的是哪几个机制。
+    #[arg(long, value_name = "MODE", default_value = "old", value_parser = ["old", "new"])]
+    pub(crate) io_mode: String,
 }
 
 impl Config {
@@ -75,6 +86,14 @@ impl Config {
                 .join("iam")
         })
     }
+
+    /// 解析成 [`IoModes`]。
+    ///
+    /// clap 的 `value_parser` 已经把取值限死在 `old` / `new`，所以这个 `expect`
+    /// 是**可达性断言**而不是错误处理：真走到 `None` 说明 `arg` 属性被改坏了。
+    pub(crate) fn modes(&self) -> IoModes {
+        IoModes::from_io_mode(&self.io_mode).expect("clap value_parser 已把取值限死为 old|new")
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +111,7 @@ mod tests {
             metrics: false,
             console: false,
             iam_dir,
+            io_mode: "old".into(),
         }
     }
 
@@ -117,5 +137,15 @@ mod tests {
             Some(PathBuf::from("/etc/rstore-iam")),
         );
         assert_eq!(c.iam_dir(), PathBuf::from("/etc/rstore-iam"));
+    }
+
+    /// 不指定时必须是 `old`（全关）——这条钉住「默认行为与今天一致」。
+    #[test]
+    fn io_mode_defaults_to_old_and_new_switches_everything_on() {
+        let mut c = cfg(vec![PathBuf::from("/d1")], None);
+        assert_eq!(c.modes(), IoModes::default());
+
+        c.io_mode = "new".into();
+        assert_eq!(c.modes(), IoModes::ALL);
     }
 }
