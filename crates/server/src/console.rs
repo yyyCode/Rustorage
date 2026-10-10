@@ -122,7 +122,14 @@ mod tests {
     #[test]
     fn unrelated_paths_are_not_intercepted() {
         // `/_consoleX` 与 `/_console.html` 只是**同前缀**，不是同段——必须落到 s3s。
-        for p in ["/", "/metrics", "/metrics/", "/_consoleX", "/_console.html", "/_consolex/a"] {
+        for p in [
+            "/",
+            "/metrics",
+            "/metrics/",
+            "/_consoleX",
+            "/_console.html",
+            "/_consolex/a",
+        ] {
             assert!(maybe_route(true, p).is_none(), "{p} 不该被拦");
         }
     }

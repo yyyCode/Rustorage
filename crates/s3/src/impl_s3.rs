@@ -778,8 +778,11 @@ mod tests {
     #[tokio::test]
     async fn underscore_bucket_name_is_rejected_by_upstream_validation() {
         let store = Arc::new(MockStore::default());
-        let (status, _headers, body) =
-            call_on(mock_service(store.clone()), request("PUT", "/_private", b"")).await;
+        let (status, _headers, body) = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/_private", b""),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -803,11 +806,8 @@ mod tests {
     #[tokio::test]
     async fn console_bucket_name_is_still_valid() {
         let store = Arc::new(MockStore::default());
-        let (status, _headers, body) = call_on(
-            mock_service(store.clone()),
-            request("PUT", "/console", b""),
-        )
-        .await;
+        let (status, _headers, body) =
+            call_on(mock_service(store.clone()), request("PUT", "/console", b"")).await;
         assert_eq!(
             status,
             StatusCode::OK,

@@ -511,9 +511,7 @@ mod tests {
     async fn raw_get(addr: std::net::SocketAddr, path: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-        );
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
@@ -523,9 +521,13 @@ mod tests {
     async fn bind_with(volumes: Vec<PathBuf>, console: bool) -> Running {
         let mut cfg = make_config(volumes);
         cfg.console = console;
-        Running::bind(&cfg, Arc::new(Readiness::new()), Arc::new(Metrics::new(false)))
-            .await
-            .unwrap()
+        Running::bind(
+            &cfg,
+            Arc::new(Readiness::new()),
+            Arc::new(Metrics::new(false)),
+        )
+        .await
+        .unwrap()
     }
 
     /// 面板路由真的接上了没有——`maybe_route` 自身的行为由 `console.rs` 的测试负责，
@@ -541,7 +543,10 @@ mod tests {
         // 截获」这条设计约束的证据：一旦截晚了，路径就已经是个 400 了。
         let running = bind_with(volumes.clone(), false).await;
         let body = raw_get(running.local_addr(), "/_console/").await;
-        assert!(body.starts_with("HTTP/1.1 400"), "应落到 s3s 并判非法桶名: {body}");
+        assert!(
+            body.starts_with("HTTP/1.1 400"),
+            "应落到 s3s 并判非法桶名: {body}"
+        );
         running.shutdown().await;
 
         // 打开开关：同一路径变成面板页面。
@@ -554,7 +559,10 @@ mod tests {
 
         // 同前缀不同段：仍然落到 s3s（同样是 s3s 给的 400）。
         let body = raw_get(addr, "/_consoleX").await;
-        assert!(body.starts_with("HTTP/1.1 400"), "/_consoleX 不该被面板带走: {body}");
+        assert!(
+            body.starts_with("HTTP/1.1 400"),
+            "/_consoleX 不该被面板带走: {body}"
+        );
 
         // **回归**：`/metrics/`（带尾斜杠）必须继续落到 s3s。这里是 403 而不是 400——
         // `metrics` 是**合法**桶名，所以它走得到鉴权那一步。启动脚本里那条「精确路径
