@@ -1621,7 +1621,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
     ///
     /// **为什么不能用「先全收进 BTreeSet 再 sort」**（[`Self::candidate_keys`] 的做法）：
     /// 那样无法提前停，10 万个 key 的桶要全走完才能返回第一页。这里改成有序 DFS，
-    /// 收够 `want` 个候选、或越过 `after` 所在的子树时立刻收手。
+    /// 收够 `want` 个候选之后立刻收手。
     ///
     /// **为什么必须在键目录这一层就把 key 定下来**：盘上布局是
     /// `<bucket>/<key>/<uuid>/meta.xl`，即一个 key 对应一个**目录**，版本在它的
@@ -1632,8 +1632,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
     /// 「`p` 自己是不是一个 key」并**先输出它**，然后再下探非版本目录。
     /// 见设计文档 §4.3。
     ///
-    /// `after` 是**排除式游标**：一个 key（或公共前缀 `dir/`），不是下标。
-    /// 整棵子树若整体 `<= after` 会被整块剪掉，所以翻页不会退化成「每页从头走一遍」。
+    /// **提前停与 `more` 的准确性**：发现第 `want + 1` 个候选时才报 `more = true`。
+    /// 多走这一步是为了把 `more` 定准——谎报 `true` 会让调用方再发一次请求，
+    /// 而在「整棵子树都要重走」的老实现上那是一次全量遍历。`want` 是**候选**数的
+    /// 上界，不是返回条目数的上界（候选是否活着由 `resolve_version` 判）。
     async fn candidate_keys_ordered(
         &self,
         bucket: &str,
@@ -1646,36 +1648,28 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
         let mut stack: Vec<String> = vec![String::new()];
 
         while let Some(dir_rel) = stack.pop() {
+            let at_root = dir_rel.is_empty();
             // 整棵子树都在游标之前 → 整块剪掉，一次 `list_dir` 都不发。
-            // 子树里的 key 要么等于 `dir_rel`，要么以 `dir_rel/` 开头；两者都
-            // `<= after` 当且仅当 `dir_rel/` <= after。
             if let Some(a) = after {
-                if !dir_rel.is_empty() && format!("{dir_rel}/").as_str() <= a {
+                if !at_root && subtree_at_or_before(&dir_rel, a) {
                     continue;
                 }
             }
 
             // `entries_under` 返回的是 BTreeSet 派生出的升序 `Vec`，直接可用。
             let entries = self.entries_under(&join_rel(bucket, &dir_rel)).await;
-            let mut child_dirs: Vec<String> = Vec::new();
             let mut is_key = false;
+            let mut child_dirs: Vec<String> = Vec::new();
             for name in entries {
                 if name.starts_with(".staging-") {
                     continue;
                 }
                 // 用户 key 的首段不可能是保留前缀（DESIGN §6.3 / Task 5.7），
                 // 所以这只跳过系统目录，不会藏掉用户数据。
-                if dir_rel.is_empty() && name.starts_with(RESERVED_PREFIX) {
+                if at_root && name.starts_with(RESERVED_PREFIX) {
                     continue;
                 }
                 let child_rel = join_rel(&dir_rel, &name);
-                // 游标剪枝：整棵子树 `<= after` 时连一次 `stat` / `list_dir` 都不必发。
-                // 条目已升序，所以第一个被剪掉的子树之后全是——直接 `break`。
-                if let Some(a) = after {
-                    if format!("{child_rel}/").as_str() <= a {
-                        break;
-                    }
-                }
                 if !self.any_disk_is_dir(&join_rel(bucket, &child_rel)).await {
                     continue;
                 }
@@ -1684,17 +1678,16 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
                 let sub = self.entries_under(&join_rel(bucket, &child_rel)).await;
                 if sub.iter().any(|e| e == "meta.xl") {
                     is_key = true;
-                } else {
+                } else if after.is_none_or(|a| !subtree_at_or_before(&child_rel, a)) {
+                    // 整棵子树都在游标之前就不压栈——剪枝发生在这一层，所以下面的
+                    // `is_key` 判定不受影响：它只依赖「子目录里有没有 meta.xl」。
                     child_dirs.push(child_rel);
                 }
             }
 
             // **先输出自己，再下探**——`p` 必须排在 `p/a` 之前。
-            if is_key && !dir_rel.is_empty() && after.is_none_or(|a| dir_rel.as_str() > a) {
+            if is_key && !at_root && after.is_none_or(|a| dir_rel.as_str() > a) {
                 if keys.len() >= want {
-                    // 已经够一页，而且**确实**还有下一个候选 → 报 `more` 并立刻收手。
-                    // 这里多走一步是为了把 `more` 定准：谎报 `true` 会让调用方再发一次
-                    // 请求，而在「整棵子树都要重走」的老实现上那是一次全量遍历。
                     more = true;
                     break;
                 }
@@ -1710,6 +1703,60 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
         (keys, more)
     }
 ```
+
+**（执行时重写）** 上面这段的游标剪枝**不是**初稿。初稿有两处会静默丢结果的写法，
+写在这里当反例：
+
+```rust
+// 反例一：拿 `dir_rel/` 与游标比。`"dir/" < "dir/b"` 成立，但 `"dir/c"` 也排在
+// `"dir/b"` 之后——按目录路径比会把整棵 dir 子树连根剪掉。
+if format!("{dir_rel}/").as_str() <= a { continue; }
+
+// 反例二：条目升序遍历时一旦剪掉一个就 `break`。
+// 「第一个被剪掉的子树之后全是」同样是错的：`"a/" <= "dir/b"`，后面还有 p 子树。
+if format!("{child_rel}/").as_str() <= a { break; }
+```
+
+后果不是「顺序略差」而是**分页提前收尾**：`after = "dir/b"` 时第一个条目 `a`
+就命中反例二的 `break`，整页返回空、`more = false`，5 个 key 只列出 2 个。
+`ordered_traversal_matches_full_traversal_including_the_uuid_trap` 那条一页一个的
+测试正好在第 3 页撞上它。
+
+正确做法是给子树算一个**保守上界** `dir_rel + '\u{10FFFF}'`（见 Step 1b），
+与游标比这个上界。
+
+- [ ] **Step 1b: 加子树上界判定**
+
+在 `crates/store/src/list.rs` 的 `parent_path` 之后加：
+
+```rust
+/// `dir_rel` 这棵子树里的**所有**候选 key 是否都 `<= after`——是则可以整块剪掉。
+///
+/// 子树里的 key 只有两种形状：`dir_rel` 本身，或 `dir_rel/<...>`。两者都以
+/// `dir_rel` 开头，紧随其后的字节要么不存在，要么是 `/`（0x2f）——都小于
+/// `U+10FFFF` 的首字节 0xF4。所以 `dir_rel + '\u{10FFFF}'` 是这棵子树的一个
+/// **严格上界**，拿它跟游标比是保守的：只有确实整棵都在游标之前才剪。
+///
+/// **两个看似可行、其实都是错的做法**，写在这里免得后来者「顺手优化」回去：
+///
+/// - 「`dir_rel <= after` 就剪」：`"dir" < "dir/b"`，但 `"dir/c"` 也排在
+///   `"dir/b"` 之后——按目录路径比会把它一起剪掉。
+/// - 「拿下一个兄弟目录名当上界」：`'/'`(0x2f) 比 `'-'`(0x2d)、`'.'`(0x2e) 都大，
+///   于是 `"p-x" < "p/a"`；兄弟名不构成上界。
+fn subtree_at_or_before(dir_rel: &str, after: &str) -> bool {
+    let mut bound = String::with_capacity(dir_rel.len() + 4);
+    bound.push_str(dir_rel);
+    bound.push('\u{10FFFF}');
+    bound.as_str() <= after
+}
+```
+
+> **已知残留假设（这次不修）**：整个有序 DFS 的前提是「同一个目录下，兄弟名
+> 互不为前缀，或续接字符都大于 `'/'`」。反例是键 `p/a` 与 `p-x`：DFS 先走完
+> `p` 再走 `p-x`，于是输出 `p/a, p-x`，而字节序是 `p-x < p/a`。修它要命名空间
+> 索引（DESIGN §20 Phase 2），不是「换个比较函数」能解决的。这条要写进 Task 9
+> 的基准报告「已知限制」，并说明**默认（`old`）模式不受影响**：旧路径用
+> `BTreeSet` 整体排序，天然正确。
 
 - [ ] **Step 2: 加 `list_objects_from`，并把 `list_objects` 改成它的特化**
 
@@ -1748,6 +1795,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
     /// 会从结果里消失。所以一页可能比 `want` 短，而 `more` 仍为 `true`——
     /// 调用方据此继续取下一批。
     ///
+    /// **契约：`entries` 为空时 `more` 必然为 `false`**，否则调用方会空转。
+    /// `want == 0` 是这条契约的退化边界，直接按空页处理：调用方（S3 层）用
+    /// `max_keys.max(1)` 保证不会走到这里，两条模式在这个边界上也保持一致。
+    ///
     /// **模式判断只此一处**：`bounded_listing` 关着就走旧的全量遍历
     /// （[`Self::candidate_keys`]，今天的实现），开着才走有序增量遍历。
     /// 两条实现都在，这正是新旧对比的基础。
@@ -1758,6 +1809,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
         after: Option<&str>,
         want: usize,
     ) -> Result<(Vec<ObjectEntry>, bool), StoreError> {
+        if want == 0 {
+            return Ok((Vec::new(), false));
+        }
+
         let (candidates, more) = if self.modes().bounded_listing {
             self.candidate_keys_ordered(bucket, after, want).await
         } else {
@@ -1956,6 +2011,9 @@ Expected: 既有 3 条 + 新增 3 条全绿。
         after: Option<&str>,
         want: usize,
     ) -> Result<(Vec<ObjectEntry>, bool), ApiError> {
+        if want == 0 {
+            return Ok((Vec::new(), false));
+        }
         let all = self.list_objects(bucket, prefix).await?;
         let mut out: Vec<ObjectEntry> = Vec::new();
         let mut more = false;

@@ -40,6 +40,43 @@ pub trait ObjectStore: Send + Sync + 'static {
         bucket: &str,
         prefix: Option<&str>,
     ) -> Result<Vec<ObjectEntry>, ApiError>;
+
+    /// 有界列举（`bounded_listing` 机制用）：从 `after`（**不含**）之后按 key 升序
+    /// 取至多 `want` 个条目，返回 `(entries, more)`。
+    ///
+    /// **默认实现退化成「一次全量 + 客户端过滤」——这正是旧行为**，所以没实现它的
+    /// `ObjectStore`（mock / nop / 将来的其他实现）不必改动，也不会因为少了这个方法
+    /// 而编译不过。`Wiring` 覆盖它以走引擎的增量遍历。
+    ///
+    /// `want` 是条目数的上界；`more = true` 表示后面还有。**实现必须保证
+    /// `entries.is_empty()` ⇒ `more == false`**，否则调用方会空转。
+    async fn list_objects_from(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        want: usize,
+    ) -> Result<(Vec<ObjectEntry>, bool), ApiError> {
+        if want == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let all = self.list_objects(bucket, prefix).await?;
+        let mut out: Vec<ObjectEntry> = Vec::new();
+        let mut more = false;
+        for e in all {
+            if let Some(a) = after {
+                if e.key.as_str() <= a {
+                    continue;
+                }
+            }
+            if out.len() >= want {
+                more = true;
+                break;
+            }
+            out.push(e);
+        }
+        Ok((out, more))
+    }
 }
 
 /// 闭区间 `[start, end]`。**不复用 `rstore_store::ByteRange`**（那条边不存在）——

@@ -221,4 +221,37 @@ impl ObjectStore for Wiring {
             }
         }
     }
+
+    /// 转发给引擎的增量遍历。模式关着时引擎自己会退回全量（见 `list_objects_from`
+    /// 在 `crates/store/src/list.rs` 里的分派），所以这一层不需要认识模式。
+    async fn list_objects_from(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        want: usize,
+    ) -> Result<(Vec<ObjectEntry>, bool), ApiError> {
+        match self
+            .set
+            .list_objects_from(bucket, prefix, after, want)
+            .await
+        {
+            Ok((entries, more)) => Ok((
+                entries
+                    .into_iter()
+                    .map(|e| ObjectEntry {
+                        key: e.key,
+                        size: e.size,
+                        etag: e.etag,
+                        mod_time: e.mod_time,
+                    })
+                    .collect(),
+                more,
+            )),
+            Err(e) => {
+                self.note_err(&e, "list");
+                Err(map_object_err(e))
+            }
+        }
+    }
 }
