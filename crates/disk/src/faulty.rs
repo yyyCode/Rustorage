@@ -165,6 +165,33 @@ impl DiskAPI for FaultyDisk {
         }
     }
 
+    async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
+        self.begin_call()?;
+
+        // 与 `write_all` 相同的 payload 变换。两条写路径分叉，会让走 `append` 的
+        // 实现悄悄绕过 Truncate / PartialWrite / CorruptBytes，故障注入就白做了。
+        match self.current_fault() {
+            Some(Fault::DropWrites) => Ok(()),
+            Some(Fault::PartialWrite) => {
+                let half = data.len() / 2;
+                self.inner.append(rel_path, &data[..half]).await
+            }
+            Some(Fault::Truncate { len }) => {
+                let n = len.min(data.len());
+                self.inner.append(rel_path, &data[..n]).await
+            }
+            Some(Fault::CorruptBytes { at, mask }) => {
+                let mut buf = data.to_vec();
+                // 越界视为 no-op：`DiskAPI` 约定实现不得 panic。
+                if let Some(byte) = buf.get_mut(at) {
+                    *byte ^= mask;
+                }
+                self.inner.append(rel_path, &buf).await
+            }
+            _ => self.inner.append(rel_path, data).await,
+        }
+    }
+
     async fn read_exact_at(
         &self,
         rel_path: &str,

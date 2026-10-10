@@ -35,6 +35,12 @@ pub struct FileStat {
 #[async_trait::async_trait]
 pub trait DiskAPI: Send + Sync {
     async fn write_all(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError>;
+    /// 追加写。逐块落盘的分片写入器用它（见 `rstore_store::writer`）。
+    ///
+    /// **必须与 [`Self::write_all`] 区分开**：`write_all` 创建即截断，对同一路径
+    /// 反复调用只会留下最后一次；`append` 则等价于「顺序写完整个文件」。
+    /// **不 fsync**：调用方在最后一块之后用 [`Self::sync_file_and_parent`] 收尾。
+    async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError>;
     async fn read_exact_at(
         &self,
         rel_path: &str,
@@ -119,6 +125,35 @@ pub mod contract_tests {
             entries.windows(2).all(|w| w[0] <= w[1]),
             "list_dir must be sorted ascending, got {entries:?}"
         );
+
+        // 追加语义：这正是 `write_all` 做不到、而流式分片落盘依赖的那一点。
+        // 三次调用必须等价于「一次写完 abcdef」。
+        let app = "__contract__/append";
+        disk.append(app, b"ab").await.expect("first append");
+        disk.append(app, b"cd").await.expect("second append");
+        disk.append(app, b"ef").await.expect("third append");
+        let got = disk
+            .read_exact_at(app, 0, 6)
+            .await
+            .expect("read back appended content");
+        assert_eq!(
+            got.as_slice(),
+            b"abcdef",
+            "append must concatenate; a truncating implementation would leave only ef"
+        );
+
+        // 两者的差别要在同一个测试里明确钉住：同一路径上再 `write_all` 一次，
+        // 必须把 6 字节截断回 3 字节。上面那段其实已经能区分两者（截断式实现
+        // 只会剩下 `ef`），但把「write_all 仍是截断」也写下来，
+        // 才能同时防住「把 write_all 改成追加」这个反向的错误改动。
+        disk.write_all(app, b"XYZ")
+            .await
+            .expect("write_all should succeed");
+        let got = disk
+            .read_exact_at(app, 0, 3)
+            .await
+            .expect("read back truncated content");
+        assert_eq!(got.as_slice(), b"XYZ", "write_all must still truncate");
 
         // sync_file_and_parent 幂等：连调两次都成功。
         disk.sync_file_and_parent(file)
