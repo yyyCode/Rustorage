@@ -50,7 +50,8 @@ pub struct Running {
 
 impl Running {
     /// 在 `addr` 上监听（用 `cfg.port`，`0` 表示由内核分配），把 `/health` `/ready`
-    /// `/metrics` 三条路径截下来，其余交给 s3s。返回后服务已在跑。
+    /// `/metrics` 三条精确路径与 `--console` 打开时的 `/_console` 命名空间截下来，
+    /// 其余交给 s3s。返回后服务已在跑。
     pub async fn bind(
         cfg: &Config,
         ready: Arc<Readiness>,
@@ -92,6 +93,7 @@ impl Running {
             s3,
             Arc::clone(&ready),
             Arc::clone(&m),
+            cfg.console,
             token,
         ));
         running.track_task(loop_handle);
@@ -137,6 +139,7 @@ async fn accept_loop(
     s3: s3s::service::S3Service,
     ready: Arc<Readiness>,
     metrics: Arc<Metrics>,
+    console: bool,
     token: CancellationToken,
 ) {
     loop {
@@ -167,10 +170,21 @@ async fn accept_loop(
                             ),
                             "/ready" => Ok(ready.ready_response().map(s3s::Body::from)),
                             "/metrics" => Ok(metrics.metrics_response().map(s3s::Body::from)),
+                            // 控制面板也判在这一层，理由有三：
+                            // 1. 它的路由是**命名空间**匹配（`/_console` 或 `/_console/...`），
+                            //    与上面三条的精确匹配不是一套规则，判断收在 `maybe_route` 里；
+                            // 2. 必须在 s3s **之前**——`_console` 含下划线，会被 s3s 的
+                            //    `check_bucket_name` 在路径解析期判成非法桶名直接 400，
+                            //    永远轮不到我们（见 `crates/s3` 的 underscore 测试）；
+                            // 3. 落在 ready 门**之前**，所以启动中也能打开页面看阶段
+                            //    （预备页面本身就要显示 Booting），这是设计 §2.2 要的。
                             // `S3Service` 有同名的固有 `call(req: Request<Body>)`，
                             // 会遮蔽 hyper trait 方法，必须用全限定语法走 trait 那个
                             // `call(req: Request<Incoming>)`。
-                            _ => Service::call(&s3, req).await,
+                            _ => match crate::console::maybe_route(console, &path) {
+                                Some(resp) => Ok::<_, s3s::HttpError>(resp.map(s3s::Body::from)),
+                                None => Service::call(&s3, req).await,
+                            },
                         }
                     }
                 }),
@@ -380,6 +394,7 @@ mod tests {
             secret_key: "rustorage-secret".into(),
             base_domain: None,
             metrics: false,
+            console: false,
         }
     }
 
@@ -489,5 +504,66 @@ mod tests {
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "shutdown 返回后监听套接字必须已释放"
         );
+    }
+
+    /// 用裸 TCP 发一个请求并读回整个响应。**必须带 `Connection: close`**：
+    /// 不带的话 hyper 保持 keep-alive，`read_to_end` 会一直等下去（测试挂死）。
+    async fn raw_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn bind_with(volumes: Vec<PathBuf>, console: bool) -> Running {
+        let mut cfg = make_config(volumes);
+        cfg.console = console;
+        Running::bind(&cfg, Arc::new(Readiness::new()), Arc::new(Metrics::new(false)))
+            .await
+            .unwrap()
+    }
+
+    /// 面板路由真的接上了没有——`maybe_route` 自身的行为由 `console.rs` 的测试负责，
+    /// 这里验的是**接线**，所以打的是真实 TCP。
+    #[tokio::test]
+    async fn console_route_is_wired_and_off_by_default() {
+        let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let volumes: Vec<PathBuf> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+
+        // 默认（`console: false`）时 `/_console/` 落到 s3s。状态码是 **400 而不是 403**：
+        // `_console` 含下划线，被 s3s 的 `check_bucket_name` 在路径解析期就判成非法桶名，
+        // 根本走不到鉴权那一步。这个区别值得钉住——它同时也是「面板必须在 s3s 之前
+        // 截获」这条设计约束的证据：一旦截晚了，路径就已经是个 400 了。
+        let running = bind_with(volumes.clone(), false).await;
+        let body = raw_get(running.local_addr(), "/_console/").await;
+        assert!(body.starts_with("HTTP/1.1 400"), "应落到 s3s 并判非法桶名: {body}");
+        running.shutdown().await;
+
+        // 打开开关：同一路径变成面板页面。
+        let running = bind_with(volumes, true).await;
+        let addr = running.local_addr();
+        let body = raw_get(addr, "/_console/").await;
+        assert!(body.starts_with("HTTP/1.1 200"), "应命中面板: {body}");
+        assert!(body.contains("text/html"), "应当给 HTML: {body}");
+        assert!(body.contains("Rustorage Console"), "应拿到页面正文: {body}");
+
+        // 同前缀不同段：仍然落到 s3s（同样是 s3s 给的 400）。
+        let body = raw_get(addr, "/_consoleX").await;
+        assert!(body.starts_with("HTTP/1.1 400"), "/_consoleX 不该被面板带走: {body}");
+
+        // **回归**：`/metrics/`（带尾斜杠）必须继续落到 s3s。这里是 403 而不是 400——
+        // `metrics` 是**合法**桶名，所以它走得到鉴权那一步。启动脚本里那条「精确路径
+        // 匹配」注释的可执行版本就是这条断言。
+        let body = raw_get(addr, "/metrics/").await;
+        assert!(
+            body.starts_with("HTTP/1.1 403"),
+            "/metrics/ 不该命中运维端点: {body}"
+        );
+        running.shutdown().await;
     }
 }
