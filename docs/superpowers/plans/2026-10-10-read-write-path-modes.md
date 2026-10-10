@@ -129,19 +129,26 @@ mod tests {
     /// 「指定 `old` 却拿到了部分新机制」这种最难查的对比失真。
     #[test]
     fn old_is_all_off_and_new_is_all_on() {
-        assert_eq!(IoModes::from_io_mode("old"), Some(IoModes::default()));
-        assert_eq!(IoModes::from_io_mode("new"), Some(IoModes::ALL));
+        // 走 `from_io_mode` 拿值而不是直接读 `IoModes::ALL` / `default()`：
+        // 一来顺带把解析路径测了，二来对常量表达式直接断言会被 clippy 的
+        // `assertions_on_constants` 拒掉（它求值后发现恒真）。
+        let off = IoModes::from_io_mode("old").expect("old 是合法取值");
+        let on = IoModes::from_io_mode("new").expect("new 是合法取值");
 
-        let off = IoModes::default();
+        assert_eq!(off, IoModes::default());
+        assert_eq!(on, IoModes::ALL);
+
+        // 逐字段再断一遍：整体比较已经覆盖「全关/全开」，但逐项写出来，
+        // 失败时能直接指出是哪一个开关漂了。
         assert!(!off.ranged_shard_read);
         assert!(!off.metadata_cache);
         assert!(!off.bounded_listing);
         assert!(!off.pooled_write_buffers);
 
-        assert!(IoModes::ALL.ranged_shard_read);
-        assert!(IoModes::ALL.metadata_cache);
-        assert!(IoModes::ALL.bounded_listing);
-        assert!(IoModes::ALL.pooled_write_buffers);
+        assert!(on.ranged_shard_read);
+        assert!(on.metadata_cache);
+        assert!(on.bounded_listing);
+        assert!(on.pooled_write_buffers);
     }
 
     /// 未知取值必须返回 `None` 而不是悄悄退化成某一档：静默的默认值会让
@@ -371,6 +378,11 @@ use rstore_common::modes::IoModes;
             io_mode: "old".into(),
 ```
 
+**`startup.rs` 的测试里还有第二个 `Config` 字面量**（`fn make_config`，约第 405 行）——
+加了必填字段之后它也会编译不过。同样在 `iam_dir: None,` 之后加一行
+`io_mode: "old".into(),`。**别漏**：这条只有真跑 `cargo clippy --all-targets`
+才会暴露（`lib` 构建看不见 `#[cfg(test)]`）。
+
 在 `mod tests` 末尾加：
 
 ```rust
@@ -586,8 +598,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
         let w = BitrotShardWriter::new(Arc::clone(&disk), "part.1".into(), BS);
         w.finish().await.unwrap(); // 空 payload：落成 0 字节文件
 
+        // 注意这里必须用 `shard_len = 0` 的读取器，**不是**上面测试用的那个
+        // `PAYLOAD_LEN` 版本：文件是 0 字节，而 `PAYLOAD_LEN` 的期望长度是
+        // `bitrot_size(1500, 1024) = 1564`，长度检查会先报 `ShortRead` 把它拦下，
+        // 根本走不到块区间那一步。
         assert_eq!(
-            reader(Arc::clone(&disk)).read_all().await.unwrap(),
+            BitrotShardReader::new(Arc::clone(&disk), "part.1".into(), BS, 0)
+                .read_all()
+                .await
+                .unwrap(),
             Vec::<u8>::new(),
             "空分片的整份读仍然必须是空"
         );
