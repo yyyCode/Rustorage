@@ -46,6 +46,10 @@ function s(tag, attrs = {}) {
 /// 描边——颜色由 CSS 的 `color` 决定，所以同一个图标在侧栏、按钮、空态里
 /// 各自跟随所在处的文字色，不需要为每种场合复制一份。
 const ICONS = {
+  grid: [['rect', { x: 3, y: 3, width: 7, height: 7, rx: 1.5 }],
+         ['rect', { x: 14, y: 3, width: 7, height: 7, rx: 1.5 }],
+         ['rect', { x: 3, y: 14, width: 7, height: 7, rx: 1.5 }],
+         ['rect', { x: 14, y: 14, width: 7, height: 7, rx: 1.5 }]],
   bucket: [['path', { d: 'M4 7h16v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7Z' }],
            ['path', { d: 'M4 7l1.2-3.4A1 1 0 0 1 6.1 3h11.8a1 1 0 0 1 .9.6L20 7' }],
            ['path', { d: 'M10 11h4' }]],
@@ -157,14 +161,20 @@ function ensureDrawer() {
 /// 少了后一半，键盘用户关掉抽屉后会被丢回页面开头。
 export function openDrawer({ title, body }) {
   ensureDrawer();
+  const wasOpen = !!drawer.dataset.open;
   drawerTitle.textContent = title;
   drawerBody.replaceChildren(body);
-  lastFocus = document.activeElement;
   drawer.dataset.open = 'true';
   backdrop.dataset.open = 'true';
-  // 直接持有那个按钮的引用，而不是 `querySelector('button')`：抽屉头部以后
-  // 若多出别的按钮，选择器会指到错的那个，而症状只是「焦点落错地方」。
-  drawerCloseBtn.focus();
+  // 只在**首次**打开时记焦点、抢焦点。详情是先开抽屉显示骨架、再拿 HEAD 结果
+  // 填内容（两次 `openDrawer`）——若无条件重记，`lastFocus` 会变成抽屉自己的
+  // 关闭键，关掉后焦点回到一个已经不可见的节点上，等于丢焦点。
+  if (!wasOpen) {
+    lastFocus = document.activeElement;
+    // 直接持有那个按钮的引用，而不是 `querySelector('button')`：抽屉头部以后
+    // 若多出别的按钮，选择器会指到错的那个，而症状只是「焦点落错地方」。
+    drawerCloseBtn.focus();
+  }
 }
 
 export function closeDrawer() {

@@ -7,19 +7,28 @@
 <!-- 资源一律用**绝对路径**：index.html 同时服务在 `/_console` 与 `/_console/` 上，
      用相对路径时前者会把 `style.css` 解析成 `/style.css`。 -->
 <link rel="stylesheet" href="/_console/style.css">
+<!-- 页签图标。**不只是为了好看**：不写这个标签，浏览器会去请求站点根的
+     `/favicon.ico`，而那条路径不属于面板命名空间、会原样落到 s3s，于是每次
+     打开面板都在 DevTools 里留下一行匿名 403。资源登记在 ASSETS 里，
+     少登记会被 console.rs 的 `index_references_only_registered_assets` 抓住。 -->
+<link rel="icon" type="image/svg+xml" href="/_console/favicon.svg">
 </head>
 <!-- 布局：左侧固定侧栏（导航 + 桶列表 + 连接状态），右侧主区。
-     登录前由 app.js 把 body 的 data-state 置为 `anon`，样式据此收起侧栏并让登录卡片居中。 -->
+     登录前由 app.js 把 body 的 data-state 置为 `anon`，样式据此收起侧栏并让登录卡片居中。
+
+     这里只放**常驻骨架**与挂点：主区（`#view`）里的页头、面包屑、工具条、表格全部由
+     app.js 渲染。骨架不随视图变化，视图天天变——把会变的写进 HTML，就会有两处要同步。 -->
 <body data-state="anon">
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
-      <span class="brand-mark">RS</span>
+      <span class="brand-mark" aria-hidden="true">RS</span>
       <span class="brand-text">Rustorage<em>Console</em></span>
     </div>
-    <nav id="nav" class="side-nav"></nav>
+    <nav id="nav" class="side-nav" aria-label="主导航"></nav>
     <div class="side-group">
-      <p class="side-label">桶</p>
+      <!-- 计数与「桶」标签同一行：桶多的时候「我到底有几个桶」不必靠数列表。 -->
+      <p class="side-label"><span>桶</span><span id="bucket-count" class="side-count"></span></p>
       <div id="buckets" class="side-buckets"></div>
     </div>
     <div class="side-foot">

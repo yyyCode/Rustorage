@@ -81,6 +81,9 @@ expect /_console 200 text/html
 for asset in style.css app.js sigv4.js s3api.js metrics.js ui.js; do
     expect "/_console/$asset" 200
 done
+# 图标单独一行：它认领 content-type（其余脚本给不出有用的期望值，
+# 但 svg 的 `image/svg+xml` 一旦写错，浏览器只会静默不显示图标）。
+expect /_console/favicon.svg 200 image/svg+xml
 
 # CSP 是设计 §4.2 的护栏（禁止外链与内联），必须在**每一条**面板响应上——
 # 包括 404，否则「打错一个资源名」这条路径就少了护栏。
@@ -123,6 +126,7 @@ sigv4.js|signRequest
 s3api.js|listBuckets
 metrics.js|parseMetrics
 ui.js|openDrawer
+favicon.svg|linearGradient
 EOF
 
 echo "== CSP 护栏：不得有内联样式 =="

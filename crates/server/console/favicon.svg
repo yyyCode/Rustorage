@@ -1,0 +1,16 @@
+<!-- 页签图标。做成**登记在 ASSETS 里的资源**而不是内联的 `data:` URI：
+     浏览器只在「没有可用的 icon 链接」时才回退去请求站点根的 `/favicon.ico`，
+     而那条路径不属于面板命名空间、会原样落到 s3s —— 每次打开面板都白留一行
+     匿名 403。`data:` URI 省事，但链接是否被浏览器接受取决于它对 URL 的宽容度，
+     不值得把「有没有那行 403」押在上面。与侧栏品牌标记同一套渐变。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4c9aff"/>
+      <stop offset="1" stop-color="#7a5cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="url(#g)"/>
+  <text x="16" y="22" font-family="system-ui, sans-serif" font-size="15" font-weight="700"
+        fill="#fff" text-anchor="middle">RS</text>
+</svg>

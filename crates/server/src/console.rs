@@ -54,6 +54,11 @@ pub const ASSETS: &[Asset] = &[
         mime: "text/javascript; charset=utf-8",
         body: include_str!("../console/ui.js"),
     },
+    Asset {
+        name: "favicon.svg",
+        mime: "image/svg+xml; charset=utf-8",
+        body: include_str!("../console/favicon.svg"),
+    },
 ];
 
 /// 面板不引任何外部资源，这条 CSP 是对「以后有人往 HTML 里塞 CDN `<script>`」的护栏。

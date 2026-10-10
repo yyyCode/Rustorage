@@ -51,6 +51,12 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+
+/* `[hidden]` 必须能压过作者样式里的 `display`。浏览器默认表里的
+   `[hidden] { display: none }` 属于 UA 样式，**打不过**任何作者规则——
+   于是 `<button class="btn" hidden>` 里的 `.btn { display: inline-flex }`
+   会照常生效，元素照样显示，而「明明设了 hidden」这件事只在肉眼可见时才发现。 */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -231,7 +237,9 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: var(--focu
 
 /* ---- 工具条 -------------------------------------------------------------- */
 
-.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+/* 工具条只出现在**粘性页头**的右侧（搜索 + 刷新），所以没有上外边距：
+   它由 `.head-row` 的 `align-items: flex-end` 与标题基线对齐。 */
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .toolbar .spacer { flex: 1; }
 
 /* ---- 面板与卡片 ---------------------------------------------------------- */
@@ -349,6 +357,9 @@ tbody tr:focus-within .row-actions { opacity: 1; }
 /* 可复制字段：值 + 复制键，值本身也是可选中文本。 */
 .copy-row { display: flex; align-items: flex-start; gap: 6px; }
 .copy-row .copy-val { flex: 1; min-width: 0; }
+
+/* 抽屉底部的动作区。竖排：抽屉本身窄，横排两个按钮会挤成一条。 */
+.drawer-acts { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
 
 /* ---- Toast --------------------------------------------------------------- */
 
