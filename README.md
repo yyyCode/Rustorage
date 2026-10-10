@@ -22,6 +22,7 @@
 - [4. 启动服务](#4-启动服务)
 - [5. 客户端使用](#5-客户端使用)
 - [6. 容错能力与 quorum](#6-容错能力与-quorum)
+- [6.5 控制面板（可选）](#65-控制面板可选)
 - [7. 已知限制](#7-已知限制)
 - [8. 开发](#8-开发)
 - [9. 许可](#9-许可)
@@ -41,7 +42,7 @@
 
 **不是**这些（写下来是为了防止范围蔓延，详见 [DESIGN §1.2](docs/DESIGN.md)）：
 
-- 不兼容 MinIO 的盘格式，也不实现 MinIO Admin API / Console 协议；
+- 不兼容 MinIO 的盘格式，也不实现 MinIO Admin API / Console 协议（[§6.5](#65-控制面板可选) 的控制面板是自研静态页面，不是这套协议）；
 - 不做多存储后端（网关模式）、不做站点复制；
 - MVP 不做多节点、不做 TLS、不做 multipart、不做对象锁。
 
@@ -149,6 +150,7 @@ rstore-server --volumes D:\rs\d1 D:\rs\d2 D:\rs\d3 D:\rs\d4 --parity 2
 | `--secret-key <SECRET>` | `rustorage-secret` | S3 Secret Key |
 | `--base-domain <DOMAIN>` | 不设 | 开启虚拟主机寻址（`Host: bucket.example.com`）；不设 = 纯 path-style |
 | `--metrics` | 关 | 打开 `/metrics` 指标计数 |
+| `--console` | 关 | 打开只读控制面板（[§6.5](#65-控制面板可选)） |
 | `-h` / `--help` | | 帮助 |
 
 > ⚠️ 默认凭据 `rustorage` / `rustorage-secret` 只适合本地试用。**对外提供服务前务必用
@@ -315,6 +317,7 @@ for obj in s3.list_objects_v2(Bucket="demo").get("Contents", []):
 | `GET /health` | 进程活着就 `200`（不看就绪状态），适合做 liveness probe |
 | `GET /ready` | 存储层就绪后 `200`；之前 `503` + `Retry-After: 5`，适合做 readiness probe |
 | `GET /metrics` | Prometheus 文本格式。**需启动时带 `--metrics`**，否则返回 `200` 但正文为空 |
+| `GET /_console/` | 只读控制面板。**需启动时带 `--console`**，见 [§6.5](#65-控制面板可选) |
 
 ```bash
 curl -i http://127.0.0.1:9000/health
@@ -322,9 +325,14 @@ curl -i http://127.0.0.1:9000/ready
 curl -s http://127.0.0.1:9000/metrics
 ```
 
-这三个路径是**精确匹配**：`/metrics/`（带尾斜杠）不会被当成指标端点，而是走进 S3 的
+这些路径都是**精确匹配**：`/metrics/`（带尾斜杠）不会被当成指标端点，而是走进 S3 的
 请求路径——未签名时先撞上 SigV4 认证，返回 `403 AccessDenied`（签名后才会是
 `404 NoSuchBucket`）。
+
+`/_console/` 在没有 `--console` 时的表现**与 `/metrics/` 不同**：它返回 `400
+InvalidBucketName`。因为 `_console` 首字符是下划线，s3s 在**路径解析阶段**就判它
+不是合法桶名，请求根本走不到认证那一步。两种表现都说明同一件事：面板没开关时
+不会被截获，请求原样落到 S3 层。
 
 ## 6. 容错能力与 quorum
 
@@ -366,6 +374,23 @@ bash tests/compat/aws_cli.sh
 bash tests/compat/mc.sh
 bash tests/compat/rclone.sh
 ```
+
+## 6.5 控制面板（可选）
+
+加 `--console` 启动后，浏览器打开 <http://127.0.0.1:9000/_console/> 就能看到只读面板：
+桶列表、目录式对象浏览、对象详情与下载、服务状态与指标。
+
+- **只读**：本版没有上传、删除、建桶——面板不提供任何写操作；
+- **凭据在浏览器端**：登录时输入的 access/secret key 只存本标签页的 `sessionStorage`，
+  签名（SigV4）在浏览器里现算，服务端不经手；权限与 `aws-cli` / `mc` 完全一致；
+- **只在 `127.0.0.1` 可用**：签名依赖 `crypto.subtle`，而它要求可信来源。
+  服务端目前把监听地址写死为 `127.0.0.1`，所以成立；**一旦允许绑别的地址或改用
+  局域网 IP 访问，面板必须先上 TLS**；
+- 指标页需要服务端同时以 `--metrics` 启动，否则计数部分是空的。
+
+这不是 MinIO 的 Console 协议（那套 RPC 契约本项目依然不做），只是一个挂在既有路由上的
+静态页面。`/_console` 之所以不会撞上任何桶，是因为 s3s 的桶名校验不允许下划线
+（详见 [DESIGN §18.4](docs/DESIGN.md)）。
 
 ## 7. 已知限制
 
@@ -412,6 +437,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 bash scripts/check-layer-deps.sh
 python scripts/tests/test_check_layer_deps.py
+```
+
+端到端验收脚本（各自起一个实例，需要 `curl`；`console.sh` 还会用到可选的 `node`）：
+
+```bash
+bash tests/acceptance.sh   # 纠删码容错与 quorum 边界
+bash tests/console.sh      # 控制面板（见 §6.5）
 ```
 
 ## 9. 许可

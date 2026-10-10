@@ -53,7 +53,7 @@ Rustorage 是一个 **S3 兼容的分布式对象存储**，对标 MinIO / RustF
 | 非目标 | 理由 |
 |---|---|
 | MinIO 盘格式兼容（读 MinIO 写的盘） | 成本极高（字节级格式锁死 + 多种分布算法 + 双 codec），与「概念清晰」的定位冲突 |
-| MinIO Admin API / Console 协议 | 需要一套独立的 RPC 契约与认证，收益不成比例 |
+| MinIO Admin API / Console 协议 | 需要一套独立的 RPC 契约与认证，收益不成比例（§18.4 的 `--console` 是自研的静态页面，**不是**这套协议） |
 | 从 MinIO 双向复制 / 站点复制 | 后续如需，走标准 S3 客户端，不作为本项目的一等能力 |
 | 多存储后端（网关模式） | 本项目的价值在存储引擎本身 |
 
@@ -769,6 +769,27 @@ enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
 - 敏感字段脱敏规则集中在一处（access_key / secret_key / session_token）；
 - 每个请求一个 `request_id`，贯穿全链路。
 
+### 18.4 控制面板（`--console`）
+
+只读面板挂在 `/_console`（常量：`rstore_common::consts::CONSOLE_PREFIX`），资源用
+`include_str!` 编进二进制（`crates/server/src/console.rs`），默认关闭。三条要点：
+
+- **命名空间不与桶名相撞，靠的是上游规则**：s3s 默认装上 `AwsNameValidation`，它在
+  **路径解析阶段**执行 `check_bucket_name`，逐条比对 AWS 的 bucket naming rules
+  （长度 3..=63、只允许小写字母/数字/`.`/`-`、首尾须字母或数字、禁连续的 `..`、
+  禁 IP 形态、禁 `xn--` 前缀）。下划线出现在任何位置都非法，所以 `/_console`
+  不可能是合法桶名。**本仓库没有为此新增任何校验**（早期设计草案曾打算加一条
+  `validate_bucket_name`，实为冗余，已回退）；
+- **不改数据面契约**：面板只调既有 S3 接口与既有 `/health` `/ready` `/metrics`，
+  不新增服务端 API，`rstore-api` 的 `ObjectStore` trait 不变；
+- **不受 readiness 门控制**：面板资源与 `/health` 同层截获，因为概览页本身要显示
+  启动阶段。
+
+认证走浏览器端 SigV4（WebCrypto），因此**依赖监听地址是可信来源**
+（`127.0.0.1` / `localhost`）。改绑地址前必须先解决这一点。
+
+完整设计见 `docs/superpowers/specs/2026-10-10-console-design.md`。
+
 ---
 
 ## 19. 测试策略
@@ -846,6 +867,7 @@ enum SystemStage { Booting = 0, StorageReady = 1, FullReady = 2 }
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **MVP** | 单机多盘纠删码 + 核心 S3 数据面 + bitrot + 提交协议 + 测试框架 | 见 `docs/MVP.md` |
+| Console | `--console`、`/_console` 静态资源、浏览器端 SigV4 只读面板 | 已实现，见 §18.4 |
 | Phase 2 | 对象版本化；压缩与 SSE 加密（走 §13 的变换层缝）；命名空间索引（解决 LIST 全扫） | 未开始 |
 | Phase 3 | 多节点：`RemoteDisk`、节点间 RPC、集群发现、分布式租约与 fencing | 未开始 |
 | Phase 4 | Heal 编排、scanner / 用量、弹性扩容（pool 级 rebalance） | 未开始 |
