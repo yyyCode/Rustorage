@@ -320,12 +320,12 @@ impl S3 for RstoreFs {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         // PERF: 见 DESIGN §1.2 与 §20 Phase 2 — 命名空间索引。
-        // MVP 靠 `list_objects` 的全盘遍历（4.11）+ 本层过滤/分页，不是终态设计。
-        let entries = self
-            .store
-            .list_objects(&req.input.bucket, req.input.prefix.as_deref())
-            .await
-            .map_err(to_s3_error)?;
+        // MVP 靠引擎的列举（4.11）+ 本层过滤/分页，不是终态设计。
+        //
+        // 候选是**分批**向引擎要的，不是一次要全量：`bounded_listing` 打开时
+        // 引擎的增量遍历会在够数时提前收手，于是「10 万个 key 的桶只要 1000 条」
+        // 只走一小段。模式关着时引擎退回全量遍历，第一批就带回全部、`more = false`，
+        // 于是下面的循环只转一圈——**与今天的开销相同**。
 
         let prefix = req.input.prefix.as_deref().unwrap_or("");
         // 空字符串的 delimiter 等同没给（否则每个 key 都在开头「命中」空串）。
@@ -348,41 +348,71 @@ impl S3 for RstoreFs {
         // 「最后一条**返回过的**条目」的 key，作为下一页的游标。共同前缀也能当游标：
         // `cp = "dir/"` 是 `"dir/x"` 的前缀，`key <= "dir/"` 恰好跳过整个 dir/ 子树。
         let mut last_key: Option<String> = None;
+        // **取批游标**：与 `last_key` 不同——`last_key` 是给客户端的续传 token，
+        // 这个是本层内部翻批用的，一次响应里可能前进很多次。
+        let mut cursor: Option<String> = start_after.clone();
+        // 一批至少覆盖一整页，免得为了凑满一页反复取批。
+        let batch_want = max_keys.max(1);
 
-        for entry in entries {
-            // 游标必须最先应用：被跳过的条目不该占 max_keys 的额度，否则第二页会比
-            // 第一页短（且只在游标落在前缀内部时暴露）。字符串比较，不是下标。
-            if let Some(s) = &start_after {
-                if entry.key <= *s {
-                    continue;
+        'batches: loop {
+            let (batch, more) = self
+                .store
+                .list_objects_from(
+                    &req.input.bucket,
+                    req.input.prefix.as_deref(),
+                    cursor.as_deref(),
+                    batch_want,
+                )
+                .await
+                .map_err(to_s3_error)?;
+
+            for entry in &batch {
+                // 游标必须最先应用：被跳过的条目不该占 max_keys 的额度，否则第二页会比
+                // 第一页短（且只在游标落在前缀内部时暴露）。字符串比较，不是下标。
+                if let Some(s) = &start_after {
+                    if entry.key <= *s {
+                        continue;
+                    }
+                }
+                // **先判容量，再处理本条**：max_keys=0 时在这里就 `break`，不会漏进循环体；
+                // 于是 `is_truncated` 恰好等于「循环因容量而中断」，不必事后猜还有没有剩余。
+                if contents.len() + common_prefixes.len() >= max_keys {
+                    truncated = true;
+                    break 'batches;
+                }
+                let rel = &entry.key[prefix.len()..];
+                match delimiter.and_then(|d| rel.find(d)) {
+                    Some(rel_idx) => {
+                        // 下标是相对 `key` 全串的：相对切片的 rel_idx 必须加回 prefix.len()，
+                        // 否则前缀被吃掉，客户端按 "sub/" 列举一条都拿不到。
+                        let cp = entry.key[..prefix.len() + rel_idx + 1].to_string();
+                        common_prefixes.insert(cp.clone());
+                        last_key = Some(cp);
+                    }
+                    None => {
+                        contents.push(Object {
+                            key: Some(entry.key.clone()),
+                            size: Some(entry.size as i64),
+                            e_tag: Some(ETag::Strong(entry.etag.clone())),
+                            last_modified: Some(timestamp_of(entry.mod_time)),
+                            storage_class: Some(ObjectStorageClass::from_static("STANDARD")),
+                            ..Default::default()
+                        });
+                        last_key = Some(entry.key.clone());
+                    }
                 }
             }
-            // **先判容量，再处理本条**：max_keys=0 时在这里就 `break`，不会漏进循环体；
-            // 于是 `is_truncated` 恰好等于「循环因容量而中断」，不必事后猜还有没有剩余。
-            if contents.len() + common_prefixes.len() >= max_keys {
-                truncated = true;
-                break;
+
+            // 本批处理完了，后面没有更多 → 这一页就是最终结果，`truncated` 保持 false。
+            if !more {
+                break 'batches;
             }
-            let rel = &entry.key[prefix.len()..];
-            match delimiter.and_then(|d| rel.find(d)) {
-                Some(rel_idx) => {
-                    // 下标是相对 `key` 全串的：相对切片的 rel_idx 必须加回 prefix.len()，
-                    // 否则前缀被吃掉，客户端按 "sub/" 列举一条都拿不到。
-                    let cp = entry.key[..prefix.len() + rel_idx + 1].to_string();
-                    common_prefixes.insert(cp.clone());
-                    last_key = Some(cp);
-                }
-                None => {
-                    contents.push(Object {
-                        key: Some(entry.key.clone()),
-                        size: Some(entry.size as i64),
-                        e_tag: Some(ETag::Strong(entry.etag)),
-                        last_modified: Some(timestamp_of(entry.mod_time)),
-                        storage_class: Some(ObjectStorageClass::from_static("STANDARD")),
-                        ..Default::default()
-                    });
-                    last_key = Some(entry.key);
-                }
+            // 还有更多：从本批最后一个候选之后继续。
+            // 引擎的契约保证 `batch` 非空（空批必然 `more == false`），所以这里取不到
+            // 最后一个就等于上游违约——**必须停下**，否则就是一个死循环。
+            match batch.last() {
+                Some(e) => cursor = Some(e.key.clone()),
+                None => break 'batches,
             }
         }
 
@@ -1672,5 +1702,95 @@ mod tests {
             panic!("非法域名应在构造期被拒绝");
         };
         assert!(err.contains("not a domain"), "错误应含原始输入: {err}");
+    }
+
+    // ---- Task 5.11: `bounded_listing` 的分批列举 ----
+
+    /// 从 ListObjectsV2 的 XML 里按出现顺序取出所有 `<Key>..</Key>`。
+    ///
+    /// 手撕而不是引 XML 库：这里只需要「有几个、什么顺序」，而多一个依赖要过
+    /// allowlist 与 license 检查，不划算。
+    fn keys_in(body: &[u8]) -> Vec<String> {
+        let xml = std::str::from_utf8(body).expect("list body is utf-8 xml");
+        let mut out = Vec::new();
+        let mut rest = xml;
+        while let Some(i) = rest.find("<Key>") {
+            let after = &rest[i + "<Key>".len()..];
+            let end = after.find("</Key>").expect("well-formed <Key>");
+            out.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        out
+    }
+
+    /// 取 `<NextContinuationToken>..</NextContinuationToken>`；没有（= 最后一页）返回 `None`。
+    fn next_token(body: &[u8]) -> Option<String> {
+        let xml = std::str::from_utf8(body).expect("list body is utf-8 xml");
+        let open = "<NextContinuationToken>";
+        let i = xml.find(open)? + open.len();
+        let end = xml[i..].find("</NextContinuationToken>")?;
+        Some(xml[i..i + end].to_string())
+    }
+
+    /// **逐页取要拼出与一次全量完全相同的 key 串**——`max-keys=2` 对 5 个 key，
+    /// 必然要走完 `list_objects_v2` 里那个 `'batches` 循环的三圈。
+    ///
+    /// 这条盯的就是那个循环：它把「一次拿全」换成了「多次拿一小段」，游标前进、
+    /// 容量判定、`is_truncated` / `next_continuation_token` 的任何一个写错都会在这里显形。
+    ///
+    /// **用 `MockStore` 是够的**：它没覆盖 `ObjectStore::list_objects_from`，
+    /// 于是走 trait 的默认实现（一次全量 + 按 `after`/`want` 过滤），
+    /// 那正是「旧模式」的形状，S3 层照样会收到 `more = true` 并被迫翻批。
+    /// 引擎那一侧的**提前停**由 `crates/store/src/list.rs` 的单测负责，
+    /// 两件事各测各的，不要在这里混着测。
+    #[tokio::test]
+    async fn list_v2_paging_reassembles_the_whole_bucket() {
+        let store = Arc::new(MockStore::default());
+        for i in 0..5 {
+            let (status, _, body) = call_on(
+                mock_service(store.clone()),
+                request("PUT", &format!("/test-bucket/k{i}"), OBJ_BODY),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(pages <= 10, "分页没有终止——游标没有前进");
+            let path = match &token {
+                Some(t) => format!("/test-bucket?list-type=2&max-keys=2&continuation-token={t}"),
+                None => "/test-bucket?list-type=2&max-keys=2".to_string(),
+            };
+            let (status, _, body) =
+                call_on(mock_service(store.clone()), request("GET", &path, b"")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "body: {}",
+                String::from_utf8_lossy(&body)
+            );
+
+            seen.extend(keys_in(&body));
+            match next_token(&body) {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec!["k0", "k1", "k2", "k3", "k4"],
+            "分页拼接必须与全量列举逐条相同、同序"
+        );
+        assert_eq!(pages, 3, "5 个 key、每页 2 个 → 恰好三页（2+2+1）");
     }
 }
