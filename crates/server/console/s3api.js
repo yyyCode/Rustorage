@@ -18,6 +18,16 @@ export function setCredentials(next) { creds = next; }
 export function clearCredentials() { creds = null; }
 export function hasCredentials() { return creds !== null; }
 
+/// 当前登录的 access key，未登录时是空串。
+///
+/// 有了多身份，界面上不显示它，用户就真的分不清「我现在是谁」——一个桶看不见，
+/// 可能是没权限，也可能是登成了另一个人，而这两种的处置完全不同。
+/// access key 是**标识**不是秘密（它在每个 SigV4 请求的 Authorization 头里
+/// 明文出现）；`secretKey` 不提供任何出口，它只留在本模块的 `creds` 里。
+export function currentAccessKey() {
+  return creds ? creds.accessKey : '';
+}
+
 /// 从 S3 的错误 XML 里取 `<Code>` 与 `<Message>`。取不到就退回状态码文本——
 /// **不编造**一个更好看的错误信息（设计 §7：面板不吞错）。
 async function describe(resp) {

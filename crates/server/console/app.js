@@ -12,8 +12,8 @@
 // （连**注释里**都不能出现那三个字符的连写——守卫不做语法分析，它只切字符串。）
 
 import {
-  ConsoleError, clearCredentials, fetchMetricsText, fetchReady, getObjectBlob,
-  hasCredentials, headObject, listBuckets, listObjects, setCredentials,
+  ConsoleError, clearCredentials, currentAccessKey, fetchMetricsText, fetchReady,
+  getObjectBlob, hasCredentials, headObject, listBuckets, listObjects, setCredentials,
 } from './s3api.js';
 import { formatValue, labelText, parseMetrics } from './metrics.js';
 import {
@@ -27,6 +27,7 @@ const bucketsNav = document.getElementById('buckets');
 const bucketCount = document.getElementById('bucket-count');
 const conn = document.getElementById('conn');
 const logoutBtn = document.getElementById('logout');
+const identity = document.getElementById('identity');
 
 const NAV_ITEMS = [
   ['概览', '#/', 'grid'],
@@ -36,6 +37,13 @@ const NAV_ITEMS = [
 /// 侧栏缓存下来的桶名。`null` = 还没取过：登录成功与退出登录都要置回 `null`，
 /// 否则会拿别人的凭据看着上一个人的桶列表。
 let bucketNames = null;
+/// 取桶**失败**的原因，与 `bucketNames` 的三态互补。
+///
+/// 这两个变量必须分开：`ListBuckets` 是**账号级**操作，IAM 里只被授予某个桶
+/// 权限的用户必然拿不到它（403），而那跟「一个桶都还没建」是两回事。
+/// 早先的写法把失败也塞成 `[]`，侧栏于是对无权列桶的人说「还没有桶」——
+/// 那不是简化，是替服务端编了一句更好听的假话。
+let bucketErr = null;
 /// 侧栏要点亮的项，由各视图在渲染时设置。
 let currentNav = '#/';
 let activeBucket = null;
@@ -137,10 +145,21 @@ function paintSidebar() {
 
   // 计数由这里统一更新——侧栏的桶列表就是从 `bucketNames` 画的，
   // 让它跟列表各写一处，迟早会出现「写着 3 个、列出来 4 个」。
+  // 取桶失败时不留数字：那会让「无权列桶」看起来像「桶数为零」。
   bucketCount.textContent = bucketNames && bucketNames.length ? String(bucketNames.length) : '';
 
   bucketsNav.replaceChildren();
-  if (bucketNames === null) {
+  if (!hasCredentials()) {
+    // 未登录时什么都不说。「加载中……」在这里是句假话——没有任何请求在飞，
+    // 而且永远不会落地：登录页上那行字会一直挂着。
+  } else if (bucketErr) {
+    // 四种错里两种值一句话：403 是「权限不够」，多半因为策略里没有账号级的
+    // `s3:ListAllMyBuckets`；503 是服务没起来。其余照实说「取不到」，
+    // 完整错误挂在 `title` 上，悬停能看到服务端给的 `Code`/`Message`。
+    bucketsNav.append(h('p', {
+      class: 'hint', title: errText(bucketErr), text: bucketErrHint(bucketErr),
+    }));
+  } else if (bucketNames === null) {
     bucketsNav.append(h('p', { class: 'hint', text: '加载中……' }));
   } else if (bucketNames.length === 0) {
     bucketsNav.append(h('p', { class: 'hint', text: '还没有桶。' }));
@@ -157,18 +176,39 @@ function paintSidebar() {
   }
 }
 
-/// 侧栏取不到桶**不该**把主视图也带走：主视图自己会显示服务端返回的错误，
-/// 而这里失败只意味着侧栏暂时是空的。
-async function ensureBuckets() {
-  if (bucketNames === null) {
+/// 侧栏一句话版的取桶错误。**403 必须与「空」分开说**：`ListBuckets` 是
+/// 账号级操作，只被授予某个桶权限的 IAM 用户拿不到它——这是 IAM 起作用的样子，
+/// 不是异常，更不是「还没有桶」。
+function bucketErrHint(err) {
+  if (err instanceof ConsoleError && err.status === 403) return '无权列出桶';
+  if (err instanceof ConsoleError && err.status === 503) return '服务启动中';
+  return '取不到桶列表';
+}
+
+/// 取桶列表并缓存，返回 `{ names, err }`。
+///
+/// 三态都写在一处：还没取过（两个都是初值）、取到了（`names`，`err` 为 null）、
+/// 取失败（`err`，`names` 为 null）。谁再往里塞个 `catch {}` 把失败压成空数组，
+/// 就会把这三个状态又压回两个——侧栏「无权列桶」那句真话就没了。
+async function loadBuckets({ refresh = false } = {}) {
+  const stale = refresh || (bucketNames === null && bucketErr === null);
+  if (stale) {
     try {
       bucketNames = await listBuckets();
-    } catch {
-      bucketNames = [];
+      bucketErr = null;
+    } catch (e) {
+      bucketNames = null;
+      bucketErr = e;
     }
     paintSidebar();
   }
-  return bucketNames;
+  return { names: bucketNames, err: bucketErr };
+}
+
+/// 侧栏取不到桶**不该**把主视图也带走：主视图自己会显示服务端返回的错误，
+/// 而这里失败只意味着侧栏暂时是空的。
+function ensureBuckets() {
+  return loadBuckets();
 }
 
 function setSidebar(navHref, bucket = null) {
@@ -189,6 +229,7 @@ function setConn(text, bad = null) {
 logoutBtn.addEventListener('click', () => {
   clearCredentials();
   bucketNames = null;
+  bucketErr = null;
   location.hash = '#/';
   render();
 });
@@ -199,22 +240,22 @@ function go(hash) {
 
 // ---- 视图：登录 ----------------------------------------------------------
 
-function renderLogin(err) {
+function renderLogin() {
   const access = h('input', { id: 'login-ak', type: 'text', autocomplete: 'off' });
   const secret = h('input', { id: 'login-sk', type: 'password', autocomplete: 'off' });
   const form = h('form', {
-    onsubmit: async (e) => {
+    // **登录不拿 `ListBuckets` 当门禁。** 它是**账号级**操作，只被授予某个桶
+    // 权限的 IAM 用户必然 403——早先在这里验凭据，等于把控制台对它自己造出来的
+    // 那类身份锁死：凭据是对的，人却被弹回登录页，还被告知「凭据错误」。
+    // 现在存下凭据直接进概览，让概览自己的错误卡说真话（错误卡一直在做这件事，
+    // 而且说得更准）。代价是密码打错会落在概览上看到 403，而不是停在登录页。
+    onsubmit: (e) => {
       e.preventDefault();
       setCredentials({ accessKey: access.value, secretKey: secret.value });
-      try {
-        await listBuckets(); // 用一次真实调用验凭据，签名错自然 403
-        bucketNames = null; // 换了凭据，侧栏的旧快照作废
-        go('#/');
-        render();
-      } catch (e2) {
-        clearCredentials();
-        renderLogin(e2);
-      }
+      bucketNames = null; // 换了凭据，侧栏的旧快照作废
+      bucketErr = null;
+      go('#/');
+      render();
     },
   },
     h('div', { class: 'field' },
@@ -227,7 +268,7 @@ function renderLogin(err) {
     h('div', { class: 'login-mark', 'aria-hidden': 'true', text: 'RS' }),
     h('h1', { text: '登录 Rustorage' }),
     h('p', { class: 'hint', text: '用与 aws-cli / mc 相同的 S3 凭据。' }),
-    h('div', { class: 'card' }, form, err ? errorBox(err) : null),
+    h('div', { class: 'card' }, form),
     // 这句话必须与实现一致：凭据是 `s3api.js` 里的一个模块级变量，刷新即丢。
     // 原文案写的是「存在 sessionStorage 里」——全仓没有这个调用，那是句假话，
     // 而它恰好是一句关于**凭据去哪了**的话，错在这里最不该。
@@ -288,22 +329,46 @@ async function renderBuckets() {
     }));
   }
 
-  try {
-    all = await listBuckets();
-    bucketNames = all;
-    paintSidebar();
-    setConn('已连接', false);
-    sub.textContent = `${all.length} 个桶`;
-    searchInput.disabled = all.length === 0;
-    paintRows('');
-    // 服务端不存桶的创建时间（`bucket.meta` 内容就是 `{}`），所以这一列**不存在**，
-    // 而不是显示空白或假值（设计 §5.4）。
-  } catch (err) {
+  // 走 `loadBuckets` 而不是直接 `listBuckets`：概览与侧栏读的必须是**同一份**
+  // 结果（含同一个错误），否则又会出现「侧栏说无权、主区说已连接」这种自相矛盾。
+  const { names, err } = await loadBuckets({ refresh: true });
+  if (err) {
     setConn('连接异常', true);
     sub.textContent = '';
     searchInput.disabled = true;
-    host.replaceChildren(h('div', { class: 'card' }, errorBox(err)));
+    host.replaceChildren(h('div', { class: 'card' }, errorBox(err), deniedHint(err)));
+    return;
   }
+  all = names;
+  setConn('已连接', false);
+  sub.textContent = `${all.length} 个桶`;
+  searchInput.disabled = all.length === 0;
+  paintRows('');
+  // 服务端不存桶的创建时间（`bucket.meta` 内容就是 `{}`），所以这一列**不存在**，
+  // 而不是显示空白或假值（设计 §5.4）。
+}
+
+/// 403 时补一条**出路**，而不是只报个错就完事。
+///
+/// `ListBuckets` 是账号级操作，IAM 里只被授予某个桶权限的用户必然拿不到它，
+/// 但 `#/b/<桶名>/` 这条路是通的。没有这个输入框，这类用户登录后会卡在一个
+/// 报错页上——控制台对它**自己造出来的**那类身份不可用，这正是要修的东西。
+/// 输入框只在 403 时出现：列得出桶的人有列表可点，多这一个框只是噪音。
+function deniedHint(err) {
+  if (!(err instanceof ConsoleError) || err.status !== 403) return null;
+  const name = h('input', {
+    type: 'text', autocomplete: 'off', placeholder: '例如 photos',
+    'aria-label': '直接打开的桶名',
+  });
+  return h('div', { class: 'jump' },
+    h('p', { class: 'hint', text: '若这个凭据只对个别桶有权限，直接输入桶名也能进去：' }),
+    h('form', {
+      onsubmit: (e) => {
+        e.preventDefault();
+        const v = name.value.trim();
+        if (v) go(`#/b/${encodeURIComponent(v)}/`);
+      },
+    }, name, h('button', { class: 'btn', type: 'submit', text: '打开' })));
 }
 
 // ---- 视图：对象浏览 -------------------------------------------------------
@@ -465,7 +530,9 @@ async function renderBrowse(bucket, prefix) {
     setConn('连接异常', true);
     sub.textContent = '';
     searchInput.disabled = true;
-    host.replaceChildren(h('div', { class: 'card' }, errorBox(err)));
+    // 这里也要给出路：对列不出桶的用户来说，侧栏是空的，这个框是**换桶的唯一入口**，
+    // 少了它就只能靠手改地址栏。
+    host.replaceChildren(h('div', { class: 'card' }, errorBox(err), deniedHint(err)));
   }
 }
 
@@ -622,14 +689,18 @@ function render() {
   // 登录与否决定侧栏收不收起来（样式在 style.css 里按 data-state 分支）。
   const authed = hasCredentials();
   document.body.dataset.state = authed ? 'authed' : 'anon';
+  // 当前身份随凭据走，**不缓存**：它是从 `s3api.js` 的凭据变量直接读出来的，
+  // 放了副本就会在换身份时留下上一个人的 key——那是句比「还没有桶」更糟的假话。
+  identity.textContent = authed ? currentAccessKey() : '';
   // 换视图先把抽屉收掉：它显示的是**上一个视图**里的对象，换页后还开着就是张冠李戴。
   closeDrawer();
 
   if (!authed) {
     bucketNames = null;
+    bucketErr = null;
     paintSidebar();
     setConn('');
-    renderLogin(null);
+    renderLogin();
     return;
   }
   const hash = location.hash || '#/';

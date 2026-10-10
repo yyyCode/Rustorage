@@ -106,15 +106,32 @@ impl ErasureSet {
         Ok(())
     }
 
-    /// 所有盘的桶名并集（已排序）。**跳过以 `.` 开头的条目**——
-    /// 盘根下有 `.rstore.sys/`（DESIGN §6.2），它不是一个桶。
+    /// 所有盘的桶名并集（已排序）。**只认目录**，并跳过以 `.` 开头的条目。
+    ///
+    /// 两条规则各自挡一类东西，**都不能省**：
+    /// - `.` 开头的是系统目录：盘根下有 `.rstore.sys/`（DESIGN §6.2），它不是一个桶。
+    /// - 盘根下的**散装文件**也不是桶——最典型的是 `format.json`（盘格式标记，
+    ///   由 `startup.rs` 写在盘根）。它必须被排除，但**不能靠名字**：S3 只要求
+    ///   桶名以字母或数字开头结尾、中间可含点号，`format.json` 完全合法，
+    ///   按名字拉黑就等于把一个真桶永久藏起来。
+    ///   按「是不是目录」判则同时说清了真正的不变式：**桶是目录**。
+    ///
+    /// 代价是每个条目多一次 `stat`。桶的数量级是「运维手建的几十个」，
+    /// 拿它换一条不会随文件名演进出错的规则，划算。
     pub async fn list_buckets(&self) -> Result<Vec<String>, StoreError> {
         let mut union: BTreeSet<String> = BTreeSet::new();
         for disk in self.disks().iter().flatten() {
             if let Ok(entries) = disk.list_dir("").await {
                 for name in entries {
-                    if !name.starts_with('.') {
-                        union.insert(name);
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    // `stat` 报错或查不到都只算「这个条目不是桶」，不上抛：
+                    // 列桶是尽力而为的展示操作，一个坏条目不该让整张表失败。
+                    if let Ok(Some(st)) = disk.stat(&name).await {
+                        if st.is_dir {
+                            union.insert(name);
+                        }
                     }
                 }
             }
@@ -175,23 +192,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_buckets_skips_system_dirs() {
+    async fn list_buckets_returns_only_directories() {
         let set = set_with_disks(6, 2).await;
         set.create_bucket("alpha").await.unwrap();
         set.create_bucket("beta").await.unwrap();
 
-        // 盘根下的盘级系统目录（DESIGN §6.2 的 `<disk>/.rstore.sys/disk_id`）不是桶。
+        for i in 0..6 {
+            let disk = set.disks()[i].as_ref().unwrap();
+            // 盘根下的盘级系统目录（DESIGN §6.2 的 `<disk>/.rstore.sys/disk_id`）不是桶。
+            disk.write_all(".rstore.sys/disk_id", b"not-a-bucket")
+                .await
+                .unwrap();
+            // 盘格式标记就躺在盘根，是个**文件**。它必须被排除，但**不是靠名字**：
+            // `format.json` 是合法的 S3 桶名（只要求首尾是字母或数字），按名字
+            // 拉黑就会把一个真桶永久藏起来。真正的不变式是「桶是目录」。
+            disk.write_all("format.json", b"{}").await.unwrap();
+        }
+
+        let buckets = set.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["alpha", "beta"]);
+    }
+
+    /// 名字相同的**文件**与**目录**：只有目录算桶。
+    ///
+    /// 这条盯的是「别退化成按名字过滤」——按名字过滤的实现在这条上必须红。
+    #[tokio::test]
+    async fn a_file_at_the_disk_root_is_never_a_bucket() {
+        let set = set_with_disks(6, 2).await;
+        set.create_bucket("logs").await.unwrap();
         for i in 0..6 {
             set.disks()[i]
                 .as_ref()
                 .unwrap()
-                .write_all(".rstore.sys/disk_id", b"not-a-bucket")
+                .write_all("photos", b"i am a file, not a bucket")
                 .await
                 .unwrap();
         }
 
         let buckets = set.list_buckets().await.unwrap();
-        assert_eq!(buckets, vec!["alpha", "beta"]);
+        assert_eq!(buckets, vec!["logs"]);
     }
 
     #[tokio::test]

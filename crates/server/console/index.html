@@ -31,9 +31,16 @@
       <p class="side-label"><span>桶</span><span id="bucket-count" class="side-count"></span></p>
       <div id="buckets" class="side-buckets"></div>
     </div>
+    <!-- 侧栏脚：**当前身份**在上，连接状态与退出在下。
+         显示 access key 是因为服务端已经有了多身份（IAM）：一个桶看不见时，
+         「没权限」和「登错人了」需要一眼分得开。access key 是标识不是秘密
+         （它随每个请求的 Authorization 头明文出去），secret 不在此显示。 -->
     <div class="side-foot">
-      <span id="conn" class="conn"></span>
-      <button id="logout" class="link-btn" type="button">退出登录</button>
+      <p class="side-id"><span class="side-id-label">身份</span><span id="identity" class="side-id-key mono"></span></p>
+      <div class="side-foot-row">
+        <span id="conn" class="conn"></span>
+        <button id="logout" class="link-btn" type="button">退出登录</button>
+      </div>
     </div>
   </aside>
   <main id="view" class="content"></main>

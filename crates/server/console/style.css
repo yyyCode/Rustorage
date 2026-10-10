@@ -159,9 +159,16 @@ a:hover { color: var(--accent-hi); }
 .side-buckets .hint { padding: 4px 10px; }
 
 .side-foot {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
   padding: 10px 14px; border-top: 1px solid var(--line-soft);
 }
+/* 身份行。`min-width: 0` 是必需的：flex 项默认 `min-width: auto`，
+   不写的话长 key 会把省略号挤掉、把整个侧栏撑宽。 */
+.side-id { display: flex; align-items: baseline; gap: 6px; margin: 0; min-width: 0; }
+.side-id-label { flex: none; color: var(--dim); font-size: 11px; letter-spacing: .04em; }
+.side-id-key { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-2); font-size: 12px; }
+.side-foot-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
 .link-btn {
   background: none; border: 0; padding: 0; cursor: pointer;
   color: var(--dim); font: inherit; font-size: 12px;
@@ -250,6 +257,12 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: var(--focu
   box-shadow: var(--sh-1);
 }
 .card h2 { font-size: 13px; font-weight: 600; color: var(--fg-2); margin: 0 0 12px; }
+
+/* 概览页 403 时的出路：直接输桶名进去（见 app.js 的 deniedHint）。 */
+.jump { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
+.jump .hint { margin: 0 0 8px; }
+.jump form { display: flex; gap: 8px; }
+.jump input { flex: 1 1 auto; min-width: 0; }
 
 /* 表格容器：圆角裁切 + 横向可滚（窄窗口下表格不破版）。 */
 .panel {
