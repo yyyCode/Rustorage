@@ -488,7 +488,7 @@ mod tests {
 
     use super::*;
     use crate::error::StoreError;
-    use crate::testutil::{body, set_with_disks, TestSet};
+    use crate::testutil::{body, set_with_disks, set_with_recording_disks, TestSet};
 
     /// 某块盘上 `bucket/key/<data_dir>` 里的文件名（已排序）。
     /// 走 `DiskAPI::list_dir` 而不是直接碰文件系统：夹具里的盘可能被 `FaultyDisk`
@@ -562,7 +562,10 @@ mod tests {
 
         // 单部分对象：每块盘的数据目录里恰好一个分片文件 part.1。
         // 原计划这里写「不是 6 个！」，是因为当时没定清楚 part.N 的 N 指什么——
-        // N 是**部分号**（multipart 的 part），不是盘号；MVP 只有一部分。
+        // N 是**部分号**（multipart 的 part），不是盘号。P1 阶段恒为 1；
+        // P2 的 multipart 走「Complete 时重编码成整体」（设计文档 §2 决策一），
+        // 那时盘上**仍是一个** part.1，S3 的 part 号只体现在 etag 的 `-N` 后缀里——
+        // 也就是说这个 N 与 S3 的 part 是一一对应的，只是永远等于 1。
         for i in 0..6 {
             let files = list_data_dir(&set, i, "b/big", &out.data_dir).await;
             assert_eq!(
@@ -586,6 +589,48 @@ mod tests {
                 .expect("part.1 必须存在");
             assert_eq!(st.size, expect_on_disk, "disk {i}");
         }
+    }
+
+    /// **本任务的核心断言**：写路径从不一次性写出超过一个块。
+    ///
+    /// 这钉的是设计文档 §1.2 那个 3.5x 放大器。退回任何一种整份缓冲都会在这里红：
+    /// - 退回 `BitrotShardWriter` 攒整份分片 -> `write_all` 收到整份分片（16 MiB 对象
+    ///   的 4 数据分片是 4 MiB），远大于 `BLOCK_SIZE + 32`；
+    /// - 退回 S3 层的 `try_collect().concat()` -> 不会出现在本层，由
+    ///   `crates/s3` 的测试与 acceptance 脚本覆盖。
+    #[tokio::test]
+    async fn write_path_never_emits_more_than_one_block() {
+        // 16 MiB = 16 个块，4+2 布局。够大到让「整份缓冲」与「逐块」差出数量级：
+        // 整份缓冲时每块盘一次写出的分片是 4 MiB，逐块时是 256 KiB。
+        const SIZE: usize = 16 * 1024 * 1024;
+
+        let (set, log) = set_with_recording_disks(6, 2).await;
+        let out = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "bounded".into(),
+                body: body(vec![0x5Au8; SIZE]),
+                etag: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.size as usize, SIZE);
+
+        let sizes = log.sizes();
+        assert!(!sizes.is_empty(), "盘上一个字节都没写？");
+        let max = *sizes.iter().max().unwrap();
+        assert!(
+            max <= BLOCK_SIZE + rstore_checksum::HASH_LEN,
+            "单次写入 {max} 字节，超过一个块（{BLOCK_SIZE} + {}）——写路径又在整份缓冲了",
+            rstore_checksum::HASH_LEN
+        );
+        // 顺带确认它确实是**多次**写入，而不是运气好一次写完刚好没超。
+        // 16 个块 × 6 块盘 = 96 次 append（外加若干次 meta.xl）。
+        assert!(
+            sizes.len() > 16,
+            "16 MiB / 1 MiB 应该远多于 16 次写入，实际 {}",
+            sizes.len()
+        );
     }
 
     /// 流式入口必须与原入口逐字节等价：同样的字节进去，同样的 etag / size / 盘上布局。

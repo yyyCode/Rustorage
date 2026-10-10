@@ -1396,6 +1396,12 @@ pub async fn set_with_recording_disks(total: u8, parity: u8) -> (TestSet, WriteL
 }
 ```
 
+**还得往 `crates/store/Cargo.toml` 的 `[dev-dependencies]` 加一行** `async-trait.workspace = true`
+（原计划漏了）：`RecordingDisk` 要用 `#[async_trait::async_trait]` 实现 `DiskAPI`，
+而 `rstore-store` 此前只从 `rstore-disk` 间接见过这个宏，自己并没有依赖它。
+不加就是 `error[E0433]: cannot find module or crate async_trait`。
+放在 dev-dependencies 是因为 `testutil` 是 `#[cfg(test)]` 门控的夹具。
+
 顶部 `use` 区改成：
 
 ```rust

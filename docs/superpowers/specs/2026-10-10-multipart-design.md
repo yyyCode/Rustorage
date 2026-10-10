@@ -101,55 +101,89 @@ MinIO 走的是 A，因为它是生产系统，5 TiB 单对象 + 瞬时 Complete
 
 ### 3.1 三个改动点
 
-**a. 磁盘层补一个流式写原语。** `DiskAPI`（`crates/disk/src/lib.rs:37–49`）今天只有
-`write_all(rel_path, data)`——整块写，没有 append，也没有写入句柄。补：
+**a. 磁盘层补一个追加原语。** `DiskAPI`（`crates/disk/src/lib.rs:37–49`）今天只有
+`write_all(rel_path, data)`——整块写，没有 append。补一个：
 
 ```rust
-/// 打开一个只写句柄；`finish()` 前的内容不保证落盘，`finish()` 负责 fsync。
-async fn create_writer(&self, rel_path: &str) -> Result<Box<dyn DiskWriter>, DiskError>;
-
-pub trait DiskWriter: Send {
-    async fn write(&mut self, buf: &[u8]) -> Result<(), DiskError>;
-    async fn finish(self: Box<Self>) -> Result<(), DiskError>;
-}
+/// 追加写。逐块落盘的分片写入器用它。
+///
+/// **必须与 `write_all` 区分开**：`write_all` 创建即截断，对同一路径反复调用
+/// 只会留下最后一次；`append` 则等价于「顺序写完整个文件」。
+/// **不 fsync**：调用方在最后一块之后用 `sync_file_and_parent` 收尾。
+async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError>;
 ```
 
-保持 `write_all` 不动（内联分支与元数据写入仍用它）。
+保持 `write_all` 不动（内联分支与元数据写入仍用它）。两条写的语义差别在
+`crates/disk/src/lib.rs` 的契约测试里被同一个测试钉住（同一路径上 `append` 三次
+得到 `abcdef`，再 `write_all` 三次得到 `XYZ`）。
+
+> **实施时的偏离（原方案是 `create_writer` 句柄 + `DiskWriter` trait）**：
+> `LocalDisk` 的每个方法都是一次无状态的 `spawn_blocking`，闭包必须 `'static + Send`、
+> **不能捕获 `&self`**；持有一个写入句柄就得在句柄里放 `File`，而 `spawn_blocking`
+> 的闭包要按值搬走它，于是每次写都要「取出 `File` → 用完放回」，且并发下必须有个
+> `expect` 的 panic 路径。**追加原语是同一件事的无状态版本**，没有句柄要持有，
+> 也不需要为并发写路径设计所有权协议。
+> "句柄"方案在多节点阶段仍有价值（见 §11 的风险表），但那是 `RemoteDisk` 的事。
 
 **b. `BitrotShardWriter` 改成增量落盘。** 块间的 `bitrot_hash(data) + data` 交错格式
-不变，只是从「攒在 `buf` 里」变成「每块直接写进 `DiskWriter`」。崩溃时留下的是
+不变，只是从「攒在 `buf` 里」变成「每块直接 `append`」。崩溃时留下的是
 `.staging-*` 里的半截文件——而 staging 目录本来就被发现逻辑跳过、由对账回收
 （`DESIGN.md` §12.3），所以**不需要新的崩溃点语义**。
+
+> **实施时补上的两点（既有测试挡下来的）**：逐块落盘把两处原先被"缓冲"掩盖的语义
+> 翻了出来。(1) 一个块都没推过时盘上不会有文件，而**空分片在读侧是合法的**
+> （`bitrot_size(0, bs) == 0`），读取器靠 `stat` 判存在性、缺失会被报成 `NotFound`
+> ——所以 `finish` 必须显式落一个 0 字节文件（缓冲版是靠 `write_all` 的
+> "创建即截断"顺手做到的）。(2) `push_block` 从此会真的碰到盘，于是它的 IO 失败
+> 第一次有了提前暴露的机会；若不处理，一块掉线的盘会让**整个 PUT** 失败，而它本该
+> 只是少一票。所以调用点把 `ShardLayout`（程序 bug，中止）和 `Disk`（该盘拿不到票）
+> 分开处理。
 
 **c. `put_object` 收流而不是收 `Vec<u8>`。**
 
 ```rust
-pub struct PutStreamArgs {
+/// `crates/store` 层。
+pub struct PutArgs {
     pub bucket: String,
     pub key: String,
-    pub body: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    /// `Content-Length`。`None` = 未知（chunked）。
-    pub size: Option<u64>,
-    /// `Some` = 用给定的 ETag（multipart Complete，以及 CopyObject 搬运
-    /// multipart 源对象时保留其 `-N` 形式），
-    /// `None` = 边读边算 MD5（普通 PUT，以及 CopyObject 的常规情形——
+    pub body: Box<dyn AsyncRead + Unpin + Send>,
+    /// `Some` = 用给定的 ETag（multipart Complete 传合成的 `-N` 形式），
+    /// `None` = 边读边算整份内容的 MD5（普通 PUT，以及 CopyObject 的常规情形——
     /// 同内容同算法，重算出来的值与源一致）。
     pub etag: Option<String>,
 }
 ```
 
-`crates/api` 的 `ObjectStore::put_object(bucket, key, data: Vec<u8>)` 换成这个形态，
-而不是并存两条路径——**并存会立刻分叉**，而这次的目的正是把缓冲这个洞堵死。
+`crates/api` 的 `ObjectStore::put_object(bucket, key, data: Vec<u8>)` 换成
+`put_object(&self, req: PutRequest)`（字段与上面同形，见下），而不是并存两条路径
+——**并存会立刻分叉**，而这次的目的正是把缓冲这个洞堵死。
 
-**未知长度怎么办**：`size` 为 `None` 时，先窥探 `DEFAULT_INLINE_BLOCK + 1` 字节——
-在阈值内就读到 EOF，走内联分支；否则把窥探到的字节回灌进流，走分片分支。缓冲上限因此
-是 `DEFAULT_INLINE_BLOCK`（128 KiB），语义与今天完全一致。
+> **实施时的两处偏离**：
+> 1. **没有 `size` 字段。** 尺寸不需要调用方给：先读**一个块**，读不满就说明整个
+>    对象到此为止（`known_len` 是精确值），读满了则说明对象至少一个块，而
+>    `shard_step` 只看 `size.min(BLOCK_SIZE)`、与总长无关。于是 `Content-Length`
+>    和 chunked 走同一条路，`None` 也不必窥探 `DEFAULT_INLINE_BLOCK + 1` 字节再回灌。
+> 2. **body 约束是 `Send`，不是 `Send + Sync`。** trait 方法的**返回值**（那个 future）
+>    必须 `Send`，参数随 future 一起被捕获，因此参数也只要 `Send`。`Sync` 是白加的
+>    限制，会让 `StreamReader` 这类适配器白白卡住。
 
 ### 3.2 完成判据
 
-**用计量测试钉住，不靠肉眼**：写一个 1 GiB 的对象（或一个分配计数探针），断言写路径
-峰值分配 < 64 MiB。这条测试就是 §1.2 那个放大器的回归防线——没有它，将来某次改动
-很容易把缓冲悄悄改回来。
+**用计量测试钉住，不靠肉眼**：写一个 16 MiB 的对象，断言**任何一次落盘写入都不超过
+一个块**（`BLOCK_SIZE + HASH_LEN`）。这条测试就是 §1.2 那个放大器的回归防线——
+没有它，将来某次改动很容易把缓冲悄悄改回来。
+
+> **实施时的偏离（原方案是"1 GiB 对象、峰值分配 < 64 MiB"，含"分配计数探针"）**：
+> **分配计数探针在这个仓库里根本做不出来**——它需要一个 `GlobalAlloc` 实现，而那是
+> `unsafe`，workspace lint 是 `unsafe_code = "forbid"`。
+> 可实现的等价物是**记录每次写入的 payload 长度**（`testutil::RecordingDisk`，包在
+> `LocalDisk` 之外、`FaultyDisk` 之内）：整份缓冲一定表现为"一次巨大的写入"，照样能
+> 抓住，而且比对象大小阈值更精确——它直接断言机制本身。
+> 对象也降到 16 MiB：4+2 布局下整份缓冲时每块盘一次写出 4 MiB、逐块时是 256 KiB，
+> 已经差出一个数量级，跑起来却只要 1 秒。
+> **这条测试必须验证过它会红**：把 `BitrotShardWriter` 临时改回攒整份分片，
+> 它报「单次写入 4194816 字节（= 4 MiB + 32）」，然后还原。
+> 峰值内存的绝对值另有 acceptance 脚本与 `aws-cli` 的上传实测覆盖。
 
 ---
 
@@ -186,7 +220,7 @@ ETag = hex( md5( concat( md5(part_1), md5(part_2), … ) ) ) + "-" + <part 数>
 rclone 与 mc 会校验它，所以不能省。在方案 B 下，对象盘上仍是**一个** `PartInfo`
 （`parts` 长度为 1），合成出来的 ETag 就存在它的 `etag` 字段里。
 
-这直接推出了 §3.1c 里 `PutStreamArgs.etag` 的存在：默认实现是「边读边算整对象 MD5」，
+这直接推出了 §3.1c 里 `PutArgs.etag` / `PutRequest.etag` 的存在：默认实现是「边读边算整对象 MD5」，
 而 Complete 需要**外部传入**一个不同的值。
 
 > **注意一处语义解耦**：`PartInfo` 在盘上是「纠删编码段」，而 S3 的 part 是「客户端上传
@@ -305,7 +339,7 @@ rclone 与 mc 会校验它，所以不能省。在方案 B 下，对象盘上仍
 
 | 阶段 | 内容 | 完成判据 |
 |---|---|---|
-| **P1 流式写路径** | `DiskWriter` 原语、`BitrotShardWriter` 增量落盘、`PutStreamArgs` | 既有 210 个测试全绿（**行为不变**）；1 GiB 写入峰值内存 < 64 MiB |
+| **P1 流式写路径** | `DiskAPI::append` 原语、`BitrotShardWriter` 增量落盘、`PutArgs`/`PutRequest` 收流 | 既有 210 个测试全绿（**行为不变**）；任一次落盘写入 ≤ 一个块 |
 | **P2 主路径** | Create / UploadPart / Complete / Abort + 限制校验 + ETag | `tests/multipart.sh` 前三步通过；`aws-cli` 20 MiB 往返逐字节相同 |
 | **P3 服务端搬运** | ListParts / ListMultipartUploads / UploadPartCopy / CopyObject | 脚本第 4、5 步通过；rclone 更新已存在对象不再退出码 1 |
 | **P4 文档同步** | README §7 删掉 multipart 那条、§5 的 8 MiB 警告、DESIGN §14.5 重写、§20 路线图 | 文档不漂移 |
@@ -322,7 +356,7 @@ rclone 与 mc 会校验它，所以不能省。在方案 B 下，对象盘上仍
 | **P1 把既有写路径改坏** | 最大风险：动的是 quorum/commit/bitrot 所在的那条路。对策：P1 独立成阶段，判据是「既有 210 个测试全绿 + 行为零变化」，不夹带任何 multipart 逻辑 |
 | Complete 的 O(对象大小) 时长 | 客户端可能超时。MVP 可接受（单机本地 IO）；**若将来要支持 TB 级对象，必须转方案 A**，本文 §2 已写明升级路径 |
 | 5 MiB 最小 part 校验踩到联调 | 有些测试工具会传极小的 part。是否放宽要由实测决定——但**默认严格**，因为 AWS 就是严格的，放宽会让「本地能跑、上云失败」 |
-| `create_writer` 对 `RemoteDisk` 的适配 | 多节点阶段，流式句柄要映射成分块上传 RPC。P1 只做 `LocalDisk`，但 trait 形状要留得下这件事（`DiskWriter` 是 `Send`、按块写） |
+| `append` 对 `RemoteDisk` 的适配 | 多节点阶段，逐块追加要映射成分块上传 RPC；P1 只做 `LocalDisk`。届时可能重新引入写入句柄（见 §3.1a 的偏离说明）——`DiskAPI::append` 无状态，天然对远程实现友好 |
 | `ListMultipartUploads` 要动 `list.rs` | 那里现在在**跳过** `.rstore`。改动要保证既有 LIST 行为不变（`list.rs:116` 的跳过不能顺手删掉） |
 
 ---

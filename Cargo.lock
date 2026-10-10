@@ -1504,6 +1504,7 @@ dependencies = [
 name = "rstore-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "md-5 0.10.6",
  "rstore-checksum",
