@@ -217,4 +217,43 @@ mod tests {
             );
         }
     }
+
+    /// 抠出源码里 `getElementById('x')` 的 `x`。
+    fn looked_up_ids(js: &str) -> Vec<String> {
+        js.split("getElementById('")
+            .skip(1)
+            .map(|chunk| chunk.chars().take_while(|&c| c != '\'').collect())
+            .collect()
+    }
+
+    #[test]
+    fn app_looks_up_ids_that_index_actually_provides() {
+        // 面板没有构建链、也没有 DOM 层的测试，`getElementById` 取到 `null` 是最可能的
+        // 「白屏」原因：`app.js` 一开头就对这些节点赋值，少一个就整页不渲染。
+        // 这条不让浏览器出场就能钉住它——按 id 建节点是 HTML 与 JS 之间唯一的硬约定。
+        let index = ASSETS
+            .iter()
+            .find(|a| a.name.is_empty())
+            .expect("资源表里必须有 index.html")
+            .body;
+        let app = ASSETS
+            .iter()
+            .find(|a| a.name == "app.js")
+            .expect("资源表里必须有 app.js")
+            .body;
+
+        let ids = looked_up_ids(app);
+        // 同样先证明提取没退化，否则「一个都没查到」会让下面的循环变成空转。
+        assert!(
+            !ids.is_empty(),
+            "没能从 app.js 抠出任何 getElementById，提取逻辑可能已失效"
+        );
+
+        for id in &ids {
+            assert!(
+                index.contains(&format!("id=\"{id}\"")),
+                "app.js 取了 #{id}，但 index.html 里没有这个 id（会白屏）"
+            );
+        }
+    }
 }
