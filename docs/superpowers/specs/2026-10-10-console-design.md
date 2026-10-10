@@ -73,38 +73,51 @@ S3 数据面的请求照旧受 ready 门控制（`503 + Retry-After: 5` 不变�
 
 ### 3.1 问题
 
-桶名**当前完全不校验**：`impl_s3.rs` 的 `create_bucket` 把 `req.input.bucket` 直接透传给
-store，store 侧 `bucket_meta_rel()` 只做字符串拼接。于是 `console`、`_console` 都是今天
-就能建出来的合法桶名。
-
 若把面板挂在 `/console/`，就会**遮蔽**名为 `console` 的桶——这正是 `startup.rs` 那条
 「精确匹配」注释要避免的事。两个候选：
 
-| | B1：保留桶名 `console` | **B2：`/_console` + 桶名规则（采纳）** |
+| | B1：保留桶名 `console` | **B2：`/_console`（采纳）** |
 |---|---|---|
 | 路径 | 精确 `/console` + 前缀 `/console/` | 精确 `/_console` + 前缀 `/_console/` |
-| 配套 | 新增桶名校验，拒绝 `console` | 新增桶名校验，拒绝**首字符为 `_`** |
-| 代价 | 一个原本合法的桶名被占用 | 引入一条今天不存在的桶名规则 |
-| 收益 | 无 | 顺带补上真实兼容缺口：AWS 与 MinIO 本就拒绝含 `_` 的桶名，我们今天放行 |
+| 配套 | 无——只能靠「`console` 是个禁词」的文档约定 | 无——**上游的桶名规则已经挡在这里**（§3.2） |
+| 代价 | 一个正常名字被占用，而它本可以是一个合法桶 | 无 |
+| 收益 | 无 | 冲突被结构性消除，且不需要我们做任何事 |
 
-**采纳 B2。** 关键差别在于：B2 的路径**在规则生效后不可能成为任何合法桶名**，冲突被
-结构性消除；B1 的代价是把一个正常名字变成禁词，而这个禁词本身仍是一个「本可以存在的
-路径」，两边的语义是平的，只靠文档约定维系。
+**采纳 B2。** 关键差别在于：B2 的路径**不可能是任何合法桶名**；B1 则要依赖「大家记得
+别建名叫 console 的桶」，而面板一旦挂上去，那个桶就再也没法通过 HTTP 访问了。
 
-### 3.2 采纳的规则
+### 3.2 为什么 `_` 开头是安全的（上游给的保证）
 
-新增 `validate_bucket_name`（放在 `crates/s3/src/validate.rs`，与 `validate_object_key`
-并列），规则**只加这一条**：
+> **本节经过一次修正。** 初稿写的是「桶名当前完全不校验，需要新增
+> `validate_bucket_name` 拒绝首字符为 `_` 的桶名」，并按此实现过一版。那个前提是
+> **错的**，规则已回退（见本节的推断错在哪）。按本项目「不允许文档漂移」的规矩，
+> 这里留着修正的痕迹，而不是静默改成对的。
 
-> 桶名不得以 `_` 开头 → `ApiError::InvalidBucketName` → 400 `InvalidBucketName`
+桶名**不是**「完全不校验」。s3s 的 `S3ServiceBuilder` 在未调用 `set_validation` 时
+默认装上 `AwsNameValidation`（`s3s-0.17.0/src/service.rs`），它在**路径解析阶段**
+执行 `check_bucket_name`（`s3s-0.17.0/src/path.rs:111`），逐条比对 AWS 的
+[bucket naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html)：
 
-刻意**只加这一条**，不顺手做完整的 DNS 风格校验（长度 3–63、不允许大写、不允许
-`..`……）：那是一次面更大的兼容性变更，与本设计无关，会掩盖真正的改动。完整校验留给
-独立的一次任务。
+- 长度 3..=63；
+- 字符集只允许小写字母、数字、`.`、`-`；
+- 首尾必须是小写字母或数字；
+- 不允许出现连续的 `..`；
+- 不允许是 IP 地址形态；
+- 不允许以 `xn--` 开头。
+  （AWS 另外还禁了 `.-` / `-.` 相邻与 `-s3alias` 后缀，上游这份没覆盖——与本节无关。）
 
-调用点在 `crates/s3/src/impl_s3.rs` 的 `create_bucket` 入口，与 `put_object` 调
-`validate_object_key` 同形。**不改 store 层**——桶名的合法性是 S3 协议层的事，
-store 只认字符串（这条与 `validate_object_key` 的既有分界一致）。
+**下划线出现在任何位置都非法**，所以 `_console` 从来不是合法桶名，`/_console/*`
+撞不上任何真实桶。B2 要的那个「结构性事实」本来就成立——我们只是选了一个恰好落在
+上游禁区里的前缀，不需要自己写一行校验。
+
+**原先的推断错在哪：** 看到 `impl_s3.rs` 的 `create_bucket` 里没有校验调用，就断定
+桶名没被校验。漏掉的一环是——**校验跑在比 `create_bucket` 更早的路径解析阶段，代码
+在上游**。实测很容易戳破：`PUT /_private`（未接线时）就返回 400，`create_bucket`
+根本没被执行。教训是「哪一层先跑」比「我们的代码里有没有这一句」靠谱。
+
+**因此未做的事：** 没有新增任何桶名校验。上游这份已经覆盖了 AWS 规则的绝大多数，
+缺的只是 `.-` / `-.` 相邻与 `-s3alias` 后缀这类边角——与本设计无关，留给独立的一次
+任务，别顺手补在半路上。
 
 ### 3.3 路由规则
 
@@ -239,12 +252,13 @@ Cookie 安全、CSRF 防护、转发层——**一个独立子系统**，而收�
 | 文件 | 改动 | 备注 |
 |---|---|---|
 | `crates/common/src/consts.rs` | 新增 `CONSOLE_PREFIX` | 与 `RESERVED_PREFIX` 同处集中定义 |
-| `crates/s3/src/validate.rs` | 新增 `validate_bucket_name` | 与 `validate_object_key` 并列 |
-| `crates/s3/src/impl_s3.rs` | `create_bucket` 入口调用上一条 | 同 `put_object` 的既有形态 |
 | `crates/server/src/console.rs`（新） | `Asset` 表 + `route()` 纯函数 | 不碰 IO，可单测 |
 | `crates/server/console/`（新） | 前端源文件（`include_str!` 目标） | 无构建步骤 |
 | `crates/server/src/config.rs` | 新增 `--console` 开关 | **默认关闭** |
 | `crates/server/src/startup.rs` | `service_fn` 的 `match` 新增一支 | 仅在开关开启时生效 |
+
+**`crates/s3` 一行都没改**——桶名的把关在上游的路径解析里（§3.2），本设计没有理由
+去碰 S3 协议层。初稿曾在这里列过 `validate.rs` / `impl_s3.rs` 两行，已随该前提一并撤回。
 
 `--console` 默认关闭的理由：与 `--metrics` 一致（同样是 opt-in），且不会让既有的
 `tests/acceptance.sh` 与 `tests/compat/` 的行为发生任何变化。
@@ -274,12 +288,15 @@ Cookie 安全、CSRF 防护、转发层——**一个独立子系统**，而收�
 复用既有的 `tower::ServiceExt::oneshot`（`crates/s3` 与 `crates/api` 已在用）：
 
 - `--console` 开 → `GET /_console/` 200 且 `Content-Type: text/html`;
-- `--console` 关 → `GET /_console/` 落到 s3s，拿到 s3s 的响应（未签名请求 → 403），
-  断言**不是** 200、也不是 `text/html`；
+- `--console` 关 → `GET /_console/` 落到 s3s。**期望值是 400 `InvalidBucketName`，不是
+  403**（初稿猜的是 403，实测推翻了）：s3s 在路径解析阶段就把 `_` 开头的段判为非法桶名，
+  请求走不到鉴权那一步。这条断言的价值恰在于此——它证明关闭开关时面板**一个字节都没拦**；
 - `GET /_console/nope` → 404（不降级到 index.html）；
-- **回归**：`GET /metrics/`（带尾斜杠）行为不变，仍落到 s3s；
-- `validate_bucket_name`：`_x` → `InvalidBucketName`；`x_y`、`x`、`console` → 通过
-  （`console` 通过正是 B2 相对 B1 的收益，要有测试钉住）。
+- **回归**：`GET /metrics/`（带尾斜杠）行为不变，仍落到 s3s。它和上面那条正好构成对照：
+  `metrics` 是**合法**桶名，所以能一路走到鉴权（未签名 → 403），而 `_console` 走不到；
+- 桶名（放在 HTTP 层，钉的是**上游的行为**而不是我们的规则）：
+  `_x` / `put` 到 `/_private` → 400 `InvalidBucketName`；`console`（无下划线）→ 仍能正常
+  建桶。后者正是 B2 相对 B1 的收益——**没有**占用任何真实桶名，要有测试钉住。
 
 ### 8.2 前端（验收脚本）
 
@@ -302,7 +319,7 @@ Cookie 安全、CSRF 防护、转发层——**一个独立子系统**，而收�
 | s3s 是否接受预签名 URL | 待验证；不影响主流程，只影响下载实现（§4.6 有退路） |
 | `LIST` 全盘遍历 | 大桶下页面慢。对策：单页硬上限 + 显式提示，不做无限滚动 |
 | `crypto.subtle` 依赖可信来源 | 今天成立（§5.3），但绑地址一改就断。写进文档并在此登记 |
-| 只加一条桶名规则造成认知不一致 | 界面/文档要说明「完整桶名校验尚未实现」，避免有人以为桶名已被完整校验 |
+| 误以为桶名已被完整校验 | 上游只兜住了「`_` 非法」这一条（§3.2），长度/大小写/`..` 等仍未校验。文档不要写成「桶名已校验」 |
 | 前端零测试 | 无构建链的必然代价。用 `tests/console.sh` + 手动验收兜底，不做「假装有单测」的补偿 |
 
 ---
@@ -311,7 +328,7 @@ Cookie 安全、CSRF 防护、转发层——**一个独立子系统**，而收�
 
 | 阶段 | 内容 | 完成判据 |
 |---|---|---|
-| **M1 服务端骨架** | `CONSOLE_PREFIX`、`validate_bucket_name`、`console.rs`、`--console` 开关、§8.1 全部测试 | `cargo test --workspace` 全绿，且 `--console` 关闭时行为零变化 |
+| **M1 服务端骨架** | `CONSOLE_PREFIX`、`console.rs`、`--console` 开关、§8.1 全部测试 | `cargo test --workspace` 全绿，且 `--console` 关闭时行为零变化 |
 | **M2 前端骨架** | 登录 + SigV4 + 桶列表 + 对象浏览 + 下载 | `tests/console.sh` 通过；浏览器里能走通主流程 |
 | **M3 指标与概览** | `/metrics` 解析 + 折线 + `/ready` 状态呈现 | 跑一次 PUT 后概览页看到非零计数器 |
 | **M4 文档同步** | README 与 `docs/DESIGN.md` 增补 console 一节，更新既有「非目标」里 Console 那条说明 | 文档不漂移：本文与两份文档口径一致 |
