@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 rstore-api.workspace = true
 rstore-common.workspace = true
+# 授权判定：`IamAccess::check` 把请求映射成「主体 + 动作 + 资源」交给它。
+rstore-iam.workspace = true
+# 每次拒绝记一条日志——否则运维面对一个 403 只能靠猜（设计 §7.2）。
+tracing.workspace = true
 s3s.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -28,6 +32,9 @@ tokio-util = { workspace = true, features = ["io"] }
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
+# 权限矩阵测试要从 JSON 字面量造策略文档。**只在测试里用**——正式依赖
+# 不需要 serde_json，因为策略的解析发生在 rstore-iam 里。
+serde_json.workspace = true
 # 时间戳：认证测试要用「当前 UTC 时间」签 SigV4（默认时钟偏移容忍 900s），
 # 手工做 civil-date 换算没有必要。jiff 已经是 s3s-sigv4 的依赖。
 jiff.workspace = true

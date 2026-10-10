@@ -17,4 +17,6 @@ pub mod store;
 pub mod user;
 
 pub use error::IamError;
+pub use policy::{Effect, OneOrMany, PolicyDoc, Statement};
 pub use store::{Decision, DenyReason, IamStore};
+pub use user::{UserRecord, UserStatus};

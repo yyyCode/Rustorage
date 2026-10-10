@@ -9,8 +9,11 @@ use s3s::service::{S3Service, S3ServiceBuilder};
 
 pub(crate) mod conditional;
 pub(crate) mod errors;
+pub mod iam;
 pub mod impl_s3;
 pub(crate) mod validate;
+
+pub use iam::{IamAccess, IamAuth};
 
 #[cfg(test)]
 mod testutil;

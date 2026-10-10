@@ -9,7 +9,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use http_body_util::{BodyExt, Full};
-use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_sigv4::{AmzDate, Payload};
 use tower::ServiceExt;
@@ -71,16 +70,19 @@ impl ObjectStore for NopStore {
     }
 }
 
-/// 认证测试用的 service：`NopStore` + 单对凭据。
+/// 认证测试用的 service：`NopStore` + 一对 root 凭据。
 ///
-/// **本任务（搬运）保持 `SimpleAuth` 不变**——`SimpleAuth` 与
-/// `s3s::access::default_check` 的组合就是改动前的既有行为。
-/// 换成 IAM 适配器是下一个任务的事，那时 `service()` 会一起改。
+/// **`set_auth` 与 `set_access` 成对设置**，与 `build_service` 保持同形
+/// （设计 §1.4：只装一个不会报错，只会静态地失去防护）。
 pub(crate) fn service() -> s3s::service::S3Service {
+    let iam = Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY));
     let mut b = S3ServiceBuilder::new(RstoreFs {
         store: Arc::new(NopStore),
     });
-    b.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY));
+    b.set_auth(crate::iam::IamAuth {
+        iam: Arc::clone(&iam),
+    });
+    b.set_access(crate::iam::IamAccess { iam });
     b.build()
 }
 

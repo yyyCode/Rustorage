@@ -90,6 +90,22 @@ impl IamStore {
         })
     }
 
+    /// 直接给全部部件。**给测试与将来的管理 API 用**——`load` 会在这里
+    /// 再补上引用完整性与 root 冲突的校验。
+    pub fn with_parts(
+        root_access_key: &str,
+        root_secret_key: &str,
+        users: Vec<(String, UserRecord)>,
+        policies: Vec<(String, PolicyDoc)>,
+    ) -> Self {
+        Self {
+            root_access_key: root_access_key.to_owned(),
+            root_secret_key: root_secret_key.to_owned(),
+            users: users.into_iter().collect(),
+            policies: policies.into_iter().collect(),
+        }
+    }
+
     /// 只有 root 的 store：给测试与「还没有 IAM 目录」的场景用。
     pub fn root_only(access_key: &str, secret_key: &str) -> Self {
         Self {

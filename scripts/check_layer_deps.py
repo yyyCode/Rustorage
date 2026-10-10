@@ -24,12 +24,12 @@ ALLOWED = {
     "rstore-api":       {"rstore-common"},
     # 叶子：策略文档与身份求值不认识 s3s，也不认识盘——目录由调用方拼好传进来。
     "rstore-iam":       set(),
-    "rstore-s3":        {"rstore-common", "rstore-api"},
+    "rstore-s3":        {"rstore-common", "rstore-api", "rstore-iam"},
     "rstore-s3-compat": {"rstore-common"},
     # 组合根：允许看见全部（DESIGN §5 R4 规定绑定实现只在这里发生）
     "rstore-server":    {"rstore-common", "rstore-checksum", "rstore-erasure",
                          "rstore-meta", "rstore-disk", "rstore-store",
-                         "rstore-api", "rstore-s3", "rstore-s3-compat"},
+                         "rstore-api", "rstore-s3", "rstore-s3-compat", "rstore-iam"},
 }
 
 
