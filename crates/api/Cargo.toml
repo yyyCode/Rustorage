@@ -9,6 +9,8 @@ publish.workspace = true
 rstore-common.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+# `PutRequest::body` 是 `AsyncRead`，契约 trait 因此直接依赖 tokio 的 io 类型。
+tokio.workspace = true
 
 [lints]
 workspace = true

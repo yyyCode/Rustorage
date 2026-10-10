@@ -17,13 +17,17 @@ futures.workspace = true
 # 都是用 `http::HeaderMap` / `HeaderValue` 经 `S3Error::set_headers` 挂上去的。
 # （**不是因为 `S3Response::with_status`**——那条路径上它是空操作，见 Task 5.10。）
 http.workspace = true
+# `mock.rs` 在 `src/` 里，要 `AsyncReadExt::read_to_end` 读干请求体——
+# 于是 tokio 从 dev-dependency 升为**正式依赖**。
+tokio.workspace = true
+# `StreamReader` 把 `StreamingBlob` 转成 `AsyncRead`。**必须显式写 `io`**：
+# workspace 里声明的是 `features = ["rt"]`，而 tokio-util 0.7 的 `default = []`，
+# 不写这一条 `tokio_util::io` 整个模块都不存在。
+tokio-util = { workspace = true, features = ["io"] }
 
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
-# `tokio` 只在 `#[tokio::test]` 里用到（本 crate 的 src 里没有异步运行时调用），
-# 因此是 dev-dependency 而不是 dependency。
-tokio.workspace = true
 # 时间戳：认证测试要用「当前 UTC 时间」签 SigV4（默认时钟偏移容忍 900s），
 # 手工做 civil-date 换算没有必要。jiff 已经是 s3s-sigv4 的依赖。
 jiff.workspace = true

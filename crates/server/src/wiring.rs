@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
+use rstore_api::{
+    ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore, PutRequest,
+};
 use rstore_common::error::DiskError;
 use rstore_store::error::StoreError;
 use rstore_store::put::PutArgs;
@@ -117,19 +119,15 @@ impl ObjectStore for Wiring {
         self.set.list_buckets().await.map_err(map_bucket_err)
     }
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> Result<ObjectInfo, ApiError> {
+    async fn put_object(&self, req: PutRequest) -> Result<ObjectInfo, ApiError> {
         let started = self.metrics.is_enabled().then(std::time::Instant::now);
         let out = self
             .set
             .put_object(PutArgs {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                data,
+                bucket: req.bucket,
+                key: req.key,
+                body: req.body,
+                etag: req.etag,
             })
             .await;
         if let Some(t0) = started {

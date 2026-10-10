@@ -1185,7 +1185,38 @@ use tokio_util::io::StreamReader;
 并把 `use rstore_api::{...}` 补上 `PutRequest`。**删掉**现在只服务于旧实现的导入：
 `bytes::Bytes` 与 `futures::TryStreamExt`（`try_collect` 用）——若它们在本文件别处
 还有用，保留；跑 `cargo build -p rstore-s3` 后按 `unused import` 警告逐个处理。
-`futures::StreamExt`（`blob.map(..)` 用）**要留着**。
+`futures::StreamExt`（`blob.map(..)` 用）**要留着**，但**只能放在函数内**，见下。
+
+**实测踩到的四处（原计划没说或说反了）：**
+
+1. **`bytes::Bytes` 不能删。** 它在 `impl_s3.rs:215` 的 GET 响应体
+   （`StreamingBlob::from_bytes(Bytes::from(out.data))`）里还在用，删掉直接编译不过。
+   只有 `futures::TryStreamExt` 是真该删的。
+2. **`use futures::StreamExt as _;` 必须写进 `put_object` 函数体内，不能放模块级。**
+   测试模块（`use super::*`）里 `http_body_util::BodyExt` 也有个 `collect`，
+   两个 trait 同时可见 → `error[E0034]: multiple applicable items in scope`
+   （`impl_s3.rs:569`）。原先模块级用的是 `TryStreamExt`，它没有 `collect`，
+   所以从前不冲突——换成 `StreamExt` 就撞上了。
+3. **`MockStore::put_object` 要 `mut req`**：`req.body.read_to_end(&mut data)` 要可变借。
+   原计划给的是 `req: PutRequest`，漏了 `mut`。
+4. **测试里有 5 处 `store.put_object("test-bucket", key, data)`**（`827` / `1054` /
+   `1058` / `1195` / `1398` 行附近）。加一个测试模块级的辅助函数比逐处展开好读：
+
+   ```rust
+   fn put_req(bucket: &str, key: &str, data: Vec<u8>) -> PutRequest {
+       PutRequest {
+           bucket: bucket.to_owned(),
+           key: key.to_owned(),
+           body: Box::new(std::io::Cursor::new(data)),
+           etag: None,
+       }
+   }
+   ```
+
+   然后把调用点写成 `.put_object(put_req("test-bucket", key, key.as_bytes().to_vec()))`。
+
+另外 `clippy::io_other_error`（workspace 门禁是 `-D warnings`）要求写成
+`std::io::Error::other(e)`，而不是 `Error::new(ErrorKind::Other, e)`。
 
 - [ ] **Step 5: 改 `crates/s3/Cargo.toml`**
 

@@ -1385,6 +1385,7 @@ dependencies = [
  "async-trait",
  "rstore-common",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1460,6 +1461,7 @@ dependencies = [
  "s3s-sigv4",
  "sha2",
  "tokio",
+ "tokio-util",
  "tower",
 ]
 
