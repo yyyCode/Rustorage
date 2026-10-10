@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use rstore_common::disk_id::DiskId;
-use rstore_disk::{DiskAPI, Fault, FaultyDisk, LocalDisk};
+use rstore_common::error::DiskError;
+use rstore_disk::{DiskAPI, Fault, FaultyDisk, FileStat, LocalDisk};
 
 use crate::set::ErasureSet;
 
@@ -103,6 +104,122 @@ pub async fn set_with_disks(total: u8, parity: u8) -> TestSet {
         faulties,
         _dir: dir,
     }
+}
+
+/// 写入长度日志。`Arc` 包一层是为了让 `RecordingDisk` 与测试各持一份。
+#[derive(Clone, Default)]
+pub struct WriteLog(Arc<std::sync::Mutex<Vec<usize>>>);
+
+impl WriteLog {
+    /// 所有写入 payload 的长度，`write_all` 与 `append` 合并、按时序。
+    pub fn sizes(&self) -> Vec<usize> {
+        self.0.lock().expect("write log poisoned").clone()
+    }
+
+    fn record(&self, n: usize) {
+        self.0.lock().expect("write log poisoned").push(n);
+    }
+}
+
+/// 记录**每次写入 payload 长度**的盘，用于断言写路径的内存上界。
+///
+/// **为什么不是「分配计数探针」**：那需要一个 `GlobalAlloc` 实现，而它必须
+/// `unsafe`，workspace lint 是 `unsafe_code = "forbid"`。记录写入长度是同一件事的
+/// 可实现版本：整份缓冲会表现为「一次巨大的写入」，照样能抓住。
+///
+/// **`write_all` 与 `append` 都要记**——只看 `append` 的话，一个退回
+/// 「缓冲整份分片再 `write_all`」的实现会在这一层完全隐形（那正是要防的回归）。
+///
+/// **它包在最内层**（`LocalDisk` 之外、`FaultyDisk` 之内）：故障注入与写入计数
+/// 于是观测的是同一批调用，两者不会互相遮蔽。见 [`set_with_recording_disks`]。
+pub struct RecordingDisk {
+    inner: Arc<dyn DiskAPI>,
+    log: WriteLog,
+}
+
+impl RecordingDisk {
+    pub fn new(inner: Arc<dyn DiskAPI>, log: WriteLog) -> Self {
+        Self { inner, log }
+    }
+}
+
+#[async_trait::async_trait]
+impl DiskAPI for RecordingDisk {
+    async fn write_all(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
+        self.log.record(data.len());
+        self.inner.write_all(rel_path, data).await
+    }
+
+    async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
+        self.log.record(data.len());
+        self.inner.append(rel_path, data).await
+    }
+
+    async fn read_exact_at(
+        &self,
+        rel_path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, DiskError> {
+        self.inner.read_exact_at(rel_path, offset, len).await
+    }
+    async fn rename(&self, from_rel: &str, to_rel: &str) -> Result<(), DiskError> {
+        self.inner.rename(from_rel, to_rel).await
+    }
+    async fn remove_dir_all(&self, rel_path: &str) -> Result<(), DiskError> {
+        self.inner.remove_dir_all(rel_path).await
+    }
+    async fn list_dir(&self, rel_path: &str) -> Result<Vec<String>, DiskError> {
+        self.inner.list_dir(rel_path).await
+    }
+    async fn stat(&self, rel_path: &str) -> Result<Option<FileStat>, DiskError> {
+        self.inner.stat(rel_path).await
+    }
+    async fn sync_file_and_parent(&self, rel_path: &str) -> Result<(), DiskError> {
+        self.inner.sync_file_and_parent(rel_path).await
+    }
+    fn disk_id(&self) -> &DiskId {
+        self.inner.disk_id()
+    }
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+}
+
+/// [`set_with_disks`] 的变体：每块盘的最内层是 `RecordingDisk`，
+/// 所有盘的写入长度汇总到同一个 `WriteLog`。返回 `(set, log)`。
+///
+/// 包装顺序是 `LocalDisk` → `RecordingDisk` → `FaultyDisk`。**这个顺序不能反**：
+/// `RecordingDisk` 记的是「最终落到盘上的那些写入」，若把它套在 `FaultyDisk`
+/// 外面，`Fault::DropWrites` 之类「假装成功」的故障就不会出现在日志里。
+pub async fn set_with_recording_disks(total: u8, parity: u8) -> (TestSet, WriteLog) {
+    let dir = tempfile::TempDir::new().expect("create tempdir");
+    let log = WriteLog::default();
+
+    let mut disks: Vec<Option<Arc<dyn DiskAPI>>> = Vec::with_capacity(total as usize);
+    let mut faulties: Vec<Arc<FaultyDisk>> = Vec::with_capacity(total as usize);
+    for i in 0..total as usize {
+        let root = dir.path().join(format!("disk{i}"));
+        let inner: Arc<dyn DiskAPI> =
+            Arc::new(LocalDisk::open(&root, DiskId::new_v4()).expect("open local disk"));
+        // `FaultyDisk::wrap` 取 `impl DiskAPI + 'static`（按值），所以先把
+        // `RecordingDisk` 建出来、按值传进去，之后再 Arc/unsize。
+        let recorded = RecordingDisk::new(inner, log.clone());
+        let faulty = Arc::new(FaultyDisk::wrap(recorded));
+        faulties.push(Arc::clone(&faulty));
+        let erased: Arc<dyn DiskAPI> = faulty;
+        disks.push(Some(erased));
+    }
+
+    let set = ErasureSet::new(disks, parity).expect("valid erasure set geometry");
+    (
+        TestSet {
+            set,
+            faulties,
+            _dir: dir,
+        },
+        log,
+    )
 }
 
 #[cfg(test)]
