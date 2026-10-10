@@ -12,7 +12,10 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use rstore_api::{ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore};
+use rstore_api::{
+    ApiError, ByteRange, ObjectData, ObjectEntry, ObjectInfo, ObjectStore, PutRequest,
+};
+use tokio::io::AsyncReadExt;
 
 /// 所有对象共用的固定 `mod_time`（Unix 纳秒，2023-11-14）。
 /// 用固定值而不是 `SystemTime::now()`：测试断言可复现，且不必引入时间依赖。
@@ -106,27 +109,30 @@ impl ObjectStore for MockStore {
         Ok(buckets.clone())
     }
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> Result<ObjectInfo, ApiError> {
+    async fn put_object(&self, mut req: PutRequest) -> Result<ObjectInfo, ApiError> {
         if let Some(err) = self.take_failure() {
             return Err(err);
         }
-        let etag = fake_etag(&data);
+        // 协议层测试只关心状态码与响应头，所以这里把流读干即可——
+        // 内存上界是 P1 在 `rstore-store` 里证明的，不是这里的职责。
+        // `read_to_end` 需要 `tokio` 作为**正式依赖**（见 Cargo.toml 的说明）。
+        let mut data = Vec::new();
+        req.body
+            .read_to_end(&mut data)
+            .await
+            .map_err(|e| ApiError::Internal(format!("mock: read body: {e}")))?;
+        let etag = req.etag.unwrap_or_else(|| fake_etag(&data));
         let size = data.len() as u64;
         {
             let mut objects = self.objects.lock().expect("mock mutex poisoned");
             objects.insert(
-                (bucket.to_string(), key.to_string()),
+                (req.bucket.clone(), req.key.clone()),
                 (data, etag.clone(), MOCK_MOD_TIME_NANOS),
             );
         }
         // PUT 自动建桶：M5 只测协议翻译，5.3 的 `PUT /b/k` 不会先建桶
         // （真实 S3 会回 `NoSuchBucket`，这里刻意宽松）。
-        self.ensure_bucket(bucket);
+        self.ensure_bucket(&req.bucket);
         Ok(ObjectInfo {
             size,
             etag,

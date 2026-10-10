@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
-use futures::TryStreamExt as _;
 use http::StatusCode;
-use rstore_api::{ApiError, ByteRange, ObjectInfo, ObjectStore};
+use rstore_api::{ApiError, ByteRange, ObjectInfo, ObjectStore, PutRequest};
 use s3s::dto::*;
 use s3s::{S3Error, S3Request, S3Response, S3Result, S3};
+use tokio::io::AsyncRead;
+use tokio_util::io::StreamReader;
 
 use crate::conditional::{self, Verdict};
 use crate::errors::to_s3_error;
@@ -114,26 +115,34 @@ impl S3 for RstoreFs {
     ) -> S3Result<S3Response<PutObjectOutput>> {
         // 写入入口：两条命名规则都在这里挡（DESIGN §6.3 + 盘上别名）。
         validate_object_key(&req.input.key).map_err(to_s3_error)?;
-        let data = match req.input.body {
-            // `Bytes` 不实现 `Extend<u8>`，`try_concat()` 在这里用不了；
-            // 先收集成 `Vec<Bytes>` 再拼接。
-            Some(body) => body
-                .try_collect::<Vec<Bytes>>()
-                .await
-                // 错误构造统一走映射表，本文件不散落 `s3_error!`（见 `errors.rs` 顶部）。
-                .map_err(|e| {
-                    to_s3_error(ApiError::Internal(format!(
-                        "failed to read request body: {e}"
-                    )))
-                })?
-                .concat()
-                .to_vec(),
-            // 空对象是合法的 PUT（`touch` 一个 0 字节文件）：body 为 None 就是空。
-            None => Vec::new(),
+
+        // 请求体**不再收全**：`StreamingBlob` 是一个字节流，直接转成 `AsyncRead`
+        // 交给存储层逐块消费。空 body 是合法的 PUT（`touch` 一个 0 字节文件），
+        // `tokio::io::empty()` 就是那个「立刻 EOF」的流。
+        //
+        // `StreamExt` 只在**这里**导入，不放模块级：测试模块里
+        // `http_body_util::BodyExt` 也有个 `collect`，两者同时可见会变成
+        // 「multiple applicable items in scope」。
+        use futures::StreamExt as _;
+        let body: Box<dyn AsyncRead + Unpin + Send> = match req.input.body {
+            Some(blob) => Box::new(StreamReader::new(
+                // `StreamingBlob` 的 Item 是 `Result<Bytes, Box<dyn Error + Send + Sync>>`，
+                // 而 `StreamReader` 要求 `Result<_, io::Error>`。这层映射只是把错误
+                // 换个盒子——真正的错误语义在存储层的 `read_block` 里统一成
+                // `StoreError::Internal`，不会在这里丢信息。
+                blob.map(|r| r.map_err(std::io::Error::other)),
+            )),
+            None => Box::new(tokio::io::empty()),
         };
+
         let info = self
             .store
-            .put_object(&req.input.bucket, &req.input.key, data)
+            .put_object(PutRequest {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                body,
+                etag: None,
+            })
             .await
             .map_err(to_s3_error)?;
         Ok(S3Response::new(PutObjectOutput {
@@ -490,6 +499,17 @@ mod tests {
     use crate::build_service;
     use crate::mock::{fake_etag, MockStore};
 
+    /// 把一段内存字节包成 [`PutRequest`]。`body` 是流，每个调用点自己包一遍太吵，
+    /// 而测试里要的从来就是「拿这坨字节去 PUT」。
+    fn put_req(bucket: &str, key: &str, data: Vec<u8>) -> PutRequest {
+        PutRequest {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            body: Box::new(std::io::Cursor::new(data)),
+            etag: None,
+        }
+    }
+
     const ACCESS_KEY: &str = "testkey";
     const SECRET_KEY: &str = "testsecret";
     const REGION: &str = "us-east-1";
@@ -515,12 +535,7 @@ mod tests {
         async fn list_buckets(&self) -> Result<Vec<String>, ApiError> {
             Ok(Vec::new())
         }
-        async fn put_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _data: Vec<u8>,
-        ) -> Result<ObjectInfo, ApiError> {
+        async fn put_object(&self, _req: PutRequest) -> Result<ObjectInfo, ApiError> {
             Err(ApiError::Internal("nop".into()))
         }
         async fn get_object(
@@ -824,7 +839,7 @@ mod tests {
             .await
             .expect("create bucket");
         store
-            .put_object("test-bucket", "obj", b"data".to_vec())
+            .put_object(put_req("test-bucket", "obj", b"data".to_vec()))
             .await
             .expect("put object");
 
@@ -1051,11 +1066,11 @@ mod tests {
             .await
             .expect("create bucket");
         store
-            .put_object("test-bucket", "a", b"1".to_vec())
+            .put_object(put_req("test-bucket", "a", b"1".to_vec()))
             .await
             .expect("put a");
         store
-            .put_object("test-bucket", "b", b"2".to_vec())
+            .put_object(put_req("test-bucket", "b", b"2".to_vec()))
             .await
             .expect("put b");
 
@@ -1192,7 +1207,7 @@ mod tests {
         let store = Arc::new(MockStore::default());
         for key in LIST_KEYS {
             store
-                .put_object("test-bucket", key, key.as_bytes().to_vec())
+                .put_object(put_req("test-bucket", key, key.as_bytes().to_vec()))
                 .await
                 .expect("put object");
         }
@@ -1395,7 +1410,7 @@ mod tests {
         let store = Arc::new(MockStore::default());
         for key in ["a", "b", "c", "d"] {
             store
-                .put_object("test-bucket", key, key.as_bytes().to_vec())
+                .put_object(put_req("test-bucket", key, key.as_bytes().to_vec()))
                 .await
                 .expect("put object");
         }

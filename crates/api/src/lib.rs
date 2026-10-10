@@ -5,9 +5,13 @@ pub mod error;
 pub use error::ApiError;
 
 use async_trait::async_trait;
+use tokio::io::AsyncRead;
 
-/// S3 层能对引擎提出的全部问题。**刻意不含 multipart**——MVP 一律返回 501，
-/// 所以 trait 上根本没有对应方法，编译期就堵死了「不小心实现了半个 multipart」。
+/// S3 层能对引擎提出的全部问题。
+///
+/// **仍然没有 multipart**——分片上传是 P2/P3 的事，届时这里会新增方法。
+/// 本阶段只把 `put_object` 从「收 `Vec<u8>`」改成「收流」，为 P2 的
+/// Complete 铺路（它要把所有 part 流式读出来重编码成整体）。
 ///
 /// 所有方法返回 [`ApiError`] 而**不是** `rstore_store::StoreError`：`rstore-api` 与
 /// `rstore-store` 是兄弟，allowlist 里没有这条边。`StoreError -> ApiError`
@@ -19,12 +23,8 @@ pub trait ObjectStore: Send + Sync + 'static {
     async fn head_bucket(&self, bucket: &str) -> Result<(), ApiError>;
     async fn list_buckets(&self) -> Result<Vec<String>, ApiError>;
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> Result<ObjectInfo, ApiError>;
+    /// 写入一个对象。`req.body` 是请求体流，**读一次就没了**。
+    async fn put_object(&self, req: PutRequest) -> Result<ObjectInfo, ApiError>;
     async fn get_object(
         &self,
         bucket: &str,
@@ -49,6 +49,20 @@ pub trait ObjectStore: Send + Sync + 'static {
 pub struct ByteRange {
     pub start: u64,
     pub end: u64,
+}
+
+/// 一次 PUT 的输入。**用参数结构体而不是四个位置参数**：`put_object` 的调用点
+/// （S3 层与组合根各一处）读起来更好认，且以后加字段不必再改签名。
+///
+/// `body` 只要求 `Send`：trait 方法的**返回值**（那个 future）必须 `Send`，
+/// 参数随 future 一起被捕获，因此参数也只要 `Send`。`Sync` 是白加的限制，
+/// 会让 `StreamReader` 这类适配器白白卡住。
+pub struct PutRequest {
+    pub bucket: String,
+    pub key: String,
+    pub body: Box<dyn AsyncRead + Unpin + Send>,
+    /// `Some` = 用给定的 etag（P2 的 multipart Complete）；`None` = 按内容算 MD5。
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
