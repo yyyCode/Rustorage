@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use rstore_api::ObjectStore;
-use s3s::auth::SimpleAuth;
 use s3s::host::SingleDomain;
 use s3s::service::{S3Service, S3ServiceBuilder};
 
@@ -34,12 +33,17 @@ pub use impl_s3::RstoreFs;
 /// 错误类型；用它会让「启动失败」和「请求失败」在同一处混起来）。
 pub fn build_service(
     store: Arc<dyn ObjectStore>,
-    access_key: &str,
-    secret_key: &str,
+    iam: Arc<rstore_iam::IamStore>,
     base_domain: Option<&str>,
 ) -> Result<S3Service, String> {
     let mut builder = S3ServiceBuilder::new(RstoreFs { store });
-    builder.set_auth(SimpleAuth::from_single(access_key, secret_key));
+    // **认证与授权必须成对设置。** 只调 `set_access` 而不调 `set_auth` 时，
+    // s3s 的 `authorize()` 第一行就 `return Ok(())`——检查被整体跳过，
+    // 而且不报任何错（设计 §1.4）。两行紧挨着写，中间不放别的东西。
+    builder.set_auth(IamAuth {
+        iam: Arc::clone(&iam),
+    });
+    builder.set_access(IamAccess { iam });
     if let Some(domain) = base_domain {
         // `SingleDomain` 默认带 CNAME 回退（域外的 host 被整个当成桶名）。
         // **保留默认**：关掉它（`with_cname_fallback(false)`）会让「用别的域名

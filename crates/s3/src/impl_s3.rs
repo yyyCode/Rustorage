@@ -1495,8 +1495,12 @@ mod tests {
         let store = Arc::new(MockStore::default());
         // `build_service` 设了 auth，所以这一节的请求**必须签名**——这正是把
         // `signed_list_buckets` 泛化成 `signed_request` 的原因。
-        let service = build_service(store.clone(), ACCESS_KEY, SECRET_KEY, Some("example.com"))
-            .expect("valid base domain");
+        let service = build_service(
+            store.clone(),
+            Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY)),
+            Some("example.com"),
+        )
+        .expect("valid base domain");
 
         let payload = b"hello vhost";
         let (status, _headers, resp) = call_on(
@@ -1546,8 +1550,12 @@ mod tests {
         // 开了虚拟主机没有把 path-style 关掉：`SingleDomain` 内部对 `host_part ==
         // base_part` 返回**不带 bucket** 的 `VirtualHost`，于是回落到 path-style。
         let store = Arc::new(MockStore::default());
-        let service = build_service(store.clone(), ACCESS_KEY, SECRET_KEY, Some("example.com"))
-            .expect("valid base domain");
+        let service = build_service(
+            store.clone(),
+            Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY)),
+            Some("example.com"),
+        )
+        .expect("valid base domain");
 
         let payload = b"hello path style";
         let (status, _headers, resp) = call_on(
@@ -1597,8 +1605,12 @@ mod tests {
         // 不对；只有 `head_bucket` / `delete_bucket` 会真的回 `NoSuchBucket`。
         // （`HEAD /` 也能拿到 404，但 s3s 会把 HEAD 的响应体剥掉，断言不了 `<Code>`。）
         let store = Arc::new(MockStore::default());
-        let service = build_service(store, ACCESS_KEY, SECRET_KEY, Some("example.com"))
-            .expect("valid base domain");
+        let service = build_service(
+            store,
+            Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY)),
+            Some("example.com"),
+        )
+        .expect("valid base domain");
 
         let (status, _headers, body) = call_on(
             service,
@@ -1625,8 +1637,12 @@ mod tests {
         // 这个豁免，会被 CNAME 回退拿去做桶名（而且那处**不剥端口**），于是桶名校验
         // 失败。别把 `127.0.0.1` 和 `localhost` 混为一谈。
         let store = Arc::new(MockStore::default());
-        let service = build_service(store, ACCESS_KEY, SECRET_KEY, Some("example.com"))
-            .expect("valid base domain");
+        let service = build_service(
+            store,
+            Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY)),
+            Some("example.com"),
+        )
+        .expect("valid base domain");
 
         let (status, _headers, body) =
             call_on(service, signed_request("GET", "/", "127.0.0.1:9000", b"")).await;
@@ -1648,7 +1664,11 @@ mod tests {
         let store = Arc::new(MockStore::default());
         // `let-else` 而不是 `expect_err`：`S3Service` 没实现 `Debug`，`expect_err`
         // 编译不过；而 `.err().expect()` 会被 clippy 的 `err_expect` 挡下。
-        let Err(err) = build_service(store, ACCESS_KEY, SECRET_KEY, Some("not a domain")) else {
+        let Err(err) = build_service(
+            store,
+            Arc::new(rstore_iam::IamStore::root_only(ACCESS_KEY, SECRET_KEY)),
+            Some("not a domain"),
+        ) else {
             panic!("非法域名应在构造期被拒绝");
         };
         assert!(err.contains("not a domain"), "错误应含原始输入: {err}");
