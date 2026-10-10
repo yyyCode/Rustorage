@@ -78,7 +78,7 @@ echo "== 打开 --console =="
 start --console --metrics
 expect /_console/ 200 text/html
 expect /_console 200 text/html
-for asset in style.css app.js sigv4.js s3api.js metrics.js; do
+for asset in style.css app.js sigv4.js s3api.js metrics.js ui.js; do
     expect "/_console/$asset" 200
 done
 
@@ -122,11 +122,29 @@ app.js|renderBuckets
 sigv4.js|signRequest
 s3api.js|listBuckets
 metrics.js|parseMetrics
+ui.js|openDrawer
 EOF
+
+echo "== CSP 护栏：不得有内联样式 =="
+# CSP 是 `default-src 'self'`，内联 `style=` 与 `<style>` 块都会被浏览器**静默**
+# 拒掉——页面看着只是「样式没生效」，报错只在 DevTools 里。这条把静默失败
+# 变成验收脚本里的响亮失败。（`.style.` 是 JS 里写内联样式的另一种形态。）
+if grep -q 'style=' crates/server/console/index.html; then
+    echo "FAIL index.html 含内联 style=，会被 CSP 拒掉" >&2; exit 1
+fi
+if grep -q '<style' crates/server/console/index.html; then
+    echo "FAIL index.html 含 <style> 块，会被 CSP 拒掉" >&2; exit 1
+fi
+for js in app.js ui.js; do
+    if grep -q '\.style\.' "crates/server/console/$js"; then
+        echo "FAIL $js 写了 node.style.*，请改用 style.css 的类名" >&2; exit 1
+    fi
+done
+echo "ok 无内联样式"
 
 echo "== 有 node 时顺带查一遍 ES module 语法（可选）=="
 if command -v node >/dev/null; then
-    for js in app.js sigv4.js s3api.js metrics.js; do
+    for js in app.js sigv4.js s3api.js metrics.js ui.js; do
         # node --check 对 .js 默认按 CommonJS 解析，会误报 import/export，故拷成 .mjs。
         cp "crates/server/console/$js" /tmp/rs-check.mjs
         node --check /tmp/rs-check.mjs || { echo "FAIL $js 语法" >&2; exit 1; }
