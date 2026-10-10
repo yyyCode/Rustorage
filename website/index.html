@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rustorage —— 从零实现的 S3 兼容纠删码对象存储</title>
+<meta name="description" content="Rustorage 是一个用 Rust 从零实现的单节点 S3 兼容对象存储：纠删码而不是多副本，每份分片带校验和，崩溃之后看不到半成品。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Rustorage —— 从零实现的 S3 兼容纠删码对象存储">
+<meta property="og:description" content="单节点、S3 兼容、纠删码对象存储。64× 更少的范围读字节，元数据缓存命中即零磁盘调用，六盘掉两块仍可读写。">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<!-- 两个脚本都放在 head 且不 defer：i18n.js 只是赋值，app.js 在解析时就给 <html>
+     打上 .js 类，进场动效的初始隐藏态才不会在首帧闪一下。真正的初始化挂在
+     DOMContentLoaded 上。 -->
+<script src="assets/i18n.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+
+<a class="skip" href="#top" data-i18n="skip">跳到主内容</a>
+
+<header class="topbar">
+  <div class="wrap bar">
+    <a class="brand" href="#top">
+      <img src="assets/logo.svg" alt="" width="24" height="24">
+      <span>Rustorage</span>
+    </a>
+
+    <button type="button" class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="siteNav">
+      <span class="sr-only" data-i18n="nav.toggle">展开导航</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <path d="M4 7h16M4 12h16M4 17h16"/>
+      </svg>
+    </button>
+
+    <nav class="nav" id="siteNav">
+      <a href="#what" data-i18n="nav.what">它是什么</a>
+      <a href="#design" data-i18n="nav.design">设计亮点</a>
+      <a href="#diagrams" data-i18n="nav.diagrams">图解</a>
+      <a href="#bench" data-i18n="nav.bench">性能数据</a>
+      <a href="#scope" data-i18n="nav.scope">不做什么</a>
+      <a href="#roadmap" data-i18n="nav.roadmap">路线图</a>
+    </nav>
+
+    <div class="lang">
+      <button type="button" class="lang-btn" data-lang="zh" aria-pressed="true">中文</button>
+      <button type="button" class="lang-btn" data-lang="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ── 首屏 ───────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="wrap">
+      <p class="badge" data-i18n="hero.badge">开源 · Rust · S3 兼容</p>
+      <h1>Rustorage</h1>
+      <p class="tagline" data-i18n="hero.tagline">从零实现的 S3 兼容对象存储</p>
+      <p class="hero-sub" data-i18n="hero.sub">纠删码，不是多副本。每份分片自带校验和。崩溃之后，你要么看不到这个对象，要么看到一个完整的它。全部依赖就是几块磁盘，跑起来是一个可执行文件。</p>
+
+      <div class="stats">
+        <div class="stat" data-reveal>
+          <div class="stat-v"><span data-count-to="64">64</span><span class="stat-x">×</span></div>
+          <div class="stat-l" data-i18n="hero.s1.label">范围读少读的字节</div>
+        </div>
+        <div class="stat" data-reveal>
+          <div class="stat-v"><span data-count-to="0">0</span></div>
+          <div class="stat-l" data-i18n="hero.s2.label">元数据解析的磁盘调用（缓存命中时）</div>
+        </div>
+        <div class="stat" data-reveal>
+          <div class="stat-v">4+2</div>
+          <div class="stat-l" data-i18n="hero.s3.label">六盘 4+2 配置，掉两块盘仍可读写</div>
+        </div>
+      </div>
+
+      <p class="ctas">
+        <a class="btn btn-primary" href="#design" data-i18n="hero.cta1">看设计</a>
+        <a class="btn" href="#bench" data-i18n="hero.cta2">看性能数据</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- ── 它是什么 ───────────────────────────────────────────── -->
+  <section id="what" class="section" aria-labelledby="h-what">
+    <div class="wrap">
+      <h2 id="h-what" data-i18n="what.title">它是什么</h2>
+      <p class="lead" data-i18n="what.lead">Rustorage 是一个单节点的 S3 兼容对象存储，用 Rust 从零写成。</p>
+
+      <div class="grid grid-3">
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/>
+            <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+            <rect x="14" y="14" width="7" height="7" rx="1.5" stroke-dasharray="2.5 2"/>
+          </svg>
+          <h3 data-i18n="what.c1.title">纠删码</h3>
+          <p data-i18n="what.c1.body">Reed–Solomon。</p>
+        </article>
+
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <ellipse cx="12" cy="5.5" rx="7.5" ry="2.5"/>
+            <path d="M4.5 5.5v6c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5v-6"/>
+            <path d="M4.5 11.5v6c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5v-6"/>
+          </svg>
+          <h3 data-i18n="what.c2.title">单节点多盘</h3>
+          <p data-i18n="what.c2.body">所有盘属于一个 erasure set。</p>
+        </article>
+
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 8h12"/><path d="M13 5l3 3-3 3"/>
+            <path d="M20 16H8"/><path d="M11 13l-3 3 3 3"/>
+          </svg>
+          <h3 data-i18n="what.c3.title">S3 数据面</h3>
+          <p data-i18n="what.c3.body">桶与对象的增删查列。</p>
+        </article>
+
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3l7.5 3v6.2c0 4.3-3 7.9-7.5 9.3-4.5-1.4-7.5-5-7.5-9.3V6z"/>
+            <path d="M8.8 12.2l2.2 2.2 4.2-4.4"/>
+          </svg>
+          <h3 data-i18n="what.c4.title">完整性</h3>
+          <p data-i18n="what.c4.body">每份分片带一个 keyed BLAKE3 校验和。</p>
+        </article>
+
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="7" height="16" rx="1.5" stroke-dasharray="2.5 2"/>
+            <path d="M14 12h7"/><path d="M18 9l3 3-3 3"/>
+          </svg>
+          <h3 data-i18n="what.c5.title">崩溃一致性</h3>
+          <p data-i18n="what.c5.body">数据先落到 .staging-* 临时名。</p>
+        </article>
+
+        <article class="card" data-reveal>
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12.5h3.8l2.4-6.5 3.9 12 2.4-5.5H21"/>
+          </svg>
+          <h3 data-i18n="what.c6.title">运维面</h3>
+          <p data-i18n="what.c6.body">健康检查、就绪探针、Prometheus 指标。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 三个设计取舍 ───────────────────────────────────────── -->
+  <section id="design" class="section soft" aria-labelledby="h-design">
+    <div class="wrap">
+      <h2 id="h-design" data-i18n="design.title">三个设计取舍</h2>
+      <p class="lead" data-i18n="design.lead">这三件事是真正花了心思的地方。</p>
+
+      <div class="decisions">
+        <article class="decision" data-reveal>
+          <div class="dnum">01</div>
+          <h3 data-i18n="design.1.title">纠删码，而不是多副本</h3>
+          <p data-i18n="design.1.body">同样是 6 块盘。</p>
+          <pre class="detail mono" data-i18n="design.1.detail">read_quorum  = N − parity</pre>
+        </article>
+
+        <article class="decision" data-reveal>
+          <div class="dnum">02</div>
+          <h3 data-i18n="design.2.title">绝不返回坏数据</h3>
+          <p data-i18n="design.2.body">每份分片带校验和。</p>
+          <p class="detail warnbox" data-i18n="design.2.detail">换来的是单向的可用性收益。</p>
+        </article>
+
+        <article class="decision" data-reveal>
+          <div class="dnum">03</div>
+          <h3 data-i18n="design.3.title">崩溃之后看不到半成品</h3>
+          <p data-i18n="design.3.body">一次写入分三步。</p>
+          <p class="detail" data-i18n="design.3.detail">而且写路径是逐块流式的。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 图解 ───────────────────────────────────────────────── -->
+  <section id="diagrams" class="section" aria-labelledby="h-diagrams">
+    <div class="wrap">
+      <h2 id="h-diagrams" data-i18n="diagrams.title">设计图解</h2>
+      <p class="lead" data-i18n="diagrams.lead">四张图，讲清对象放在哪。</p>
+
+      <!-- 图一：三级寻址 -->
+      <figure class="fig" data-reveal>
+        <div class="chain">
+          <span class="node">bucket</span>
+          <span class="arw">→</span>
+          <span class="node">key</span>
+          <span class="arw">→</span>
+          <span class="node mono">7f3a…c21d</span>
+          <span class="arw">→</span>
+          <span class="files">
+            <span class="file meta">meta.xl</span>
+            <span class="file">part.1</span>
+            <span class="file dim">…</span>
+            <span class="file">part.N</span>
+          </span>
+        </div>
+        <figcaption>
+          <h3 data-i18n="diagrams.addr.title">对象放在哪</h3>
+          <p data-i18n="diagrams.addr.body">桶就是一个目录。</p>
+        </figcaption>
+      </figure>
+
+      <!-- 图二：写路径 -->
+      <figure class="fig" data-reveal>
+        <div class="steps">
+          <span class="step" data-i18n="diagrams.write.s1">请求体</span>
+          <span class="arw">→</span>
+          <span class="step" data-i18n="diagrams.write.s2">切块</span>
+          <span class="arw">→</span>
+          <span class="step" data-i18n="diagrams.write.s3">Reed–Solomon 编码</span>
+          <span class="arw">→</span>
+          <span class="step mono" data-i18n="diagrams.write.s4">.staging-* 写入</span>
+          <span class="arw">→</span>
+          <span class="step mono">fsync</span>
+          <span class="arw">→</span>
+          <span class="step" data-i18n="diagrams.write.s6">rename 提交</span>
+        </div>
+        <figcaption>
+          <h3 data-i18n="diagrams.write.title">一次 PUT 经过什么</h3>
+          <p data-i18n="diagrams.write.body">请求体被逐块切分。</p>
+        </figcaption>
+      </figure>
+
+      <!-- 图三：掉盘矩阵 -->
+      <figure class="fig" data-reveal>
+        <div class="matrix">
+          <div class="mrow">
+            <span class="rlabel" data-i18n="diagrams.fault.r0">6 块全在</span>
+            <span class="disks">
+              <span class="d"></span><span class="d"></span><span class="d"></span>
+              <span class="d"></span><span class="d"></span><span class="d"></span>
+            </span>
+            <span class="verdict ok" data-i18n="diagrams.fault.ok">可读写</span>
+          </div>
+          <div class="mrow">
+            <span class="rlabel" data-i18n="diagrams.fault.r2">掉 2 块</span>
+            <span class="disks">
+              <span class="d"></span><span class="d dead"></span><span class="d"></span>
+              <span class="d"></span><span class="d dead"></span><span class="d"></span>
+            </span>
+            <span class="verdict ok" data-i18n="diagrams.fault.ok">可读写</span>
+          </div>
+          <div class="mrow">
+            <span class="rlabel" data-i18n="diagrams.fault.r3">掉 3 块</span>
+            <span class="disks">
+              <span class="d"></span><span class="d dead"></span><span class="d dead"></span>
+              <span class="d"></span><span class="d dead"></span><span class="d dead"></span>
+            </span>
+            <span class="verdict bad">503</span>
+          </div>
+        </div>
+        <figcaption>
+          <h3 data-i18n="diagrams.fault.title">掉几块盘还能用</h3>
+          <p data-i18n="diagrams.fault.body">4+2 布局下读 quorum 是 4。</p>
+        </figcaption>
+      </figure>
+
+      <!-- 图四：范围读对比 -->
+      <figure class="fig" data-reveal>
+        <div class="bars">
+          <div class="rbar-row">
+            <span class="rbar-label" data-i18n="diagrams.range.old">旧路径 · GET bytes=0-99</span>
+            <span class="rbar-track"><span class="rbar rbar-old"></span></span>
+            <span class="rbar-val">100.7 MB</span>
+          </div>
+          <div class="rbar-row">
+            <span class="rbar-label" data-i18n="diagrams.range.new">新路径 · GET bytes=0-99</span>
+            <span class="rbar-track"><span class="rbar rbar-new"></span></span>
+            <span class="rbar-val">1.57 MB</span>
+          </div>
+        </div>
+        <figcaption>
+          <h3 data-i18n="diagrams.range.title">取 100 字节要读多少</h3>
+          <p data-i18n="diagrams.range.body">同一个 64 MiB 对象上的 GET bytes=0-99。</p>
+          <p class="fig-note" data-i18n="diagrams.range.note">两根横条按真实比例绘制。</p>
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ── 性能数据 ───────────────────────────────────────────── -->
+  <section id="bench" class="section soft" aria-labelledby="h-bench">
+    <div class="wrap">
+      <h2 id="h-bench" data-i18n="bench.title">性能数据</h2>
+      <p class="lead" data-i18n="bench.lead">下面每个数字都来自仓库里的基准。</p>
+
+      <div class="table-wrap">
+        <table class="bench">
+          <thead>
+            <tr>
+              <th scope="col" data-i18n="bench.th.metric">机制</th>
+              <th scope="col" data-i18n="bench.th.result">结果</th>
+              <th scope="col" data-i18n="bench.th.note">说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td data-i18n="bench.r1.m">范围读少读的字节</td>
+              <td class="val" data-i18n="bench.r1.v">100 676 742 → 1 573 056</td>
+              <td class="dim" data-i18n="bench.r1.n">64×</td>
+            </tr>
+            <tr>
+              <td data-i18n="bench.r2.m">同 key 重复 HEAD 的磁盘调用</td>
+              <td class="val" data-i18n="bench.r2.v">12 000 → 0</td>
+              <td class="dim" data-i18n="bench.r2.n">缓存命中即零磁盘 IO</td>
+            </tr>
+            <tr>
+              <td data-i18n="bench.r3.m">分页列举的目录遍历</td>
+              <td class="val" data-i18n="bench.r3.v">11 430 → 7 230</td>
+              <td class="dim" data-i18n="bench.r3.n">−37%</td>
+            </tr>
+            <tr>
+              <td data-i18n="bench.r4.m">单次 PUT 内复用分片缓冲</td>
+              <td class="val" data-i18n="bench.r4.v">256 → 16 次显式扩容</td>
+              <td class="dim" data-i18n="bench.r4.n">16×</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout" data-reveal>
+        <h3 data-i18n="bench.neg.title">也有一个数字是难看的</h3>
+        <p data-i18n="bench.neg.body">当一次列举必须扫完整个桶时。</p>
+      </div>
+
+      <div class="callout plain" data-reveal>
+        <h3 data-i18n="bench.how.title">怎么读这些数字</h3>
+        <p data-i18n="bench.how.body">计数是主证据，墙钟是佐证。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 刻意不做的事 ───────────────────────────────────────── -->
+  <section id="scope" class="section" aria-labelledby="h-scope">
+    <div class="wrap">
+      <h2 id="h-scope" data-i18n="scope.title">刻意不做的事</h2>
+      <p class="lead" data-i18n="scope.lead">有边界的 MVP 比没有边界的半成品可信。</p>
+
+      <ul class="scopelist">
+        <li data-i18n="scope.i1">不支持 multipart。</li>
+        <li data-i18n="scope.i2">单节点。</li>
+        <li data-i18n="scope.i3">只监听 127.0.0.1。</li>
+        <li data-i18n="scope.i4">没有用户组。</li>
+        <li data-i18n="scope.i5">列举走全盘遍历。</li>
+        <li data-i18n="scope.i6">控制面板是只读的。</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ── 路线图 ─────────────────────────────────────────────── -->
+  <section id="roadmap" class="section soft" aria-labelledby="h-roadmap">
+    <div class="wrap">
+      <h2 id="h-roadmap" data-i18n="roadmap.title">路线图</h2>
+      <p class="lead" data-i18n="roadmap.lead">没有日期。</p>
+
+      <ol class="roadmaplist">
+        <li data-i18n="roadmap.i1">多节点与池化</li>
+        <li data-i18n="roadmap.i2">multipart 流式上传</li>
+        <li data-i18n="roadmap.i3">TLS</li>
+        <li data-i18n="roadmap.i4">自动自愈</li>
+        <li data-i18n="roadmap.i5">命名空间索引</li>
+      </ol>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap foot">
+    <p class="foot-note">
+      <span>Rustorage</span>
+      <span class="sep">·</span>
+      <span data-i18n="footer.license">MIT 许可</span>
+      <span class="sep">·</span>
+      <span data-i18n="footer.note">Rust · 纠删码 · S3</span>
+    </p>
+    <nav class="foot-links">
+      <a href="https://github.com/yyyCode/Rustorage" data-i18n="footer.repo">源码</a>
+      <a href="https://github.com/yyyCode/Rustorage/blob/main/docs/DESIGN.md" data-i18n="footer.docs">设计文档</a>
+      <a href="https://github.com/yyyCode/Rustorage/tree/main/docs/benchmarks" data-i18n="footer.benchmarks">基准数据</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

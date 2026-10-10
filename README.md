@@ -12,6 +12,8 @@
 - 设计文档：[`docs/DESIGN.md`](docs/DESIGN.md)
 - 实施计划（含每条限制的来龙去脉）：[`docs/MVP.md`](docs/MVP.md)
 - 性能基准：[`docs/benchmarks/`](docs/benchmarks/)
+- 官网展示站（零构建静态页，可挂域名）：[`website/`](website/) ——
+  本地预览：`python -m http.server 8080 --bind 127.0.0.1 --directory website`
 
 ---
 
