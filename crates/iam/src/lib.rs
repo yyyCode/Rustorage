@@ -8,5 +8,7 @@
 //!
 //! 设计依据：`docs/superpowers/specs/2026-10-10-iam-design.md`。
 
+pub mod action;
+pub mod arn;
 pub mod glob;
 pub mod policy;
