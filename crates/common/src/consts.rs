@@ -10,9 +10,10 @@ pub const RESERVED_PREFIX: &str = ".rstore";
 /// 控制面板的路径前缀（设计 §3.3）。与 [`RESERVED_PREFIX`] 同处集中定义，
 /// 服务端路由与前端资源引用都从这里取值，不得内联字面量。
 ///
-/// 选 `_` 开头是因为 `crates/s3` 的 `validate_bucket_name` 拒绝首字符为 `_` 的桶名，
-/// 于是 `/_console` 在规则生效后**不可能**成为任何合法桶名——冲突是结构性消除的，
-/// 不是靠约定。
+/// 选 `_` 开头**不是为了好看，是因为它结构上不可能是桶名**：s3s 的
+/// `check_bucket_name` 只允许 `[a-z0-9.-]`，下划线出现在任何位置都判非法，
+/// 而我们的 `build_service` 没调 `set_validation`，用的就是这套默认规则。
+/// 于是 `/_console/*` 永远撞不上一个真实桶——这是上游给的保证，不是本仓库的约定。
 pub const CONSOLE_PREFIX: &str = "/_console";
 
 /// 版本化桶取 1/8；MVP 未启用版本化，但函数签名保留该维度。
