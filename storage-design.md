@@ -823,6 +823,9 @@ sequence_number, decrypt_skip, plaintext_offset/length, total_plaintext_size}}`�
 
 ### 12.1 crate 职责
 
+> 本仓库的 MVP 只落一个 `rstore-iam`（策略文档 + 身份存储 + 求值），
+> **不拆** `credentials` / `policy` 两层——M1 约 300 行，拆开只会让改一处动三个 crate。
+
 | crate | 职责 |
 |---|---|
 | `iam` | `IamSys<T>` / `IamCache<T>` / `IamState` / `OidcSys`；用户、组、服务账号、策略绑定、STS |
@@ -859,6 +862,12 @@ sequence_number, decrypt_skip, plaintext_offset/length, total_plaintext_size}}`�
 - Admin 面：`admin/route_policy.rs` + `security-governance::admin_matrix` 的静态路由矩阵，
   `validate_admin_route_specs` 在启动/测试时校验矩阵完整性；
 - 健康探针路径（`HEALTH_PREFIX`）是唯一的鉴权旁路。
+
+> **Rustorage MVP 的偏离**（见 `docs/superpowers/specs/2026-10-10-iam-design.md`）：
+> 数据面的授权点落在 s3s 的 `S3Access::check`（`crates/s3/src/iam.rs`），
+> 判定顺序是「匿名 → root → 身份策略」，**没有桶策略**（那是 M6）。
+> 鉴权旁路不止健康探针——`/metrics` 与 `/_console` 的静态资源也在 s3s 之前
+> 被截走（`crates/server/src/startup.rs` 的 accept 循环）。
 
 ### 12.4 远端凭证密封
 

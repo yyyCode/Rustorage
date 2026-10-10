@@ -158,6 +158,7 @@ Node ──▶ Pool ──▶ ErasureSet ──▶ Disk ──▶ Shard
 rstore-server        二进制入口，唯一的装配点
    ├── rstore-s3-compat   兼容中间件（薄）
    ├── rstore-s3          s3s 的 S3 trait 实现
+   │      └── rstore-iam    策略文档 + 身份存储 + 求值（叶子，无内部依赖）
    ├── rstore-store       引擎核心：Pool / ErasureSet / 读写路径 / quorum / 提交
    │      ├── rstore-disk
    │      ├── rstore-erasure
@@ -175,13 +176,20 @@ rstore-server        二进制入口，唯一的装配点
 | `rstore-disk` | `DiskAPI` trait、`LocalDisk`、路径与 fsync 原语 | common, meta, checksum |
 | `rstore-store` | 引擎核心（见上） | 以上全部 |
 | `rstore-api` | `ObjectStore` 等契约 trait、领域错误 | common |
-| `rstore-s3` | s3s 集成：`S3` trait 实现、SigV4 接入、错误映射 | api, common |
+| `rstore-iam` | 策略文档解析、身份存储、授权求值 | 无内部依赖 |
+| `rstore-s3` | s3s 集成：`S3` trait 实现、SigV4 接入、错误映射 | api, common, iam |
 | `rstore-s3-compat` | tower 兼容中间件 | common |
 | `rstore-server` | 装配、启动/关闭编排、metrics、config 加载 | 全部 |
 
+`rstore-iam` 是**叶子**，而且比 `rstore-api` 还低：它**没有任何内部依赖**，不认识
+s3s（认证/授权适配器在 `rstore-s3`），也不认识盘——IAM 目录由调用方拼好传进来。
+`rstore-s3` 因此多了一条指向它的边（需要 `IamStore` 来做认证与授权），
+`rstore-server` 在启动期装载它并把 `Arc<IamStore>` 交给 `build_service`。
+
 **规则 R1**：外部只能通过 `rstore-api` 的 trait 访问引擎，不得直接依赖 `rstore-store`。
 **规则 R2**：`rstore-api` 不得反向依赖任何实现 crate。
-**规则 R3**：`common` 不得依赖任何内部 crate；`checksum` / `erasure` 只允许依赖 `common`。
+**规则 R3**：`common` 不得依赖任何内部 crate；`checksum` / `erasure` 只允许依赖 `common`；
+`iam`（叶子）同样不得依赖任何内部 crate。
 **规则 R4**：把实现绑定到 `rstore-api` trait 的**唯一**位置是 `rstore-server/src/wiring.rs`（组合根）。
 上层 crate（`rstore-s3`、`rstore-s3-compat`）**只接收**已经装配好的 `Arc<dyn ObjectStore>`，
 自己不得出现 `rstore-store` 的依赖。

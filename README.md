@@ -151,6 +151,7 @@ rstore-server --volumes D:\rs\d1 D:\rs\d2 D:\rs\d3 D:\rs\d4 --parity 2
 | `--base-domain <DOMAIN>` | 不设 | 开启虚拟主机寻址（`Host: bucket.example.com`）；不设 = 纯 path-style |
 | `--metrics` | 关 | 打开 `/metrics` 指标计数 |
 | `--console` | 关 | 打开只读控制面板（[§6.5](#65-控制面板可选)） |
+| `--iam-dir <PATH>` | `<volumes[0]>/.rstore/iam` | IAM 配置目录（用户与策略），详见 [§4.5](#45-身份与权限iam)。目录不存在 = 没有非 root 用户 |
 | `-h` / `--help` | | 帮助 |
 
 > ⚠️ 默认凭据 `rustorage` / `rustorage-secret` 只适合本地试用。**对外提供服务前务必用
@@ -207,6 +208,51 @@ sudo systemctl daemon-reload && sudo systemctl enable --now rustorage
 ```
 
 Windows 上可用 NSSM 或「任务计划程序」把可执行文件注册成服务，本项目不附带安装器。
+
+### 4.5 身份与权限（IAM）
+
+默认只有一对 root 凭据（`--access-key` / `--secret-key`），拿到它就是全权，没有
+「只读用户」这种东西。要区分权限，就在 IAM 目录下放**用户**与**策略**：
+
+```
+<volumes[0]>/.rstore/iam/
+    users/<access-key>.json      # 文件名（去掉 .json）就是 access key
+    policies/<name>.json         # AWS IAM policy JSON
+```
+
+`users/alice.json`：
+
+```json
+{"secret_key": "alice-secret", "status": "enabled", "policies": ["readonly"]}
+```
+
+`policies/readonly.json`：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::photos/*"]}
+  ]
+}
+```
+
+规则：
+
+- **默认拒绝**——没有任何策略允许，就什么都做不了；
+- **显式拒绝优先**——同一个请求上 `Allow` 与 `Deny` 同时命中时，`Deny` 赢；
+- **root 不受策略约束**，专门留作永不锁死自己的后门；
+- 策略是 AWS 的子集。`Action` 用 `s3:GetObject` 这种写法；`Condition` 与其他未知
+  字段会被**拒绝加载**（而不是静默忽略——忽略条件等于把策略悄悄放宽）；
+- **改完文件要重启**，M1 没有热加载。
+
+启动日志会打出 `IAM 已加载 users=.. policies=.. dir=..`；启动失败时错误信息里带
+文件名，且服务**不会开始监听**。
+
+> ⚠️ **IAM 只管 S3 协议面。** `/health`、`/ready`、`/metrics` 与 `/_console` 的静态
+> 资源在 s3s 之前就被截走，不受任何策略约束——只要 `--metrics` 开着，任何能连上
+> `127.0.0.1` 的人都能读指标。加上没有 TLS、只绑回环，**真正的边界仍然是「谁能连上
+> 这台机器」**。
 
 ## 5. 客户端使用
 
@@ -412,6 +458,8 @@ bash tests/compat/rclone.sh
 | **错误 XML 只有 `Code` + `Message`** | 没有 `Resource` / `RequestId`（上游序列化器的限制） |
 | **虚拟主机寻址默认关闭** | 要按 `Host: bucket.example.com` 寻址必须显式传 `--base-domain`；开了之后，任何非 base、非 IP 的 host 会被整体当作桶名 |
 | **默认凭据是硬编码的** | `rustorage` / `rustorage-secret`，务必在对外前改掉 |
+| **没有组与外部身份源** | 用户只能一个个建，不能建组、不能接 OIDC / LDAP，也没有管理 API（改配置 = 改文件 + 重启） |
+| **IAM 不覆盖运维端点** | `/health` `/ready` `/metrics` `/_console` 不走鉴权，见 [§4.5](#45-身份与权限iam) |
 
 ## 8. 开发
 
