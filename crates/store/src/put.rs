@@ -347,8 +347,23 @@ impl ErasureSet {
             // 分片 `kk` 落在盘 `dist[kk] - 1`。每块盘每块恰好收到一份（`dist` 是排列）。
             for (kk, shard) in shards.iter().enumerate() {
                 let physical = usize::from(dist[kk] - 1);
-                if let Some(w) = writers[physical].as_mut() {
-                    w.push_block(shard)?;
+                // 两种错误必须分开处理，**不能**一个 `?` 了事：
+                // - `ShardLayout` 是程序 bug（几何算错、块序颠倒），整次写入中止；
+                // - 盘的 IO 失败等价于「这块盘拿不到票」，交给下面的 `write_quorum` 判定。
+                // 逐块落盘之后后者第一次有了提前暴露的机会（从前 `push_block` 根本不碰盘，
+                // 所有 IO 错误都堆在 `finish` 里由选票兜底）。若在这里提前返回，
+                // 一块掉线的盘就会让**整个 PUT** 失败，而它本该只是少一票。
+                // 所以丢掉这块盘的写入器，后续块不再往它写。
+                let failed = match writers[physical].as_mut() {
+                    Some(w) => match w.push_block(shard).await {
+                        Ok(()) => false,
+                        Err(e @ StoreError::ShardLayout(_)) => return Err(e),
+                        Err(_) => true,
+                    },
+                    None => false,
+                };
+                if failed {
+                    writers[physical] = None;
                 }
             }
         }

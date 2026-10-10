@@ -123,7 +123,7 @@ mod tests {
     async fn write_shard(disk: &Arc<dyn DiskAPI>) {
         let mut w = BitrotShardWriter::new(Arc::clone(disk), "part.1".into(), BS);
         for chunk in vec![0x5Au8; PAYLOAD_LEN].chunks(BS) {
-            w.push_block(chunk).unwrap();
+            w.push_block(chunk).await.unwrap();
         }
         w.finish().await.unwrap();
     }

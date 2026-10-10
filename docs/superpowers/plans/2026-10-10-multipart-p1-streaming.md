@@ -380,15 +380,29 @@ Expected: 编译失败——`push_block` 现在返回的 future 没被 await 的
 ```
 
 ```rust
-    /// fsync 文件与父目录。逐块 `append` 都不 fsync，耐久性在这里一次性兑现。
-    ///
-    /// 文件本身由 `sync_file_and_parent` 先 sync、再 sync 父目录——顺序不可颠倒，
-    /// 否则崩溃后文件内容在盘上、目录里却没有它。
+    /// 收尾：必要时落一个空文件，再 fsync 文件与父目录。
+    /// 逐块 `append` 都不 fsync，耐久性在这里一次性兑现；
+    /// 顺序不可颠倒（文件 → 父目录），否则崩溃后文件内容在盘上、目录里却没有它。
     pub async fn finish(self) -> Result<(), StoreError> {
+        // 一个块都没推过时，盘上还不存在这个文件——逐块 `append` 只有在真的写了
+        // 字节时才会创建它。但**空分片在读侧是合法的**：`bitrot_size(0, bs) == 0`，
+        // 而读取器是靠 `stat` 判存在性的，文件缺失会被报成 `NotFound`
+        // （参与 quorum 时计为「缺失」，是另一个语义）。
+        // 缓冲版的实现靠 `write_all` 的「创建即截断」顺手落下了这个 0 字节文件，
+        // 改成逐块追加后这个副作用没了，必须显式补回来。
+        // 这里用 `write_all` 而不是 `append(&[])`：前者会把已存在的路径清空，
+        // 与「这份分片就是空的」严格一致；`append` 遇到残留内容会留下垃圾。
+        if self.payload_len == 0 {
+            self.disk.write_all(&self.rel_path, &[]).await?;
+        }
         self.disk.sync_file_and_parent(&self.rel_path).await?;
         Ok(())
     }
 ```
+
+> **为什么 `finish` 不能只是 fsync（实测踩过）**：`writer::layout_agrees_with_shared_bitrot_size`
+> 的第一个用例是 `(0, 1024)`，`reader::empty_shard_reads_to_empty` 也直接构造空写入器——
+> 两条都会以 `Disk(NotFound)` 失败。凡「空 payload 落在盘上必须有文件」的契约都靠这一步兜住。
 
 `bitrot_hash` 的返回值是 `[u8; 32]`（`rstore_checksum::HASH_LEN`），
 `32 + data.len()` 里的字面量 32 直接换成 `rstore_checksum::HASH_LEN`：
@@ -423,8 +437,32 @@ Expected: 编译失败——`push_block` 现在返回的 future 没被 await 的
 ```
 →
 ```rust
-                    w.push_block(shard).await?;
+                    // 两种错误必须分开处理，**不能**一个 `?` 了事：
+                    // - `ShardLayout` 是程序 bug（几何算错、块序颠倒），整次写入中止；
+                    // - 盘的 IO 失败等价于「这块盘拿不到票」，交给下面的 `write_quorum` 判定。
+                    // 逐块落盘之后后者第一次有了提前暴露的机会（从前 `push_block` 根本不碰盘，
+                    // 所有 IO 错误都堆在 `finish` 里由选票兜底）。若在这里提前返回，
+                    // 一块掉线的盘就会让**整个 PUT** 失败，而它本该只是少一票。
+                    // 所以丢掉这块盘的写入器，后续块不再往它写。
+                    let failed = match writers[physical].as_mut() {
+                        Some(w) => match w.push_block(shard).await {
+                            Ok(()) => false,
+                            Err(e @ StoreError::ShardLayout(_)) => return Err(e),
+                            Err(_) => true,
+                        },
+                        None => false,
+                    };
+                    if failed {
+                        writers[physical] = None;
+                    }
 ```
+
+> **为什么 `?` 是错的（实测踩过）**：`put::tests::put_fails_below_write_quorum`、
+> `quorum_boundaries::matrix_4_plus_2`、`delete::tests::gc_keeps_old_dir_where_the_new_meta_never_landed`
+> 三条都会以 `Disk(Transient(Io))` 失败——它们注入的是离线盘，期望的是
+> `WriteQuorum` 或「降级成功」，不是把第一次 IO 错误当成整次 PUT 的结局。
+> 注意 `let failed = ...` 用 `match` 而不是 `if let Some(w) = ... else` 是**必需的**：
+> 得先把可变借用在 match 表达式结束时放掉，下一行才能整体写 `writers[physical] = None`。
 
 `crates/store/src/reader.rs:126`（测试夹具里的 `w.push_block(chunk).unwrap();`）：
 
@@ -821,8 +859,17 @@ async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>
             // 分片 `kk` 落在盘 `dist[kk] - 1`。每块盘每块恰好收到一份（`dist` 是排列）。
             for (kk, shard) in shards.iter().enumerate() {
                 let physical = usize::from(dist[kk] - 1);
-                if let Some(w) = writers[physical].as_mut() {
-                    w.push_block(shard).await?;
+                // 与 Task 2 Step 6 同一条规则：布局错误中止，盘 IO 失败只丢这一票。
+                let failed = match writers[physical].as_mut() {
+                    Some(w) => match w.push_block(shard).await {
+                        Ok(()) => false,
+                        Err(e @ StoreError::ShardLayout(_)) => return Err(e),
+                        Err(_) => true,
+                    },
+                    None => false,
+                };
+                if failed {
+                    writers[physical] = None;
                 }
             }
 
