@@ -245,7 +245,45 @@ fn apply_range(full: Vec<u8>, size: u64, range: Option<ByteRange>) -> Result<Vec
     }
 }
 
-/// 分片分支：读回每块盘的 `part.1`，逐块解码重建整对象。
+/// 区间读产物的裁剪：`buf` 是从第 `first_block` 块的头开始的一段，
+/// 按 `Range` 把两端修掉。
+///
+/// 与 [`apply_range`] 的区别只有基准偏移：后者的 `buf` 从对象头开始。
+/// 两者一样，**走到这里还越界就是 M5 的 bug**，不静默吸收。
+fn slice_blocks(
+    buf: Vec<u8>,
+    size: u64,
+    range: Option<ByteRange>,
+    first_block: usize,
+) -> Result<Vec<u8>, StoreError> {
+    let Some(ByteRange { start, end }) = range else {
+        return Err(StoreError::Internal(
+            "slice_blocks called without a range".into(),
+        ));
+    };
+    if start > end || end >= size {
+        return Err(StoreError::Internal(format!(
+            "range {start}-{end} out of bounds for size {size}"
+        )));
+    }
+    // `first_block = start / BLOCK_SIZE`（由调用方保证），所以 `start >= base` 恒成立。
+    let base = first_block as u64 * BLOCK_SIZE as u64;
+    let lo = (start - base) as usize;
+    let hi = (end - base) as usize + 1;
+    if hi > buf.len() {
+        return Err(StoreError::Internal(format!(
+            "range {start}-{end} exceeds materialized block span {}",
+            buf.len()
+        )));
+    }
+    Ok(buf[lo..hi].to_vec())
+}
+
+/// 分片分支：读回每块盘的 `part.1`，解码重建 `blocks` 指定的块区间。
+///
+/// `blocks = None` 表示**全部块**——即今天的旧路径，一字不变。
+/// `blocks = Some((first, last))`（闭区间）表示只要这几块，此时每块盘也只读这几块。
+/// **模式判断在调用方**（`get_object`），本函数只认区间。
 ///
 /// **一块盘的读取失败（含 `Corrupt(BitrotMismatch)`）绝不中止整次读取**，
 /// 只是把该盘的槽位置成 `None`，交给纠删码用校验分片补回来——这正是纠删码存在的意义。
@@ -256,6 +294,7 @@ async fn read_shards(
     winner_dir: &str,
     header: &FileVersionHeader,
     body: &ObjectBody,
+    blocks: Option<(usize, usize)>,
 ) -> Result<Vec<u8>, StoreError> {
     let size = header.size;
     if size == 0 {
@@ -283,8 +322,17 @@ async fn read_shards(
 
     let step = shard_step(size, data) as usize;
     let shard_len = expected_shard_len(size, data);
-    let n = size.div_ceil(BLOCK_SIZE as u64);
+    // `size > 0` 已由上面的提前返回保证，所以 `n >= 1`——`n - 1` 不会下溢。
+    let n = size.div_ceil(BLOCK_SIZE as u64) as usize;
     let part_rel = format!("{key_rel}/{winner_dir}/part.1");
+
+    // 闭区间的两端。`None` 就是「第 0 块到末块」——与今天完全一致。
+    let (first_block, last_block) = blocks.unwrap_or((0, n - 1));
+    if first_block > last_block || last_block >= n {
+        return Err(StoreError::Internal(format!(
+            "block range {first_block}..={last_block} is invalid for {n} blocks"
+        )));
+    }
 
     // 盘 `d` 持分片 `j` ⟺ `ec_dist[j] == d + 1`。反过来建表：盘号 → 分片号。
     let mut shard_of_disk = vec![usize::MAX; total];
@@ -292,15 +340,18 @@ async fn read_shards(
         shard_of_disk[(d1 - 1) as usize] = j;
     }
 
-    // 每块盘读一次整份分片；失败只记 None，不中止整次读取。
+    // 每块盘读一次；失败只记 None，不中止整次读取。
+    // `blocks = None` → 整份分片（旧路径）；`Some` → 只读命中的块。
     let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
     for slot in set.disks() {
         let payload = match slot {
             Some(disk) => {
-                BitrotShardReader::new(Arc::clone(disk), part_rel.clone(), step, shard_len)
-                    .read_all()
-                    .await
-                    .ok()
+                let r = BitrotShardReader::new(Arc::clone(disk), part_rel.clone(), step, shard_len);
+                match blocks {
+                    None => r.read_all().await,
+                    Some((fb, lb)) => r.read_range(fb, lb).await,
+                }
+                .ok()
             }
             None => None,
         };
@@ -315,10 +366,20 @@ async fn read_shards(
         });
     }
 
-    let mut out: Vec<u8> = Vec::with_capacity(size as usize);
-    for k in 0..n {
-        let lo = (k * step as u64) as usize;
-        let hi = ((k + 1) * step as u64).min(shard_len) as usize;
+    // 本函数自己的不变量：读到了不一致的长度却照常返回，就是在静默丢数据。
+    // 全量读时期望 `size`；区间读时期望该区间覆盖的对象字节数。
+    let expect_len = (((last_block + 1) as u64) * BLOCK_SIZE as u64).min(size)
+        - first_block as u64 * BLOCK_SIZE as u64;
+    // 盘读到的那段是从第 `first_block` 块的头开始的，所以切片下标要减掉这个基准。
+    // 全量读时它是 0，即今天的行为。
+    let base = first_block * step;
+
+    let mut out: Vec<u8> = Vec::with_capacity(expect_len as usize);
+    for k in first_block..=last_block {
+        // 块下标现在是 `usize`（`n` 也是），所以偏移一律在 `usize` 里算；
+        // `shard_len` 是 `u64`（`expected_shard_len` 的返回类型），这里收窄一次。
+        let lo = k * step;
+        let hi = ((k + 1) * step).min(shard_len as usize);
         let shard_size_k = hi - lo;
         if shard_size_k == 0 {
             return Err(StoreError::Internal(format!(
@@ -334,7 +395,8 @@ async fn read_shards(
             if let Some(payload) = payload {
                 let j = shard_of_disk[d];
                 if j != usize::MAX {
-                    slots[j] = Some(payload[lo..hi].to_vec());
+                    let rel_lo = lo - base;
+                    slots[j] = Some(payload[rel_lo..rel_lo + shard_size_k].to_vec());
                 }
             }
         }
@@ -352,7 +414,7 @@ async fn read_shards(
             .map_err(|e| StoreError::Internal(format!("erasure decode: {e}")))?;
 
         // 补齐的零只在最后一个数据分片的尾部：顺序相接后截断到**本块真实长度**。
-        let block_len = (size - k * BLOCK_SIZE as u64).min(BLOCK_SIZE as u64) as usize;
+        let block_len = (size - k as u64 * BLOCK_SIZE as u64).min(BLOCK_SIZE as u64) as usize;
         let mut block = Vec::with_capacity(data_shards.len() * shard_size_k);
         for shard in &data_shards {
             block.extend_from_slice(shard);
@@ -366,10 +428,9 @@ async fn read_shards(
         out.extend_from_slice(&block[..block_len]);
     }
 
-    // 本函数自己的不变量：读到了不一致的长度却照常返回，就是在静默丢数据。
-    if out.len() as u64 != size {
+    if out.len() as u64 != expect_len {
         return Err(StoreError::Internal(format!(
-            "reassembled {} bytes but header says {size}",
+            "reassembled {} bytes but blocks {first_block}..={last_block} should hold {expect_len}",
             out.len()
         )));
     }
@@ -379,8 +440,12 @@ async fn read_shards(
 impl ErasureSet {
     /// `range` 为 `None` 时返回整个对象。
     ///
-    /// **MVP 不做流式**：Range 仍会把整份分片读进来、把所有块解码出来，
-    /// 最后才切出 `[start, end]`（省的是网络与 S3 层的内存，没省磁盘 IO）。
+    /// **旧模式（`IoModes::default()`）不做流式**：Range 仍会把整份分片读进来、
+    /// 把所有块解码出来，最后才切出 `[start, end]`（省的是网络与 S3 层的内存，
+    /// 没省磁盘 IO）——这段描述依然准确，只是有了新路径可选。
+    ///
+    /// **新模式（`ranged_shard_read`）**：把 Range 折算成块区间，每块盘只读这几块。
+    /// 省下的是磁盘 IO 与内存，代价是**被跳过的块不再做 bitrot 校验**（设计文档 §8）。
     pub async fn get_object(
         &self,
         bucket: &str,
@@ -433,14 +498,30 @@ impl ErasureSet {
         }
 
         // 分片分支。
-        let full = read_shards(self, &key_rel, winner_dir, &header, &body).await?;
+        //
+        // **模式判断只此一处**：开了范围读就把 Range 折算成块区间，关着就传 `None`
+        // （= 今天的全量读）。折算只用已经算出来的 `BLOCK_SIZE`，不需要新的偏移计算。
+        let blocks = range.and_then(|r| {
+            if !self.modes().ranged_shard_read {
+                return None;
+            }
+            let n = size.div_ceil(BLOCK_SIZE as u64);
+            let first = r.start / BLOCK_SIZE as u64;
+            let last = (r.end / BLOCK_SIZE as u64).min(n - 1);
+            Some((first as usize, last as usize))
+        });
+        let buf = read_shards(self, &key_rel, winner_dir, &header, &body, blocks).await?;
         // etag 与 LIST 共用同一处算法（见 `etag_of_meta`）；`parts` 为空时它报 `Internal`。
         let etag = etag_of_meta(meta)?;
         let data_dir = header
             .data_dir
             .or(body.id)
             .ok_or_else(|| StoreError::Internal(format!("version of {key_rel} has no data_dir")))?;
-        let data = apply_range(full, size, range)?;
+        // 两条分支的裁剪基准不同：全量读从对象头开始，区间读从块边界开始。
+        let data = match blocks {
+            None => apply_range(buf, size, range)?,
+            Some((first, _)) => slice_blocks(buf, size, range, first)?,
+        };
         Ok(GetOut {
             data,
             size,
@@ -473,9 +554,11 @@ impl ErasureSet {
 mod tests {
     use rstore_disk::faulty::Fault;
 
+    use rstore_common::modes::IoModes;
+
     use super::*;
     use crate::put::PutArgs;
-    use crate::testutil::{body, set_with_disks};
+    use crate::testutil::{body, set_with_disks, set_with_modes};
 
     fn put_args(bucket: &str, key: &str, data: Vec<u8>) -> PutArgs {
         PutArgs {
@@ -568,6 +651,70 @@ mod tests {
             .unwrap();
         assert_eq!(got.size, 3_000_000);
         assert_eq!(got.data, data[1000..2000]);
+    }
+
+    /// 开了范围读之后，**结果必须与全量读逐字节相同**。
+    /// 区间刻意覆盖三种块边界：首块内、跨块边界、末块单字节、整份。
+    #[tokio::test]
+    async fn ranged_get_matches_full_get() {
+        // 3_000_000 = 2 个满块 + 一个 942_592 字节的末块（不是 251 的整数倍）。
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let ranges = [
+            (0u64, 0u64),
+            (0, 99),
+            (
+                crate::put::BLOCK_SIZE as u64 - 1,
+                crate::put::BLOCK_SIZE as u64 + 1,
+            ),
+            (1_000_000, 2_000_000),
+            (2_999_999, 2_999_999),
+        ];
+
+        for (start, end) in ranges {
+            let plain = set_with_modes(6, 2, IoModes::default()).await;
+            plain
+                .put_object(put_args("b", "k", data.clone()))
+                .await
+                .unwrap();
+
+            let ranged = set_with_modes(6, 2, IoModes::ALL).await;
+            ranged
+                .put_object(put_args("b", "k", data.clone()))
+                .await
+                .unwrap();
+
+            let expect = &data[start as usize..=end as usize];
+            let a = plain
+                .get_object("b", "k", Some(ByteRange { start, end }))
+                .await
+                .unwrap();
+            let b = ranged
+                .get_object("b", "k", Some(ByteRange { start, end }))
+                .await
+                .unwrap();
+            assert_eq!(a.data, expect, "旧模式 {start}-{end}");
+            assert_eq!(b.data, expect, "新模式 {start}-{end}");
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.etag, b.etag);
+        }
+    }
+
+    /// 新模式下的 **HEAD 与整读**也必须一个字不变——本次只动范围读那条分支。
+    #[tokio::test]
+    async fn new_mode_leaves_full_get_and_head_alone() {
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let set = set_with_modes(6, 2, IoModes::ALL).await;
+        set.put_object(put_args("b", "k", data.clone()))
+            .await
+            .unwrap();
+
+        let got = set.get_object("b", "k", None).await.unwrap();
+        assert_eq!(got.data, data);
+        assert_eq!(got.size, 3_000_000);
+
+        let head = set.head_object("b", "k").await.unwrap();
+        assert_eq!(head.size, got.size);
+        assert_eq!(head.etag, got.etag);
     }
 
     #[tokio::test]

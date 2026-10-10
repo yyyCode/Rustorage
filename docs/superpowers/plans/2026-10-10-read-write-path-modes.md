@@ -977,8 +977,10 @@ async fn read_shards(
 
     let mut out: Vec<u8> = Vec::with_capacity(expect_len as usize);
     for k in first_block..=last_block {
-        let lo = (k * step as u64) as usize;
-        let hi = ((k + 1) * step as u64).min(shard_len) as usize;
+        // 块下标现在是 `usize`（`n` 也是），所以偏移一律在 `usize` 里算；
+        // `shard_len` 是 `u64`（`expected_shard_len` 的返回类型），这里收窄一次。
+        let lo = k * step;
+        let hi = ((k + 1) * step).min(shard_len as usize);
         let shard_size_k = hi - lo;
         if shard_size_k == 0 {
             return Err(StoreError::Internal(format!(
