@@ -43,6 +43,15 @@ pub struct Config {
     /// opt-in），且开关关闭时既有验收脚本的行为零变化。
     #[arg(long)]
     pub(crate) console: bool,
+
+    /// IAM 配置目录（`users/*.json` 与 `policies/*.json`）。未给时用
+    /// `<volumes[0]>/.rstore/iam`——放在盘上而不是进程的工作目录里，
+    /// 因为「配置跟着数据走」：换台机器起同一个盘集，身份与权限原样带过去。
+    ///
+    /// 该目录放在 `RESERVED_PREFIX`（`.rstore`）之下，而 S3 命名空间里的用户 key
+    /// 不允许以 `.rstore` 开头，所以桶/对象**结构上够不到**这份配置。
+    #[arg(long)]
+    pub(crate) iam_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -53,5 +62,60 @@ impl Config {
     pub(crate) fn parity(&self) -> u8 {
         self.parity
             .unwrap_or_else(|| default_parity(self.volumes.len() as u8))
+    }
+
+    /// IAM 目录的**实际**取值：显式给了就用，否则 `<volumes[0]>/<RESERVED_PREFIX>/iam`。
+    ///
+    /// 与 `parity()` 同一形状——clap 的 `default_value_t` 表达不了「依赖另一个参数」，
+    /// 所以默认值在这里拼。
+    pub(crate) fn iam_dir(&self) -> PathBuf {
+        self.iam_dir.clone().unwrap_or_else(|| {
+            self.volumes[0]
+                .join(rstore_common::consts::RESERVED_PREFIX)
+                .join("iam")
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(volumes: Vec<PathBuf>, iam_dir: Option<PathBuf>) -> Config {
+        Config {
+            volumes,
+            port: 0,
+            parity: None,
+            access_key: "rustorage".into(),
+            secret_key: "rustorage-secret".into(),
+            base_domain: None,
+            metrics: false,
+            console: false,
+            iam_dir,
+        }
+    }
+
+    /// 未给 `--iam-dir` 时落在**第一块盘**的 `.rstore/iam` 下。
+    /// 用 `RESERVED_PREFIX` 常量而不是字面量 `.rstore`：拼错了这条测试会红，
+    /// 而不是让服务悄悄去一个用户 key 够得到的目录里读凭据。
+    #[test]
+    fn iam_dir_defaults_to_first_volume() {
+        let c = cfg(vec![PathBuf::from("/d1"), PathBuf::from("/d2")], None);
+        assert_eq!(
+            c.iam_dir(),
+            PathBuf::from("/d1")
+                .join(rstore_common::consts::RESERVED_PREFIX)
+                .join("iam")
+        );
+    }
+
+    /// 显式给了 `--iam-dir` 就以它为准——运维要能把配置放到别处（例如只读挂载）。
+    #[test]
+    fn explicit_iam_dir_wins() {
+        let c = cfg(
+            vec![PathBuf::from("/d1")],
+            Some(PathBuf::from("/etc/rstore-iam")),
+        );
+        assert_eq!(c.iam_dir(), PathBuf::from("/etc/rstore-iam"));
     }
 }

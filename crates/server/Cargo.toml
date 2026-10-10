@@ -11,6 +11,7 @@ rstore-store.workspace = true
 rstore-api.workspace = true
 rstore-s3.workspace = true
 rstore-s3-compat.workspace = true
+rstore-iam.workspace = true
 rstore-disk.workspace = true
 rstore-meta.workspace = true
 tokio.workspace = true

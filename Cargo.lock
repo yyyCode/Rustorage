@@ -1467,12 +1467,15 @@ dependencies = [
  "jiff",
  "rstore-api",
  "rstore-common",
+ "rstore-iam",
  "s3s",
  "s3s-sigv4",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-util",
  "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -1497,6 +1500,7 @@ dependencies = [
  "rstore-api",
  "rstore-common",
  "rstore-disk",
+ "rstore-iam",
  "rstore-meta",
  "rstore-s3",
  "rstore-s3-compat",

@@ -1,8 +1,9 @@
 //! 启动与关闭编排（Task 6.3）。
 //!
 //! `parse → LocalDisk::open 各盘 → 逐盘读 format.json → select_authoritative →
-//! ErasureSet::new → build_service → 起监听 → FullReady`。盘上 `format.json` 的读写
-//! 在这里落地（Task 3.3 刻意留给 6.3）：这是全流程唯一一处直接碰文件系统的地方。
+//! ErasureSet::new → 加载 IAM → build_service → 起监听 → FullReady`。盘上
+//! `format.json` 的读写在这里落地（Task 3.3 刻意留给 6.3）。**IAM 的加载是这条链上
+//! 唯一的另一次目录读**，同样刻意放在起监听之前：配置有问题要在这里就退出。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -62,15 +63,29 @@ impl Running {
         ready.mark_stage(SystemStage::StorageReady);
 
         let store: Arc<dyn ObjectStore> = Arc::new(Wiring::new(outcome.set, Arc::clone(&m)));
+
+        // IAM 在**起监听之前**加载：配置读不动（语法错、目录里混进了子目录、
+        // 用户引用了不存在的策略）就在这一刻以非零码退出。放到请求期去发现，
+        // 只会让运维面对一堆莫名其妙的 403。
+        let iam_dir = cfg.iam_dir();
+        let iam = Arc::new(
+            rstore_iam::IamStore::load(&iam_dir, &cfg.access_key, &cfg.secret_key)
+                .map_err(|e| anyhow!("加载 IAM 配置失败（{}）：{e}", iam_dir.display()))?,
+        );
+        // 启动横幅里报出计数与目录：目录为空时的 users=0 正是「凭据只有 root」
+        // 那个状态的可见证据。
+        tracing::info!(
+            users = iam.user_count(),
+            policies = iam.policy_count(),
+            root = %cfg.access_key,
+            dir = %iam_dir.display(),
+            "IAM 已加载"
+        );
+
         // build_service 返回 Err 是「--base-domain 不是合法域名」——运维输入错误，
         // 必须打印那条信息并以非零码退出，不要 unwrap()。
-        let s3 = rstore_s3::build_service(
-            store,
-            &cfg.access_key,
-            &cfg.secret_key,
-            cfg.base_domain.as_deref(),
-        )
-        .map_err(|e| anyhow!(e))?;
+        let s3 = rstore_s3::build_service(store, iam, cfg.base_domain.as_deref())
+            .map_err(|e| anyhow!(e))?;
 
         // MVP 只绑 127.0.0.1，不做 TLS 也不对外。
         let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
@@ -395,6 +410,7 @@ mod tests {
             base_domain: None,
             metrics: false,
             console: false,
+            iam_dir: None,
         }
     }
 
