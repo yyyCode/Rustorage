@@ -28,5 +28,12 @@ async-trait.workspace = true
 # 必须显式开这个 feature 才能看到故障注入盘。
 rstore-disk = { workspace = true, features = ["fault-injection"] }
 
+# `harness = false`：这是一个手写的 `fn main`，不引 criterion。
+# 设计文档 §7.3 定的是「以确定性计数为主、墙钟为辅」——计数由本文件自己的
+# `IoLog` 给出，criterion 的统计功利用不上，而它会拖一整套依赖进来。
+[[bench]]
+name = "io_modes"
+harness = false
+
 [lints]
 workspace = true
