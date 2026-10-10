@@ -43,17 +43,32 @@ impl BitrotShardReader {
         }
     }
 
-    /// 读回整份分片并逐块校验，返回 `shard_len` 字节的原始数据。
+    /// 该分片按 `block_size` 切出的块数。0 表示空分片（`shard_len == 0`）。
+    fn block_count(&self) -> usize {
+        self.shard_len.div_ceil(self.block_size as u64) as usize
+    }
+
+    /// 第 `k` 块的明文长度。**只有最后一块可能短**，其余都是满 `block_size`。
+    fn block_data_len(&self, k: usize) -> usize {
+        if k + 1 == self.block_count() {
+            (self.shard_len - k as u64 * self.block_size as u64) as usize
+        } else {
+            self.block_size
+        }
+    }
+
+    /// `stat` + **整份文件**的长度检查。`read_all` 与 `read_range` 的共同前置。
     ///
     /// 判定顺序是刻意的，不可调换：
     /// 1. 先 `stat`：不存在 → `NotFound`（参与 quorum 时计为「缺失」而非失败）。
     /// 2. 再比对**文件总长**。短 → `Transient(ShortRead)`（很可能只是写入未完成，
     ///    报成 `Corrupt` 会把它统计进损坏、进而触发 heal）；长 → `Corrupt(LengthMismatch)`
-    ///    （多出来的字节没人能解释）。少了这一步，读取器只会读完自己需要的字节就返回 `Ok`，
-    ///    把多余的尾巴静默忽略——于是「文件被追加了垃圾」这种损坏永远发现不了。
-    /// 3. 一次性读整份（MVP 下分片本来就是内存里的整块）。
-    /// 4. 逐块重算摘要比对，不符 → `Corrupt(BitrotMismatch)`。
-    pub async fn read_all(&self) -> Result<Vec<u8>, DiskError> {
+    ///    （多出来的字节没人能解释）。
+    ///
+    /// **范围读也照样走这一整套**：它收窄的只是 `read_exact_at` 的区间，不是
+    /// 「文件总长必须恰好等于 [`bitrot_size`]」这条判据。少了它，一个被截断的文件
+    /// 会在只读前几个块的场景下静默返回一段合法-looking 的数据。
+    async fn checked_stat(&self) -> Result<u64, DiskError> {
         let stat = self.disk.stat(&self.rel_path).await?;
         let Some(stat) = stat else {
             return Err(DiskError::NotFound);
@@ -67,26 +82,37 @@ impl BitrotShardReader {
         if stat.size > expected {
             return Err(DiskError::Corrupt(CorruptKind::LengthMismatch));
         }
+        Ok(expected)
+    }
 
+    /// 读并校验**半开区间** `[first, last)` 内的块，返回它们拼起来的明文。
+    ///
+    /// 只 `read_exact_at` 这些块实际占用的那段字节：其余块既不入内存，也不重算摘要。
+    /// `first == last`（空区间，含空分片）返回空 `Vec`，**一次 IO 都不发**。
+    async fn read_blocks(&self, first: usize, last: usize) -> Result<Vec<u8>, DiskError> {
+        assert!(first <= last, "block range {first}..{last} is reversed");
+        let n = self.block_count();
+        assert!(last <= n, "block range {first}..{last} exceeds {n} blocks");
+        if first == last {
+            return Ok(Vec::new());
+        }
+
+        let stride = HASH_LEN + self.block_size;
+        let start = first * stride;
+        // 末块的结束偏移要按它**实际**的长度算：一律用满 `stride` 会越过文件尾。
+        // 这是范围读与整份读在偏移上唯一一处差别，也是唯一容易写错的地方。
+        let end = last * stride - self.block_size + self.block_data_len(last - 1);
         let raw = self
             .disk
-            .read_exact_at(&self.rel_path, 0, expected as usize)
+            .read_exact_at(&self.rel_path, start as u64, end - start)
             .await?;
 
-        // `shard_len == 0` 时块数为 0、`expected == 0`：这里直接落回空 Vec，不 panic。
-        let n = self.shard_len.div_ceil(self.block_size as u64);
-        let mut out = Vec::with_capacity(self.shard_len as usize);
-        for k in 0..n {
-            // 偏移用固定步长 `block_size + HASH_LEN`：读侧不依赖任何块内元数据，
-            // 块边界完全由 (shard_len, block_size, k) 决定。
-            let off = (k as usize) * (HASH_LEN + self.block_size);
+        // 偏移一律相对 **本次读到的这段** 计算，与整份读的相对偏移由 `first` 平移。
+        let mut out = Vec::with_capacity(end - start);
+        for k in first..last {
+            let off = (k - first) * stride;
             let digest = &raw[off..off + HASH_LEN];
-            // 只有最后一块可能是短块；前面的块一定满 block_size。
-            let data_len = if k + 1 == n {
-                (self.shard_len - k * self.block_size as u64) as usize
-            } else {
-                self.block_size
-            };
+            let data_len = self.block_data_len(k);
             let data = &raw[off + HASH_LEN..off + HASH_LEN + data_len];
             // 比对**重算的数据哈希**与落盘摘要。破坏数据字节必被这里抓出。
             if bitrot_hash(data)[..] != digest[..] {
@@ -95,6 +121,37 @@ impl BitrotShardReader {
             out.extend_from_slice(data);
         }
         Ok(out)
+    }
+
+    /// 读回整份分片并逐块校验，返回 `shard_len` 字节的原始数据。
+    ///
+    /// 就是 `read_blocks(0, n)`——长度检查与逐块校验都在那条共用路径上。
+    /// `shard_len == 0` 时 `n == 0`，直接落回空 `Vec`，不 panic。
+    pub async fn read_all(&self) -> Result<Vec<u8>, DiskError> {
+        self.checked_stat().await?;
+        let n = self.block_count();
+        self.read_blocks(0, n).await
+    }
+
+    /// 只读第 `first_block..=last_block` 块（**含两端**）并逐块校验，返回这些块的明文。
+    ///
+    /// **跳过的块不做 bitrot 校验**——位腐检测的成本正比于真正读到的范围
+    /// （见设计文档 §8）。这是刻意的语义变化，不是遗漏：完整读会因为块 7 的损坏
+    /// 丢掉整块盘的分片，读块 1 的范围读不会。所以范围读的可用性是**单向变好**的。
+    ///
+    /// 调用方必须保证 `first_block <= last_block` 且 `last_block < block_count()`。
+    /// 越界是程序 bug，用 `assert` 在最早处爆掉，胜过返回一段偏移错位的数据。
+    pub async fn read_range(
+        &self,
+        first_block: usize,
+        last_block: usize,
+    ) -> Result<Vec<u8>, DiskError> {
+        assert!(
+            first_block <= last_block,
+            "block range {first_block}..={last_block} is reversed"
+        );
+        self.checked_stat().await?;
+        self.read_blocks(first_block, last_block + 1).await
     }
 }
 
@@ -222,5 +279,154 @@ mod tests {
         let (_tmp, disk) = temp_disk();
         let err = reader(disk).read_all().await.unwrap_err();
         assert!(matches!(err, DiskError::NotFound), "got {err:?}");
+    }
+
+    // ---- read_range：范围读 ----
+    // BS = 1024、PAYLOAD_LEN = 1500 → 分片有 2 块（第 0 块 1024 字节，末块 476 字节）。
+
+    /// 范围读必须与整份读的对应切片**逐字节相同**——这是范围读唯一能拿来对齐的参照物。
+    /// 穷举所有 `(first, last)` 组合，把单块、跨块、含末块三种情形都走到。
+    #[tokio::test]
+    async fn read_range_matches_the_slice_of_read_all() {
+        let (_tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+        let full = reader(Arc::clone(&disk)).read_all().await.unwrap();
+        assert_eq!(full.len(), PAYLOAD_LEN);
+
+        let n = PAYLOAD_LEN.div_ceil(BS);
+        assert_eq!(n, 2, "本测试的分片几何依赖它是 2 块");
+        for first in 0..n {
+            for last in first..n {
+                let got = reader(Arc::clone(&disk))
+                    .read_range(first, last)
+                    .await
+                    .unwrap();
+                let lo = first * BS;
+                let hi = ((last + 1) * BS).min(PAYLOAD_LEN);
+                assert_eq!(got, full[lo..hi], "range {first}..={last}");
+            }
+        }
+    }
+
+    /// **范围外的位腐不该被范围读发现**——这是设计文档 §8 声明出来的语义变化。
+    ///
+    /// 同一次损坏下 `read_all` 必须失败，否则这条测试什么都没钉住：它要证的不是
+    /// 「范围读很宽松」，而是「范围读校验的范围正比于它读到的范围」。
+    #[tokio::test]
+    async fn read_range_ignores_bitrot_outside_the_range() {
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+
+        // 第 1 块的数据字节：跳过第 0 块的 [摘要(32) + 数据(1024)]，再跳过第 1 块自己的摘要。
+        let at = (HASH_LEN + BS) + HASH_LEN;
+        let path = tmp.path().join("part.1");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[at] ^= 0xFF;
+        std::fs::write(&path, &raw).unwrap();
+
+        let r = reader(Arc::clone(&disk)).read_range(0, 0).await;
+        assert!(r.is_ok(), "范围外的位腐不该被范围读发现，got {r:?}");
+
+        let full = reader(Arc::clone(&disk)).read_all().await;
+        assert!(
+            matches!(full, Err(DiskError::Corrupt(CorruptKind::BitrotMismatch))),
+            "整份读必须失败，否则这条测试是空的，got {full:?}"
+        );
+    }
+
+    /// 范围**内**的位腐必须被抓到：范围读省的是校验**范围**，不是校验本身。
+    #[tokio::test]
+    async fn read_range_detects_bitrot_inside_the_range() {
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+
+        let path = tmp.path().join("part.1");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[HASH_LEN] ^= 0xFF; // 第 0 块的数据字节
+        std::fs::write(&path, &raw).unwrap();
+
+        let r = reader(Arc::clone(&disk)).read_range(0, 0).await;
+        assert!(
+            matches!(r, Err(DiskError::Corrupt(CorruptKind::BitrotMismatch))),
+            "got {r:?}"
+        );
+    }
+
+    /// **整份文件的长度检查在范围读上一条都不能少**：只读几个块，也必须先确认
+    /// 文件总长恰好等于 `bitrot_size`。少了它，一个被截断的文件会在范围读里
+    /// 静默返回一段合法-looking 的数据。
+    #[tokio::test]
+    async fn read_range_keeps_the_whole_file_length_check() {
+        // 截断 → Transient(ShortRead)，**不是** Corrupt。
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+        let path = tmp.path().join("part.1");
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 10]).unwrap();
+        let r = reader(Arc::clone(&disk)).read_range(0, 0).await;
+        assert!(
+            matches!(r, Err(DiskError::Transient(TransientKind::ShortRead))),
+            "got {r:?}"
+        );
+
+        // 超长 → Corrupt(LengthMismatch)。
+        let (tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+        let path = tmp.path().join("part.1");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&[0xFF; 10]);
+        std::fs::write(&path, &raw).unwrap();
+        let r = reader(Arc::clone(&disk)).read_range(0, 0).await;
+        assert!(
+            matches!(r, Err(DiskError::Corrupt(CorruptKind::LengthMismatch))),
+            "got {r:?}"
+        );
+
+        // 不存在 → NotFound（参与 quorum 时计为「缺失」而非「失败」）。
+        let (_tmp, disk) = temp_disk();
+        let r = reader(disk).read_range(0, 0).await;
+        assert!(matches!(r, Err(DiskError::NotFound)), "got {r:?}");
+    }
+
+    /// **空分片上的范围读是契约违规，不是空结果**：0 块的分片没有任何合法区间，
+    /// 按 `read_range` 的文档契约用 `assert` 爆掉。
+    ///
+    /// 这条把**契约本身**钉住：谁把那个 `assert` 换成 `return Ok(Vec::new())`，
+    /// 越界就会变成一段安静返回的空数据，而调用方分不清它和「真的读到 0 字节」。
+    /// 引擎不会走到这一格——`read_shards` 在 `size == 0` 时提前返回，
+    /// 所以那里 `n >= 1`，区间恒有解。
+    #[tokio::test]
+    #[should_panic(expected = "exceeds")]
+    async fn read_range_on_an_empty_shard_is_a_contract_violation() {
+        let (_tmp, disk) = temp_disk();
+        let w = BitrotShardWriter::new(Arc::clone(&disk), "part.1".into(), BS);
+        w.finish().await.unwrap(); // 空 payload：落成 0 字节文件
+
+        // 注意这里必须用 `shard_len = 0` 的读取器，**不是**下面测试用的那个
+        // `PAYLOAD_LEN` 版本：文件是 0 字节，而 `PAYLOAD_LEN` 的期望长度是
+        // `bitrot_size(1500, 1024) = 1564`，长度检查会先报 `ShortRead` 把它拦下，
+        // 根本走不到块区间那一步。
+        assert_eq!(
+            BitrotShardReader::new(Arc::clone(&disk), "part.1".into(), BS, 0)
+                .read_all()
+                .await
+                .unwrap(),
+            Vec::<u8>::new(),
+            "空分片的整份读仍然必须是空"
+        );
+
+        // 0 块的分片，任何区间都不合法。
+        let _ = BitrotShardReader::new(disk, "part.1".into(), BS, 0)
+            .read_range(0, 0)
+            .await;
+    }
+
+    /// 反向的契约：`first > last` 同样必须爆掉，而不是安静地什么都不读。
+    #[tokio::test]
+    #[should_panic(expected = "reversed")]
+    async fn read_range_with_a_reversed_interval_is_a_contract_violation() {
+        let (_tmp, disk) = temp_disk();
+        write_shard(&disk).await;
+        let _ = reader(disk).read_range(1, 0).await;
     }
 }
