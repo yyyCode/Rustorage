@@ -114,13 +114,14 @@ mod tests {
     use super::*;
     use crate::error::StoreError;
     use crate::put::PutArgs;
-    use crate::testutil::{set_with_disks, TestSet};
+    use crate::testutil::{body, set_with_disks, TestSet};
 
     fn put_args(bucket: &str, key: &str, data: Vec<u8>) -> PutArgs {
         PutArgs {
             bucket: bucket.into(),
             key: key.into(),
-            data,
+            body: body(data),
+            etag: None,
         }
     }
 

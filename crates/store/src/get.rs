@@ -475,13 +475,14 @@ mod tests {
 
     use super::*;
     use crate::put::PutArgs;
-    use crate::testutil::set_with_disks;
+    use crate::testutil::{body, set_with_disks};
 
     fn put_args(bucket: &str, key: &str, data: Vec<u8>) -> PutArgs {
         PutArgs {
             bucket: bucket.into(),
             key: key.into(),
-            data,
+            body: body(data),
+            etag: None,
         }
     }
 

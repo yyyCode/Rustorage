@@ -7,6 +7,18 @@ use rstore_disk::{DiskAPI, Fault, FaultyDisk, LocalDisk};
 
 use crate::set::ErasureSet;
 
+/// 内存 `AsyncRead`：各模块的测试用它把 `Vec<u8>` 喂进流式的
+/// [`PutArgs`](crate::put::PutArgs)。
+///
+/// tokio 给 `std::io::Cursor<T: AsRef<[u8]>>` 实现了 `AsyncRead`
+/// （tokio-1.53.2/src/io/async_read.rs:111），不必自己造一个读取器。
+///
+/// 放在这里而不是各测试模块各写一份：它已经要被 put / bucket / delete / get /
+/// list / reconcile / quorum_boundaries 七处用到。
+pub(crate) fn body(data: Vec<u8>) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+    Box::new(std::io::Cursor::new(data))
+}
+
 /// 一个已挂好 `FaultyDisk` 的 erasure set。
 ///
 /// **为什么需要这层包装**：`ErasureSet::disks` 存的是 `Arc<dyn DiskAPI>`，
