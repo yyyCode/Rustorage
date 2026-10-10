@@ -38,6 +38,11 @@ pub struct Config {
     /// 打开 `/metrics`。
     #[arg(long)]
     pub(crate) metrics: bool,
+
+    /// 打开只读控制面板（`/_console/`）。默认关闭：与 `--metrics` 一致（同样是
+    /// opt-in），且开关关闭时既有验收脚本的行为零变化。
+    #[arg(long)]
+    pub(crate) console: bool,
 }
 
 impl Config {
