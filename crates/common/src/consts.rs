@@ -7,6 +7,14 @@ pub const DEFAULT_INLINE_BLOCK: u64 = 128 * 1024;
 /// **store 的目录遍历与 s3 的 key 校验都引用这一个常量，不得内联字面量。**
 pub const RESERVED_PREFIX: &str = ".rstore";
 
+/// 控制面板的路径前缀（设计 §3.3）。与 [`RESERVED_PREFIX`] 同处集中定义，
+/// 服务端路由与前端资源引用都从这里取值，不得内联字面量。
+///
+/// 选 `_` 开头是因为 `crates/s3` 的 `validate_bucket_name` 拒绝首字符为 `_` 的桶名，
+/// 于是 `/_console` 在规则生效后**不可能**成为任何合法桶名——冲突是结构性消除的，
+/// 不是靠约定。
+pub const CONSOLE_PREFIX: &str = "/_console";
+
 /// 版本化桶取 1/8；MVP 未启用版本化，但函数签名保留该维度。
 pub fn should_inline(size: u64, versioned_bucket: bool) -> bool {
     let threshold = if versioned_bucket {
