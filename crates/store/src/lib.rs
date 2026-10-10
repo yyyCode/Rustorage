@@ -5,6 +5,8 @@ pub mod commit;
 pub mod delete;
 pub mod error;
 pub mod get;
+#[cfg(test)]
+mod io_modes_equiv;
 pub mod list;
 pub mod pool;
 pub mod put;
