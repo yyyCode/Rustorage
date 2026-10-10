@@ -765,6 +765,57 @@ mod tests {
         assert!(xml.contains("<Name>test-bucket</Name>"), "xml: {xml}");
     }
 
+    /// 下划线桶名由**上游的**默认校验挡下，不是我们写的规则。
+    ///
+    /// s3s 的 `S3ServiceBuilder` 在 `validation` 未设时用 AWS 规则
+    /// （`check_bucket_name`：只允许 `[a-z0-9.-]`、长度 3..64、首尾须字母或数字），
+    /// 而它生效在**路径解析阶段**——所以 `impl S3 for RstoreFs` 的 `create_bucket`
+    /// 根本不会被执行。
+    ///
+    /// 这个测试不是「测我们的代码」，而是把**控制面板所依赖的那条属性**钉成可执行的：
+    /// `/_console` 这个路径前缀永远不可能是一个真实桶名，所以面板路由与桶名空间
+    /// 不会互相遮蔽。谁把 `set_validation` 换成宽松实现，这里就会红。
+    #[tokio::test]
+    async fn underscore_bucket_name_is_rejected_by_upstream_validation() {
+        let store = Arc::new(MockStore::default());
+        let (status, _headers, body) =
+            call_on(mock_service(store.clone()), request("PUT", "/_private", b"")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(error_code(&body), "InvalidBucketName");
+
+        // handler 压根没跑，所以 store 当然没被动过。断言它，是为了让「拒绝发生在
+        // 我们这层还是上游」这个区别在**行为**上有痕迹——若哪天变成我们的 handler
+        // 在挡，这条仍会过，但那时就该把注释改掉。
+        assert!(
+            store.list_buckets().await.expect("list buckets").is_empty(),
+            "非法的桶名不得被创建"
+        );
+    }
+
+    /// 对照组：`console`（不带下划线）是合法桶名，必须照常能建。
+    ///
+    /// 这正是面板挂 `/_console` 而不是 `/console` 的全部理由——不占用这个正常名字。
+    #[tokio::test]
+    async fn console_bucket_name_is_still_valid() {
+        let store = Arc::new(MockStore::default());
+        let (status, _headers, body) = call_on(
+            mock_service(store.clone()),
+            request("PUT", "/console", b""),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     #[tokio::test]
     async fn delete_non_empty_bucket_is_409() {
         let store = Arc::new(MockStore::default());
