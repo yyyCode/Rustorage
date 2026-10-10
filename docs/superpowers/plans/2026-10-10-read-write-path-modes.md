@@ -66,7 +66,7 @@
 - Modify: `crates/server/src/config.rs`
 - Modify: `crates/server/src/startup.rs:253,312`
 
-- [ ] **Step 1: 写 `IoModes` 及其失败测试**
+- [x] **Step 1: 写 `IoModes` 及其失败测试**
 
 创建 `crates/common/src/modes.rs`：
 
@@ -162,7 +162,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 注册模块并跑测试**
+- [x] **Step 2: 注册模块并跑测试**
 
 在 `crates/common/src/lib.rs` 的 `pub mod error;` 之后加一行：
 
@@ -173,7 +173,7 @@ pub mod modes;
 Run: `cargo test -p rstore-common modes`
 Expected: 2 passed。
 
-- [ ] **Step 3: 给 `ErasureSet` 加模式**
+- [x] **Step 3: 给 `ErasureSet` 加模式**
 
 在 `crates/store/src/set.rs` 顶部的 `use rstore_disk::DiskAPI;` 之前加：
 
@@ -242,7 +242,7 @@ pub struct ErasureSet {
     }
 ```
 
-- [ ] **Step 4: 在 `set.rs` 的测试模块里加一条**
+- [x] **Step 4: 在 `set.rs` 的测试模块里加一条**
 
 在 `crates/store/src/set.rs` 的 `mod tests` 里，`rejects_empty_set` 之后加：
 
@@ -264,7 +264,7 @@ pub struct ErasureSet {
     }
 ```
 
-- [ ] **Step 5: 加夹具 `set_with_modes`**
+- [x] **Step 5: 加夹具 `set_with_modes`**
 
 在 `crates/store/src/testutil.rs` 顶部把 `use crate::set::ErasureSet;` 之前加：
 
@@ -313,7 +313,7 @@ pub async fn set_with_modes(total: u8, parity: u8, modes: IoModes) -> TestSet {
 }
 ```
 
-- [ ] **Step 6: 在 `testutil.rs` 的测试模块里加一条**
+- [x] **Step 6: 在 `testutil.rs` 的测试模块里加一条**
 
 在 `crates/store/src/testutil.rs` 的 `mod tests` 末尾加：
 
@@ -331,12 +331,12 @@ pub async fn set_with_modes(total: u8, parity: u8, modes: IoModes) -> TestSet {
     }
 ```
 
-- [ ] **Step 7: 跑 store 的测试，确认旧路径没动**
+- [x] **Step 7: 跑 store 的测试，确认旧路径没动**
 
 Run: `cargo test -p rstore-store`
 Expected: 全绿。**尤其** `set.rs` 里那 9 条既有几何测试一条不红——它们证明 `new` 的语义没变。
 
-- [ ] **Step 8: 加 `--io-mode`**
+- [x] **Step 8: 加 `--io-mode`**
 
 在 `crates/server/src/config.rs` 顶部 `use rstore_store::set::default_parity;` 之后加：
 
@@ -370,7 +370,7 @@ use rstore_common::modes::IoModes;
     }
 ```
 
-- [ ] **Step 9: 修既有测试的构造字面量并加新测试**
+- [x] **Step 9: 修既有测试的构造字面量并加新测试**
 
 `config.rs` 的 `mod tests` 里，`fn cfg(..)` 的字面量在 `console: false,` 之后加一行：
 
@@ -397,7 +397,7 @@ use rstore_common::modes::IoModes;
     }
 ```
 
-- [ ] **Step 10: 两处构造点传模式**
+- [x] **Step 10: 两处构造点传模式**
 
 `crates/server/src/startup.rs` 第 253 行，把：
 
@@ -434,7 +434,7 @@ use rstore_common::modes::IoModes;
     );
 ```
 
-- [ ] **Step 11: 全量校验**
+- [x] **Step 11: 全量校验**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -448,7 +448,7 @@ cargo run -p rstore-server -- --help | grep -A2 io-mode
 
 Expected: 看到 `--io-mode <MODE>` 与默认值 `old`。
 
-- [ ] **Step 12: 提交**
+- [x] **Step 12: 提交**
 
 ```bash
 git add crates/common/src/modes.rs crates/common/src/lib.rs \
@@ -472,7 +472,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/store/src/reader.rs:46-98`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/store/src/reader.rs` 的 `mod tests` 里，`missing_file_is_not_found` 之后加：
 
@@ -627,12 +627,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认编译不过**
+- [x] **Step 2: 跑测试确认编译不过**
 
 Run: `cargo test -p rstore-store reader::`
 Expected: 编译错误 `no method named 'read_range'`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 把 `crates/store/src/reader.rs` 里 `impl BitrotShardReader` 的 `read_all`（第 46-98 行，含它上面那段文档注释）整段替换成：
 
@@ -749,19 +749,19 @@ Expected: 编译错误 `no method named 'read_range'`。
     }
 ```
 
-- [ ] **Step 4: 跑全部 reader 测试**
+- [x] **Step 4: 跑全部 reader 测试**
 
 Run: `cargo test -p rstore-store reader::`
 Expected: 既有 6 条 + 新增 6 条全绿。
 
 **特别确认既有那 6 条一条不红**——`read_all` 是重写过实现的老函数，那 6 条是它行为不变的唯一证据。
 
-- [ ] **Step 5: 跑全量**
+- [x] **Step 5: 跑全量**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo test -p rstore-store`
 Expected: 全绿。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/store/src/reader.rs
@@ -784,7 +784,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/store/src/get.rs:253`（`read_shards`，含上方文档注释）、`:384`（`get_object`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/store/src/get.rs` 的 `mod tests` 里，`get_with_range_returns_the_right_slice` 之后加：
 
@@ -865,7 +865,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
     use crate::testutil::{body, set_with_disks, set_with_modes};
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p rstore-store get::ranged_get_matches_full_get`
 Expected: FAIL——新模式此时与旧模式相同，`ranged_get_matches_full_get` 其实会**通过**（因为 `read_range` 还没接线）。**所以这一步改用另一条证据**：
@@ -873,7 +873,7 @@ Expected: FAIL——新模式此时与旧模式相同，`ranged_get_matches_full
 Run: `cargo test -p rstore-store get::new_mode_leaves_full_get_and_head_alone`
 Expected: PASS。这两条现在都是绿的——它们钉的是**接线之后**不许改坏的东西。真正的失败要等逻辑写完之后才可能被抓住，接受这一点：本任务的测试是**回归护栏**，前置绿灯是正常的。
 
-- [ ] **Step 3: 改 `read_shards` 认块区间**
+- [x] **Step 3: 改 `read_shards` 认块区间**
 
 把 `crates/store/src/get.rs` 里 `read_shards` **从它上方的文档注释起、到函数收尾的 `}` 为止**
 （第 249-381 行那一段）整段替换成：
@@ -1039,7 +1039,7 @@ async fn read_shards(
 }
 ```
 
-- [ ] **Step 4: 加裁剪函数**
+- [x] **Step 4: 加裁剪函数**
 
 在 `crates/store/src/get.rs` 的 `apply_range` 之后加：
 
@@ -1079,7 +1079,7 @@ fn slice_blocks(
 }
 ```
 
-- [ ] **Step 5: 接线到 `get_object`**
+- [x] **Step 5: 接线到 `get_object`**
 
 把 `get.rs` 里 `get_object` **从上方的文档注释起，到 `Ok(GetOut {` 之前为止**（第 382-455 行那一段）替换成：
 
@@ -1173,12 +1173,12 @@ fn slice_blocks(
 
 （函数余下的 `Ok(GetOut { .. })` 部分不动。）
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cargo test -p rstore-store get::`
 Expected: 全绿，包括既有的 10 条与新增 2 条。
 
-- [ ] **Step 7: 跑全量**
+- [x] **Step 7: 跑全量**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -1186,7 +1186,7 @@ cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 
 Expected: 全绿。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add crates/store/src/get.rs
@@ -1212,7 +1212,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/store/src/put.rs`（`put_object` 薄包装）
 - Modify: `crates/store/src/delete.rs`（`delete_object` 薄包装）
 
-- [ ] **Step 1: 写缓存本体**
+- [x] **Step 1: 写缓存本体**
 
 创建 `crates/store/src/resolve_cache.rs`：
 
@@ -1333,7 +1333,7 @@ impl ResolveCache {
 `type_complexity` 会以 `-D warnings` 直接报错。上面已改为 `CacheKey` / `CacheEntry`
 两个别名——不是风格问题，是这一关过不去。
 
-- [ ] **Step 2: 注册模块并给 `ErasureSet` 加字段**
+- [x] **Step 2: 注册模块并给 `ErasureSet` 加字段**
 
 `crates/store/src/lib.rs`：在 `pub mod reconcile;` 之后加：
 
@@ -1372,7 +1372,7 @@ use crate::resolve_cache::ResolveCache;
     }
 ```
 
-- [ ] **Step 3: 加 `resolve_version_cached`**
+- [x] **Step 3: 加 `resolve_version_cached`**
 
 在 `crates/store/src/get.rs` 里，`resolve_version` 函数之后加：
 
@@ -1407,7 +1407,7 @@ pub(crate) async fn resolve_version_cached(
 `.ranged_shard_read` 是字段访问，`IoModes` 这个类型名在 `get.rs` 里从头到尾没出现过。
 （加了会立刻变成 unused import，而 `-D warnings` 会挡住。）
 
-- [ ] **Step 4: 让 `get_object` / `head_object` 走缓存版**
+- [x] **Step 4: 让 `get_object` / `head_object` 走缓存版**
 
 `get_object` 里那一行：
 
@@ -1437,7 +1437,7 @@ pub(crate) async fn resolve_version_cached(
 后续代码（`meta.inline.get(...)`、`etag_of_meta(meta)`）**不用改**——`Arc<T>` 的
 `Deref` 让它们照常绑定到 `&ObjectMeta`。
 
-- [ ] **Step 5: 写入成功后失效**
+- [x] **Step 5: 写入成功后失效**
 
 `crates/store/src/put.rs`：把第 207 行 `pub async fn put_object` 的**文档注释与签名行**
 （连同它上方的文档注释）替换成：
@@ -1494,7 +1494,7 @@ pub(crate) async fn resolve_version_cached(
 
 原函数体的最后是一个 `Ok(())`，保留不动。
 
-- [ ] **Step 6: 写行为测试**
+- [x] **Step 6: 写行为测试**
 
 在 `crates/store/src/get.rs` 的 `mod tests` 末尾加：
 
@@ -1578,12 +1578,12 @@ pub(crate) async fn resolve_version_cached(
     }
 ```
 
-- [ ] **Step 7: 跑测试**
+- [x] **Step 7: 跑测试**
 
 Run: `cargo test -p rstore-store`
 Expected: 全绿。既有测试一条不红——**这是缓存没有改变默认行为的最强证据**（默认 `IoModes::default()` 下缓存根本不存在）。
 
-- [ ] **Step 8: 全量校验并提交**
+- [x] **Step 8: 全量校验并提交**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -1612,7 +1612,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/server/src/wiring.rs`
 - Modify: `crates/s3/src/impl_s3.rs:315-410`
 
-- [ ] **Step 1: 加有序增量遍历**
+- [x] **Step 1: 加有序增量遍历**
 
 在 `crates/store/src/list.rs` 的 `impl ErasureSet` 里，`candidate_keys` 之后加：
 
@@ -1725,7 +1725,7 @@ if format!("{child_rel}/").as_str() <= a { break; }
 正确做法是给子树算一个**保守上界** `dir_rel + '\u{10FFFF}'`（见 Step 1b），
 与游标比这个上界。
 
-- [ ] **Step 1b: 加子树上界判定**
+- [x] **Step 1b: 加子树上界判定**
 
 在 `crates/store/src/list.rs` 的 `parent_path` 之后加：
 
@@ -1758,7 +1758,7 @@ fn subtree_at_or_before(dir_rel: &str, after: &str) -> bool {
 > 的基准报告「已知限制」，并说明**默认（`old`）模式不受影响**：旧路径用
 > `BTreeSet` 整体排序，天然正确。
 
-- [ ] **Step 2: 加 `list_objects_from`，并把 `list_objects` 改成它的特化**
+- [x] **Step 2: 加 `list_objects_from`，并把 `list_objects` 改成它的特化**
 
 把 `list.rs` 里第 55 行的 `pub async fn list_objects`（连同它上方的文档注释与它下面的
 `PERF:` 注释）整段替换成：
@@ -1866,7 +1866,7 @@ fn subtree_at_or_before(dir_rel: &str, after: &str) -> bool {
     }
 ```
 
-- [ ] **Step 3: 写 store 层的分页测试**
+- [x] **Step 3: 写 store 层的分页测试**
 
 在 `crates/store/src/list.rs` 的 `mod tests` 末尾加：
 
@@ -1985,12 +1985,12 @@ fn subtree_at_or_before(dir_rel: &str, after: &str) -> bool {
 
 （`set_with_disks` 仍被既有测试用到，保留。）
 
-- [ ] **Step 4: 跑 store 的 list 测试**
+- [x] **Step 4: 跑 store 的 list 测试**
 
 Run: `cargo test -p rstore-store list::`
 Expected: 既有 3 条 + 新增 3 条全绿。
 
-- [ ] **Step 5: 给 `ObjectStore` 加带默认实现的方法**
+- [x] **Step 5: 给 `ObjectStore` 加带默认实现的方法**
 
 在 `crates/api/src/lib.rs` 的 trait 里，`list_objects` 之后加：
 
@@ -2033,7 +2033,7 @@ Expected: 既有 3 条 + 新增 3 条全绿。
     }
 ```
 
-- [ ] **Step 6: `Wiring` 覆盖它**
+- [x] **Step 6: `Wiring` 覆盖它**
 
 在 `crates/server/src/wiring.rs` 的 `impl ObjectStore for Wiring` 里，`list_objects` 之后加：
 
@@ -2072,7 +2072,7 @@ Expected: 既有 3 条 + 新增 3 条全绿。
     }
 ```
 
-- [ ] **Step 7: 把 S3 的 `list_objects_v2` 改成分批取**
+- [x] **Step 7: 把 S3 的 `list_objects_v2` 改成分批取**
 
 这块改 `crates/s3/src/impl_s3.rs` 的 **两个**区间，中间那段（第 330-342 行的
 `prefix` / `delimiter` / `max_keys` / `start_after` 声明）**原样保留**。
@@ -2187,7 +2187,7 @@ Expected: 既有 3 条 + 新增 3 条全绿。
 > （`key: Some(entry.key)`、`e_tag: Some(ETag::Strong(entry.etag))`）必须改成
 > `.clone()`。漏掉会直接编译不过，不会静默出错。
 
-- [ ] **Step 8: 加 S3 层的分页回归测试**
+- [x] **Step 8: 加 S3 层的分页回归测试**
 
 在 `crates/s3/src/impl_s3.rs` 的 `mod tests` 里，第 1361 行 `request_with` 之后加两个
 XML 解析小工具和一条测试。（该模块**没有** `list_objects_v2` 的既有用例，所以这里
@@ -2272,7 +2272,7 @@ XML 解析小工具和一条测试。（该模块**没有** `list_objects_v2` �
     }
 ```
 
-- [ ] **Step 8b: 跑这条测试**
+- [x] **Step 8b: 跑这条测试**
 
 Run: `cargo test -p rstore-s3 list_v2_paging`
 Expected: PASS。
@@ -2280,7 +2280,7 @@ Expected: PASS。
 **若 `pages` 不是 3**，说明 `next_token` 的解析或游标传递有问题——先查
 `http::Uri` 里查询串的取法，再查 `next_continuation_token` 的生成条件。
 
-- [ ] **Step 9: 全量校验并提交**
+- [x] **Step 9: 全量校验并提交**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -2307,7 +2307,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `crates/store/src/put.rs:103`（`read_block`）、`:368`（`write_shards_stream`）
 - Modify: `crates/store/src/testutil.rs`（`set_with_recording_disks_modes`）
 
-- [ ] **Step 1: 把读块拆成「读进已有缓冲」**
+- [x] **Step 1: 把读块拆成「读进已有缓冲」**
 
 把 `crates/store/src/put.rs` 里 `read_block`（第 103 行，连同它上方的文档注释）整段替换成：
 
@@ -2353,7 +2353,7 @@ async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>
 }
 ```
 
-- [ ] **Step 2: 加 `ShardScratch`**
+- [x] **Step 2: 加 `ShardScratch`**
 
 在 `read_block` 之后加：
 
@@ -2374,7 +2374,7 @@ struct ShardScratch {
 }
 ```
 
-- [ ] **Step 2b: 加分配计数器（L4 唯一的证据形态）**
+- [x] **Step 2b: 加分配计数器（L4 唯一的证据形态）**
 
 **为什么需要一个计数器**：这个机制**不减少任何一次 IO**，所以 IO 计数在它身上必然
 显示 0 差异。设计文档 §6 把「分配次数」定为它的证据形态——没有这个计数器，
@@ -2421,7 +2421,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
     }
 ```
 
-- [ ] **Step 3: 改写 `write_shards_stream` 的缓冲部分**
+- [x] **Step 3: 改写 `write_shards_stream` 的缓冲部分**
 
 把 `crates/store/src/put.rs` 里 `write_shards_stream`（第 368 行）的**函数体**
 （从 `let data_shards = self.data();` 到 `Ok((shard_len, size, format!("{:x}", md5.finalize())))`）
@@ -2583,7 +2583,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 16 倍。最后一块短于 `BLOCK_SIZE` 时 `shard_size_k` 变小，**不会**触发增长，
 所以新模式的 4 是精确值、不是「不超过」。
 
-- [ ] **Step 4: 加录制版夹具**
+- [x] **Step 4: 加录制版夹具**
 
 在 `crates/store/src/testutil.rs` 里，把 `set_with_recording_disks` 连同它上面的
 文档注释（第 **189-223** 行）整段拆成薄包装 + 带模式的版本：
@@ -2635,7 +2635,7 @@ pub async fn set_with_recording_disks_modes(
 }
 ```
 
-- [ ] **Step 4b: 让 `WriteLog` 记住写入的路径**（执行时补记）
+- [x] **Step 4b: 让 `WriteLog` 记住写入的路径**（执行时补记）
 
 原计划里 `WriteLog` 只记长度。**那样测不出「写入的形状没变」**：`meta.xl` 的两份
 独立 PUT 之间长度**本来就不同**——它把 `version_id` / `data_dir` 两个 UUID 经
@@ -2690,7 +2690,7 @@ impl WriteLog {
 `self.log.record(rel_path, data.len())`。`sizes()` 保持原签名，既有的
 `write_path_never_emits_more_than_one_block` 一个字节都不用改。
 
-- [ ] **Step 5: 写测试**
+- [x] **Step 5: 写测试**
 
 在 `crates/store/src/put.rs` 的 `mod tests` 里，找一个既能拿到 `TestSet` 又能拿到
 `WriteLog` 的既有测试作为位置参照，在它之后加：
@@ -2840,12 +2840,12 @@ impl WriteLog {
 **兄弟模块**，字段可见性按模块划分，写成私有会以 `E0616` 编译不过。对外仍然只暴露
 `take_scratch_allocs()`。
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cargo test -p rstore-store put::`
 Expected: 既有测试全绿 + 新增 3 条绿。
 
-- [ ] **Step 7: 全量校验并提交**
+- [x] **Step 7: 全量校验并提交**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -2876,7 +2876,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/store/src/io_modes_equiv.rs`
 - Modify: `crates/store/src/lib.rs`
 
-- [ ] **Step 1: 写测试文件**
+- [x] **Step 1: 写测试文件**
 
 创建 `crates/store/src/io_modes_equiv.rs`：
 
@@ -3099,6 +3099,10 @@ async fn corruption_outside_the_range_is_the_declared_semantic_change() {
 /// 偏移靠 `shard_step` 复算，不写死数字——写死的话几何一改，这里就悄悄改错了位置，
 /// 测试还会**绿**（改到别处去了）。
 async fn corrupt_on_disk(set: &TestSet, disk_idx: usize, data_dir: &Uuid, block: usize) {
+    // `shard_step` 只看 `size.min(BLOCK_SIZE)`，而本文件两处调用点的对象都 ≥ 一个
+    // 满块，所以 `min` 的结果恒为 `BLOCK_SIZE`——用它复算的步长与真实写入一致。
+    // （执行时补记：这条注释是必须的。写成裸的 `2 * BLOCK_SIZE` 会让人以为
+    // 「对象长度写死了」，而实际上这里只需要 `size >= BLOCK_SIZE` 就够了。）
     let size = 2 * BLOCK_SIZE as u64;
     let data_shards = set.data();
     let stride = rstore_checksum::HASH_LEN + shard_step(size, data_shards) as usize;
@@ -3114,7 +3118,7 @@ async fn corrupt_on_disk(set: &TestSet, disk_idx: usize, data_dir: &Uuid, block:
 }
 ```
 
-- [ ] **Step 2: 注册模块**
+- [x] **Step 2: 注册模块**
 
 `crates/store/src/lib.rs`：在 `#[cfg(test)] mod quorum_boundaries;` 之后加：
 
@@ -3123,7 +3127,7 @@ async fn corrupt_on_disk(set: &TestSet, disk_idx: usize, data_dir: &Uuid, block:
 mod io_modes_equiv;
 ```
 
-- [ ] **Step 3: 跑等价测试**
+- [x] **Step 3: 跑等价测试**
 
 Run: `cargo test -p rstore-store io_modes_equiv`
 Expected: 3 passed。
@@ -3132,7 +3136,7 @@ Expected: 3 passed。
 说明 `ranged_shard_read` 没有真的收窄读取范围（很可能 `blocks` 被算成了 `None`）。
 回到 Task 3 Step 5 检查 `blocks` 的折算。
 
-- [ ] **Step 4: 全量校验并提交**
+- [x] **Step 4: 全量校验并提交**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -3155,7 +3159,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `crates/store/benches/io_modes.rs`
 - Modify: `crates/store/Cargo.toml`
 
-- [ ] **Step 1: 建基准目标**
+- [x] **Step 1: 建基准目标**
 
 `crates/store/Cargo.toml`：在 `[dev-dependencies]` 之后加：
 
@@ -3168,7 +3172,7 @@ name = "io_modes"
 harness = false
 ```
 
-- [ ] **Step 2: 写基准**
+- [x] **Step 2: 写基准**
 
 创建 `crates/store/benches/io_modes.rs`：
 
@@ -3202,20 +3206,20 @@ use rstore_store::set::ErasureSet;
 // **报告里的每个数字都必须与这里的取值一起写**，否则复现不了。
 
 /// 只读 100 字节的那个对象有多大。
-const L1_SIZE: usize = 256 * 1024 * 1024;
+const L1_SIZE: usize = 64 * 1024 * 1024;
 /// HEAD 密集负载的请求数。
-const L2_HEADS: usize = 10_000;
+const L2_HEADS: usize = 2_000;
 /// HEAD 阴性对照里不同 key 的个数（每多一个 key 都要一次 PUT，所以比主测小）。
-const L2_DISTINCT: usize = 1_000;
+const L2_DISTINCT: usize = 100;
 /// 列举负载的桶里有多少 key。
-const L3_KEYS: usize = 10_000;
+const L3_KEYS: usize = 600;
 /// 列举主测要凑满一页多少条。
-const L3_PAGE: usize = 1_000;
+const L3_PAGE: usize = 100;
 /// 写负载的对象大小与轮数。
 const L4_SIZE: usize = 16 * 1024 * 1024;
-const L4_ITERS: usize = 8;
+const L4_ITERS: usize = 4;
 /// 每个 `(模式, 工作负载)` 重复几轮，取最小值压掉噪声。
-const REPEAT: usize = 3;
+const REPEAT: usize = 2;
 
 /// 记录 IO 调用次数与字节数。包在 `LocalDisk` 外面。
 #[derive(Default)]
@@ -3431,7 +3435,7 @@ where
 // 然后由 `async move` 把那份引用**拷贝**进去。写成 `|| async { .. &data .. }`
 // 会因为「借用了闭包自身的字段」而编译不过。
 
-/// L1 主测：256 MiB 对象的 `GET bytes=0-99`。
+/// L1 主测：64 MiB 对象的 `GET bytes=0-99`。
 async fn l1_ranged(fx: &Fixture) -> Measured {
     let range = Some(ByteRange { start: 0, end: 99 });
     measure(fx, |_round| async move {
@@ -3460,10 +3464,18 @@ async fn l2_same_key(fx: &Fixture) -> Measured {
 
 /// L2 阴性对照：`L2_DISTINCT` 个**不同** key 各 HEAD 一次。
 /// 缓存必然次次失效，两种模式应当**一样慢**。
+///
+/// **key 里必须带轮次下标**（`d{round}-{i:06}`）。不带的话热身那一轮就把这些 key
+/// 全部填进缓存，之后量到的「新模式 0 次 IO」就是缓存热的结果，而这条对照要
+/// 证明的恰恰是「不同 key 时新模式并不更快」。代价是种子数据里这批 key 要有
+/// `(REPEAT + 1) × L2_DISTINCT` 个，不是 `L2_DISTINCT` 个。
 async fn l2_distinct(fx: &Fixture) -> Measured {
-    measure(fx, |_round| async move {
+    measure(fx, |round| async move {
         for i in 0..L2_DISTINCT {
-            fx.set.head_object("b", &format!("k{i:06}")).await.unwrap();
+            fx.set
+                .head_object("b", &format!("d{round}-{i:06}"))
+                .await
+                .unwrap();
         }
     })
     .await
@@ -3497,7 +3509,10 @@ async fn l3_page(fx: &Fixture) -> Measured {
 
 /// 同一个桶里**除了** L3 那批 key 还有别的东西（`big`、`hot`、L2 的 `kNNNNNN`），
 /// 所以种子数据的**总**条目数是 `L3_KEYS + OTHER_KEYS`。
-const OTHER_KEYS: usize = 2 + L2_DISTINCT;
+///
+/// L2 那批 key 是 `(REPEAT + 1) × L2_DISTINCT` 个：每一轮（含热身）都要看一组
+/// 没进过缓存的 key。
+const OTHER_KEYS: usize = 2 + (REPEAT + 1) * L2_DISTINCT;
 
 /// L3 阴性对照：`max-keys` 大到必须扫全，两种模式应当**一样慢**。
 async fn l3_all(fx: &Fixture) -> Measured {
@@ -3535,13 +3550,18 @@ async fn l4_put_16m(fx: &Fixture) -> Measured {
     .await
 }
 
-/// L4 阴性对照：单块（64 KiB）对象，没有第二块可复用。
+/// L4 阴性对照：单块对象，没有第二块可复用。
 ///
 /// 分配次数也必须**逐项相同**（8 次 PUT × 1 块 × 4 份 = 32）：只有一次分片机会时，
 /// 「复用」和「重新分配」是同一件事。这条对照证明主测那 16 倍来自跨块复用，
 /// 而不是来自某种全局的分配路径改变。
+///
+/// **512 KiB 是刻意选的**（执行时修正：原计划写的 64 KiB **是错的**）。≤ 128 KiB
+/// 的对象走内联分支（`should_inline`），数据进 `meta.xl`、根本不产生分片文件，
+/// 两边 `allocs` 都是 0——那也是「逐项相同」，但空洞。要一个**真的**单块对象，
+/// 得落在 `(128 KiB, BLOCK_SIZE]` 这段区间里。
 async fn l4_put_small(fx: &Fixture) -> Measured {
-    let buf = vec![0x5Au8; 64 * 1024];
+    let buf = vec![0x5Au8; 512 * 1024];
     let data: &[u8] = &buf;
     measure(fx, |round| async move {
         for i in 0..L4_ITERS {
@@ -3571,12 +3591,18 @@ async fn seeded(modes: IoModes) -> Fixture {
         .put_object(put_args("b", "hot", &vec![0x22u8; 200_000]))
         .await
         .unwrap();
-    // L2 对照的若干 key。
-    for i in 0..L2_DISTINCT {
-        fx.set
-            .put_object(put_args("b", &format!("k{i:06}"), &vec![0x33u8; 4_096]))
-            .await
-            .unwrap();
+    // L2 对照的若干 key：每一轮（含热身那轮）一组，各自独立。
+    for round in 0..=REPEAT {
+        for i in 0..L2_DISTINCT {
+            fx.set
+                .put_object(put_args(
+                    "b",
+                    &format!("d{round}-{i:06}"),
+                    &vec![0x33u8; 4_096],
+                ))
+                .await
+                .unwrap();
+        }
     }
     // L3 的桶（与 L2 的 key 同桶，`l3_all` 断言用 `L3_KEYS`）。
     for i in 0..L3_KEYS {
@@ -3665,7 +3691,7 @@ async fn main() {
     );
     assert_eq!(ctrl.0.allocs, 32, "8 次 PUT × 1 块 × 4 份缓冲");
     print_row(
-        "L4 PUT 64 KiB × N（阴性对照：单块，无复用机会）",
+        "L4 PUT 512 KiB × N（阴性对照：单块，无复用机会）",
         ctrl.0,
         ctrl.1,
     );
@@ -3675,14 +3701,14 @@ async fn main() {
          读法：计数是主证据（确定性、可复现），墙钟是佐证。\n\
          reads/read_bytes/stats/lists 四个机制各自对应的那一列应当差异巨大，\n\
          其余三列（含 L4 的全部 IO 列）差异接近 0 是**预期**，不是没生效。\n\
-         L4 的证据在 `allocs` 列：旧 512 / 新 32（16 MiB × 8 次），单块对照两行相同。\n\
+         L4 的证据在 `allocs` 列：旧 L4_ITERS×16×4 / 新 L4_ITERS×4，单块对照两行相同。\n\
          它量的是**我们自己的代码显式增长分片缓冲的次数**，不是分配器的真实分配次数——\n\
          全局分配器探针要 `unsafe`，而 workspace lint 是 `unsafe_code = \"forbid\"`。"
     );
 }
 ```
 
-- [ ] **Step 3: 确认能编译并跑通**
+- [x] **Step 3: 确认能编译并跑通**
 
 Run: `cargo bench -p rstore-store --bench io_modes --no-run`
 Expected: 编译通过。
@@ -3690,17 +3716,37 @@ Expected: 编译通过。
 Run: `cargo bench -p rstore-store --bench io_modes`
 Expected: 打印 8 行结果。**看这几条**：
 
-- `L1 GET bytes=0-99`：new 的 `read_bytes` 应当远小于 old（old ≈ 每盘 256/4 = 64 MiB × 6 盘 ≈ 384 MiB；new ≈ 几百字节 × 6 盘）；
-- `L2 同一 key 10k 次 HEAD`：new 的 `lists` 应当远小于 old（old ≈ 10k × 6 × 2；new ≈ 几次）；
-- `L2 1k 个不同 key`：两行应当**几乎一样**（阴性对照）；
-- `L3 列全桶`：两行应当**几乎一样**（阴性对照）；
-- `L4 PUT 16 MiB`：`allocs` 列必须是 **512 / 32**（这条不靠眼看，`main` 里已断言）；
-- `L4 PUT 64 KiB`：两行的 `allocs` 必须**相同**（各 32，也已断言）。
+- `L1 GET bytes=0-99`：new 的 `read_bytes` 应当远小于 old（old ≈ 每盘 64 MiB × 6 盘 = 100.7 MB；new ≈ 每个分片一个块 ≈ 1.57 MB）；
+- `L2 同一 key 2000 次 HEAD`：new 的 `lists` 应当远小于 old（old = 2000 × 6 = 12000；new = 0）；
+- `L2 100 个不同 key`：两行应当**调用计数逐项相同**（阴性对照）；
+- `L3 列全桶`：`reads`/`stats`/`read_bytes` 三项应当**逐项相同**；`lists` **不是**——新模式多 33%，这是有序遍历的真实代价（见下）；
+- `L4 PUT 16 MiB`：`allocs` 列必须是 **256 / 16**（这条不靠眼看，`main` 里已断言）；
+- `L4 PUT 512 KiB`：两行的 `allocs` 必须**相同**（各 16，也已断言）。
 
 任何一条对照位的差异显著非零，**先修测量再谈结论**——那说明数据集串了、或计数没重置。
 L4 那两条断言失败时同理：先怀疑计数器没在轮次开始时归零，再怀疑复用逻辑。
+**唯一的例外是 L3 列全桶的 `lists`**：多出来的是每层的前瞻 `list_dir`，属于设计
+（DESIGN §4.3 预告过），不是测量错误。
 
-- [ ] **Step 4: 提交**
+### 执行期修正（回填）
+
+跑起来之后有三处与原计划不同，都已落到代码里：
+
+1. **规模整体下调。** 每次 PUT 要在 6 块盘上 fsync，实测约 33 ms/次；原计划的
+   256 MiB / 10k key 光种数据就要十几分钟。现在的取值见上面的常量。
+   **这最影响 L3 的倍数**：桶只有 600 条而一页要 100 条，早停的收益上限就只有 5/6。
+2. **`measure` 多跑一轮热身并丢掉**，用的是轮次下标 `REPEAT`，与计数的 `0..REPEAT`
+   不重叠。没有热身时，新模式在**第 0 轮**必然冷（多一轮 `list_dir` + `read_meta`），
+   第 1 轮才热，于是「逐轮计数相等」这条断言会把「冷 vs 稳态」判成不稳定。
+   热身之后量的是稳态。L2 对照的 key 因此要带轮次下标，否则热身那轮就把它们全塞进
+   缓存了，对照位反而变成主测。
+3. **`read_bytes` 不参与「逐轮计数相等」的断言**（`Counts` 的 `.1` 被排除）。
+   原因与 Task 6 Step 4b 记的是同一件事：`meta.xl` 里的 UUID 走 `[u8; 16]` 桥接字段，
+   `rmp_serde` 的编码长度随 UUID 的随机字节在 19~35 字节之间浮动，于是同一份数据的
+   两次 PUT 产生的 `meta.xl` 长度不同。读不同对象的元数据时字节数会差几百。
+   调用次数才是确定的那部分。
+
+- [x] **Step 4: 提交**
 
 ```bash
 git add crates/store/Cargo.toml crates/store/benches/io_modes.rs
@@ -3727,11 +3773,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `docs/io-modes-bench.md`
 - Modify: `docs/DESIGN.md:502-514`（§11）
 
-- [ ] **Step 1: 跑基准，把输出原样记下来**
+- [x] **Step 1: 跑基准，把输出原样记下来**
 
 Run: `cargo bench -p rstore-store --bench io_modes 2>&1 | tee /tmp/io-modes-bench.txt`
 
-- [ ] **Step 2: 写结果文档**
+**跑两次**：这条基准的价值有一半在「调用计数逐次相同」，只跑一次就没有这个证据。
+
+- [x] **Step 2: 写结果文档**
 
 创建 `docs/io-modes-bench.md`，**把上一步的真实输出填进去**（不要手抄成好看的形状——
 原样贴，附上机器与日期）。结构：
@@ -3743,43 +3791,57 @@ Run: `cargo bench -p rstore-store --bench io_modes 2>&1 | tee /tmp/io-modes-benc
 > **规模参数与机器必须一起记**，否则复现不了。
 
 **日期：** 2026-10-10
-**机器：** <在这一行填 `uname -a` 或 Windows 版本 + CPU 型号>
-**规模：** L1_SIZE=… L2_HEADS=… L2_DISTINCT=… L3_KEYS=… L3_PAGE=… L4_SIZE=… L4_ITERS=… REPEAT=…
+**机器：** Windows 11（10.0.22621.4317），Intel Core i5-13500H，16 GB 内存
+**规模：** L1_SIZE=64 MiB L2_HEADS=2000 L2_DISTINCT=100 L3_KEYS=600 L3_PAGE=100
+L4_SIZE=16 MiB L4_ITERS=4 REPEAT=2
 
 ## 原始输出
 
-<原样贴 `cargo bench` 的输出>
+（原样贴 `cargo bench` 的输出，见 `docs/io-modes-bench.md`「原始输出」一节）
 
 ## 怎么读
 
-**计数是主证据，墙钟是佐证。** 「旧模式每块盘读 256 MiB，新模式读 1 KiB」是构造性
-的事实，换台机器仍然成立；「快了 3.4 倍」会随机器、缓存、后台进程漂移。
+**计数是主证据，墙钟是佐证。** 「旧模式每块盘读 100 MB，新模式读 1.5 MB」是构造性
+的事实，换台机器仍然成立；「快了 49 倍」会随机器、缓存、后台进程漂移。
 
 **阴性对照位的差异必须接近 0。** 它们不证明新机制有多快，它们证明这次测量没有
 在量别的东西。对照位若显著非零，先修测量再谈结论。
 
+**计数逐轮相等是被断言过的**：`measure` 每轮比较 reads/stats/lists/allocs，
+不同就 panic（`read_bytes` 不参与，理由见「已知局限」）。
+
 **L4 的主证据只能是分配次数**：`pooled_write_buffers` 不减少任何一次 IO，
 所以它那两行的 reads/stats/lists 差异接近 0 是**预期**，不是没生效。
-它的证据在 `allocs` 列：16 MiB × 8 次是 **512 → 32**（16 倍），
-单块对照（64 KiB）两行**相同**（各 32）——后者才是前面那个 16 倍确实来自
+它的证据在 `allocs` 列：4 次 16 MiB 的 PUT 是 **256 → 16**（16 倍），
+单块对照（512 KiB）两行**相同**（各 16）——后者才是前面那个 16 倍确实来自
 跨块复用的证据。它数的是我们自己的代码显式增长分片缓冲的次数，
 不是分配器的真实分配次数（全局分配器探针要 `unsafe`，workspace lint 禁止）。
 
 ## 结论
 
-<逐条写：哪个机制在哪个负载上带来多少差、对照位是否干净、有哪些数字出乎预期>
+（逐条写：哪个机制在哪个负载上带来多少差、对照位是否干净、有哪些数字出乎预期。
+见 `docs/io-modes-bench.md`「结论」一节。**L3 列全桶是负数**——新模式多 33% 的
+`list_dir`、慢 13%，这是设计预告过的代价，报告里必须写出来，不能只报好消息。）
 
 ## 已知局限
 
 - 计数与墙钟来自同一次运行，`IoLog` 的原子自增会影响时序；
+- `read_bytes` 不参与逐轮断言——`meta.xl` 里 UUID 的 msgpack 编码长度随随机字节浮动
+  （19~35 字节），同一份数据的两次 PUT 会产出不同长度的元数据；
+- 每次负载前跑一轮热身并丢掉，量的是稳态；L2 的 0 次 IO 是「缓存已热」条件下的数；
+- 规模是被「跑得完」倒推的（6 块盘上每次 PUT fsync ≈ 33 ms），L3 的倍数受此影响最大；
 - `crates/disk/src/fsx.rs::sync_dir` 在 **Windows 上是 no-op**，所以本次**没有**
   测 fsync / 组提交——那在这台机器上是一条平直的假线（设计文档 §1.2）；
 - 内存上界没有被直接测量（`unsafe_code = "forbid"` 排除了全局分配器探针）；
   `allocs` 是「显式增长缓冲的次数」这个**行为**的计数，不是字节数，
-  也不能推出 RSS 的变化。
+  也不能推出 RSS 的变化；
+- 有序遍历假定 key 的字节序与目录层级顺序一致，对 `p/a` 与 `p-x` 这类组合不成立
+  （`-` = 0x2d < `/` = 0x2f），彻底修法要命名空间索引（设计文档 §20 Phase 2）。
+  **`old` 模式不受影响**（BTreeSet 全量排序），但把 `bounded_listing` 当默认行为之前
+  必须先解决。
 ```
 
-- [ ] **Step 3: 更新 DESIGN §11**
+- [x] **Step 3: 更新 DESIGN §11**
 
 在 `docs/DESIGN.md` 的 §11「完整性：bitrot 校验」末尾（`> **与 RustFS 的差异**` 那段引用块之后）加：
 
@@ -3790,7 +3852,7 @@ Run: `cargo bench -p rstore-store --bench io_modes 2>&1 | tee /tmp/io-modes-benc
   的那几个块**损坏时才被判为缺块，所以同一份数据下范围读丢的分片只会比整对象读更少。
 ```
 
-- [ ] **Step 4: 确认设计文档里那处与代码不符的说法已改**
+- [x] **Step 4: 确认设计文档里那处与代码不符的说法已改**
 
 `docs/superpowers/specs/2026-10-10-read-write-path-modes-design.md` 的 §4.2 已经改成
 「缓存自带一套按 key 哈希分片的锁」（DESIGN §16.1 那张 `RwLock` 表在代码里并不存在）。
@@ -3803,16 +3865,19 @@ git status --short docs/superpowers/specs/
 
 若显示未提交，补一次提交。
 
-- [ ] **Step 5: 全量校验并提交**
+- [x] **Step 5: 全量校验并提交**
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-git add docs/io-modes-bench.md docs/DESIGN.md docs/superpowers/specs/
+git add docs/io-modes-bench.md docs/DESIGN.md docs/superpowers/plans/ docs/superpowers/specs/
 git commit -m "docs: 读写路径新旧模式的对比结果 + DESIGN §11 同步
 
 记录 cargo bench 的原始输出与规模参数，并写清读法：计数是主证据、
 墙钟是佐证，阴性对照位必须接近 0，L4 的主证据在 allocs 列
-（512 → 32，单块对照两行相同）。
+（256 → 16，单块对照两行相同）。两次运行调用计数逐项完全相同。
+
+如实写出 L3 列全桶的倒退：新模式多 33% 的 list_dir、慢 13%，
+这是有序遍历每层前瞻的真实代价（DESIGN §4.3 预告过）。
 
 DESIGN §11 补一句「读时校验的范围正比于读到的范围」——这条语义变化
 是设计出来的，不是缺陷。
