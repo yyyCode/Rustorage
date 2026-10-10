@@ -46,8 +46,14 @@ mod tests {
     #[test]
     fn other_op_names_pass_through() {
         for op in [
-            "GetObject", "PutObject", "HeadObject", "DeleteObject", "CreateBucket",
-            "DeleteBucket", "HeadBucket", "GetBucketLocation",
+            "GetObject",
+            "PutObject",
+            "HeadObject",
+            "DeleteObject",
+            "CreateBucket",
+            "DeleteBucket",
+            "HeadBucket",
+            "GetBucketLocation",
         ] {
             assert_eq!(canonical_op(op), op);
         }
@@ -61,7 +67,10 @@ mod tests {
         assert_eq!(canonical_policy_action("s3:ListBucket"), "ListBucket");
         assert_eq!(canonical_policy_action("s3:ListObjects"), "ListBucket");
         assert_eq!(canonical_policy_action("s3:ListObjectsV2"), "ListBucket");
-        assert_eq!(canonical_policy_action("s3:ListAllMyBuckets"), "ListAllMyBuckets");
+        assert_eq!(
+            canonical_policy_action("s3:ListAllMyBuckets"),
+            "ListAllMyBuckets"
+        );
         assert_eq!(canonical_policy_action("s3:DeleteObjects"), "DeleteObject");
     }
 
@@ -76,8 +85,14 @@ mod tests {
     /// `admin:` / `sts:` 是 M5 之后的事，现在它们不该意外命中。
     #[test]
     fn non_s3_actions_never_match() {
-        assert_eq!(canonical_policy_action("admin:ServerInfo"), "admin:ServerInfo");
+        assert_eq!(
+            canonical_policy_action("admin:ServerInfo"),
+            "admin:ServerInfo"
+        );
         assert_eq!(canonical_policy_action("*"), "*");
-        assert_ne!(canonical_policy_action("admin:DeleteObject"), "DeleteObject");
+        assert_ne!(
+            canonical_policy_action("admin:DeleteObject"),
+            "DeleteObject"
+        );
     }
 }

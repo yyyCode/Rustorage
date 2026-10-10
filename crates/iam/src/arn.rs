@@ -33,7 +33,10 @@ mod tests {
     /// 而策略里的 `photos/*` 靠 `*` 跨 `/` 来匹配它。
     #[test]
     fn object_keeps_slashes_in_the_key() {
-        assert_eq!(arn_object("photos", "a/b.jpg"), "arn:aws:s3:::photos/a/b.jpg");
+        assert_eq!(
+            arn_object("photos", "a/b.jpg"),
+            "arn:aws:s3:::photos/a/b.jpg"
+        );
     }
 
     /// 空 key（例如 `GET /bucket/` 被解析成对象路径）也要能构造出 ARN。

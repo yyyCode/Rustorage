@@ -53,7 +53,10 @@ mod tests {
     /// `*` **跨 `/`**——这是 `arn:aws:s3:::photos/*` 能匹配 `photos/a/b.jpg` 的前提。
     #[test]
     fn star_matches_across_slashes() {
-        assert!(wildcard_match("arn:aws:s3:::photos/*", "arn:aws:s3:::photos/a/b.jpg"));
+        assert!(wildcard_match(
+            "arn:aws:s3:::photos/*",
+            "arn:aws:s3:::photos/a/b.jpg"
+        ));
     }
 
     /// `*` 匹配空串。

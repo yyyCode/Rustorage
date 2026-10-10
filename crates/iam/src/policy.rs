@@ -85,7 +85,10 @@ mod tests {
         assert_eq!(doc.version, "2012-10-17");
         assert_eq!(doc.statement.len(), 2);
         assert_eq!(doc.statement[0].effect, Effect::Allow);
-        assert_eq!(doc.statement[0].action.as_slice(), ["s3:GetObject", "s3:PutObject"]);
+        assert_eq!(
+            doc.statement[0].action.as_slice(),
+            ["s3:GetObject", "s3:PutObject"]
+        );
         assert_eq!(doc.statement[0].sid, None);
         assert_eq!(doc.statement[1].effect, Effect::Deny);
         assert_eq!(doc.statement[1].sid.as_deref(), Some("no-delete"));
@@ -100,8 +103,14 @@ mod tests {
             {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::b/*"]}]}"#;
         let a: PolicyDoc = serde_json::from_str(one).unwrap();
         let b: PolicyDoc = serde_json::from_str(many).unwrap();
-        assert_eq!(a.statement[0].action.as_slice(), b.statement[0].action.as_slice());
-        assert_eq!(a.statement[0].resource.as_slice(), b.statement[0].resource.as_slice());
+        assert_eq!(
+            a.statement[0].action.as_slice(),
+            b.statement[0].action.as_slice()
+        );
+        assert_eq!(
+            a.statement[0].resource.as_slice(),
+            b.statement[0].resource.as_slice()
+        );
         assert_eq!(a.statement[0].action.as_slice(), ["s3:GetObject"]);
     }
 
@@ -112,8 +121,13 @@ mod tests {
         let doc = r#"{"Version":"2012-10-17","Statement":[
             {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*",
              "Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#;
-        let err = serde_json::from_str::<PolicyDoc>(doc).unwrap_err().to_string();
-        assert!(err.contains("Condition"), "错误信息应点出字段名，实际：{err}");
+        let err = serde_json::from_str::<PolicyDoc>(doc)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Condition"),
+            "错误信息应点出字段名，实际：{err}"
+        );
     }
 
     /// 同族的另外三个也改语义，同样要拒。

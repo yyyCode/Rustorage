@@ -63,10 +63,9 @@ mod tests {
         let u: UserRecord =
             serde_json::from_str(r#"{"secret_key":"s","status":"disabled"}"#).unwrap();
         assert_eq!(u.status, UserStatus::Disabled);
-        assert!(serde_json::from_str::<UserRecord>(
-            r#"{"secret_key":"s","status":"Enabled"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<UserRecord>(r#"{"secret_key":"s","status":"Enabled"}"#).is_err()
+        );
         assert!(
             serde_json::from_str::<UserRecord>(r#"{"secret_key":"s","status":"paused"}"#).is_err()
         );

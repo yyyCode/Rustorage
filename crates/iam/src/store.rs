@@ -1,8 +1,12 @@
 //! `IamStore`：身份、策略与求值（设计 §4.1）。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use serde::de::DeserializeOwned;
 
 use crate::action::canonical_policy_action;
+use crate::error::IamError;
 use crate::glob::wildcard_match;
 use crate::policy::{Effect, PolicyDoc};
 use crate::user::{UserRecord, UserStatus};
@@ -40,6 +44,52 @@ pub enum DenyReason {
 }
 
 impl IamStore {
+    /// 从盘上加载。**唯一的完整构造入口**，所有校验都在这里发生（设计 §7.1）。
+    ///
+    /// 目录不存在 = 没有非 root 用户，**不是错误**。
+    pub fn load(
+        dir: &Path,
+        root_access_key: &str,
+        root_secret_key: &str,
+    ) -> Result<Self, IamError> {
+        let mut users: HashMap<String, UserRecord> = HashMap::new();
+        for (name, path) in read_json_dir(&dir.join("users"))? {
+            users.insert(name, parse_json(&path)?);
+        }
+
+        let mut policies: HashMap<String, PolicyDoc> = HashMap::new();
+        for (name, path) in read_json_dir(&dir.join("policies"))? {
+            policies.insert(name, parse_json(&path)?);
+        }
+
+        // 引用完整性：**启动期就炸**，不等运行时静默降级（不变量 #6）。
+        for (name, u) in &users {
+            for p in &u.policies {
+                if !policies.contains_key(p) {
+                    return Err(IamError::UnknownPolicy {
+                        user: name.clone(),
+                        policy: p.clone(),
+                        expected: dir.join("policies").join(format!("{p}.json")),
+                    });
+                }
+            }
+        }
+
+        // 同一个 key 不能既是 root 又是受限用户。
+        if users.contains_key(root_access_key) {
+            return Err(IamError::UserShadowsRoot {
+                key: root_access_key.to_owned(),
+            });
+        }
+
+        Ok(Self {
+            root_access_key: root_access_key.to_owned(),
+            root_secret_key: root_secret_key.to_owned(),
+            users,
+            policies,
+        })
+    }
+
     /// 只有 root 的 store：给测试与「还没有 IAM 目录」的场景用。
     pub fn root_only(access_key: &str, secret_key: &str) -> Self {
         Self {
@@ -103,8 +153,11 @@ impl IamStore {
                     .as_slice()
                     .iter()
                     .any(|p| wildcard_match(canonical_policy_action(p), want));
-                let resource_hit =
-                    st.resource.as_slice().iter().any(|p| wildcard_match(p, resource));
+                let resource_hit = st
+                    .resource
+                    .as_slice()
+                    .iter()
+                    .any(|p| wildcard_match(p, resource));
                 if action_hit && resource_hit {
                     effects.push(st.effect);
                 }
@@ -132,6 +185,71 @@ impl IamStore {
     pub fn policy_count(&self) -> usize {
         self.policies.len()
     }
+}
+
+/// 读一个目录下所有 `*.json`，返回 `(文件名去掉 .json, 完整路径)`。
+///
+/// 三条规则（设计 §3.4）：
+/// - **目录不存在 ≠ 错误**，等于「一个都没有」；
+/// - 子目录 → 报错（放错了层级）；
+/// - 非 `.json` 的文件忽略（编辑器的 `.swp` 之类不该让服务起不来）。
+///
+/// 结果按名字排序：`HashMap` 的迭代序本来就不稳，不排的话「哪个错误先报出来」
+/// 会随运行漂移，测试与运维都要面对不稳定的现象。
+fn read_json_dir(dir: &Path) -> Result<Vec<(String, PathBuf)>, IamError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(IamError::Io {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| IamError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        // `file_type()` 不跟随符号链接。IAM 目录由运维手工维护，
+        // 链接指向哪里是运维的事；这里只按目录处理。
+        let ft = entry.file_type().map_err(|source| IamError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        // **子目录的判断在 `.json` 过滤之前**：否则 `users/nested/` 会因为
+        // 名字不含 `.json` 被跳过，配错层级的人得不到任何提示。
+        if ft.is_dir() {
+            return Err(IamError::UnexpectedDir { path });
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        // `.json` 这种只有扩展名的文件名，`file_stem` 仍是 `.json`（Rust 把
+        // 前导点当作名字的一部分），而 `extension()` 返回 `None`——所以上面
+        // 那一步已经把它滤掉了，这里不会是空串。
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        out.push((stem.to_owned(), path));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn parse_json<T: DeserializeOwned>(path: &Path) -> Result<T, IamError> {
+    let bytes = std::fs::read(path).map_err(|source| IamError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| IamError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -167,7 +285,10 @@ mod tests {
             root_access_key: "root".into(),
             root_secret_key: "root-secret".into(),
             users: users.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-            policies: policies.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            policies: policies
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
         }
     }
 
@@ -191,7 +312,10 @@ mod tests {
             vec![("root", user(UserStatus::Enabled, &["nothing"]))],
             vec![("nothing", policy(Effect::Deny, "s3:*", "*"))],
         );
-        assert_eq!(s.authorize(Some("root"), "s3:GetObject", PHOTO), Decision::Allow);
+        assert_eq!(
+            s.authorize(Some("root"), "s3:GetObject", PHOTO),
+            Decision::Allow
+        );
     }
 
     /// 未知主体：**与认证阶段冗余，是有意的纵深防御**（设计 §4.1）。
@@ -222,7 +346,10 @@ mod tests {
     fn no_matching_statement_is_denied() {
         let s = store(
             vec![("alice", user(UserStatus::Enabled, &["ro"]))],
-            vec![("ro", policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::other/*"))],
+            vec![(
+                "ro",
+                policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::other/*"),
+            )],
         );
         assert_eq!(
             s.authorize(Some("alice"), "s3:GetObject", PHOTO),
@@ -235,9 +362,15 @@ mod tests {
     fn matching_allow_wins() {
         let s = store(
             vec![("alice", user(UserStatus::Enabled, &["ro"]))],
-            vec![("ro", policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::photos/*"))],
+            vec![(
+                "ro",
+                policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::photos/*"),
+            )],
         );
-        assert_eq!(s.authorize(Some("alice"), "s3:GetObject", PHOTO), Decision::Allow);
+        assert_eq!(
+            s.authorize(Some("alice"), "s3:GetObject", PHOTO),
+            Decision::Allow
+        );
     }
 
     /// **显式拒绝优先**：同一主体上 Allow 与 Deny 同时命中时，Deny 赢。
@@ -246,16 +379,27 @@ mod tests {
         let s = store(
             vec![("alice", user(UserStatus::Enabled, &["wide", "narrow"]))],
             vec![
-                ("wide", policy(Effect::Allow, "s3:*", "arn:aws:s3:::photos/*")),
+                (
+                    "wide",
+                    policy(Effect::Allow, "s3:*", "arn:aws:s3:::photos/*"),
+                ),
                 (
                     "narrow",
-                    policy(Effect::Deny, "s3:DeleteObject", "arn:aws:s3:::photos/locked/*"),
+                    policy(
+                        Effect::Deny,
+                        "s3:DeleteObject",
+                        "arn:aws:s3:::photos/locked/*",
+                    ),
                 ),
             ],
         );
         // 宽策略允许一切，窄策略拒掉 locked/ 下的删除——后者赢。
         assert_eq!(
-            s.authorize(Some("alice"), "s3:DeleteObject", "arn:aws:s3:::photos/locked/x"),
+            s.authorize(
+                Some("alice"),
+                "s3:DeleteObject",
+                "arn:aws:s3:::photos/locked/x"
+            ),
             Decision::Deny(DenyReason::ExplicitDeny)
         );
         // 不在 locked/ 下的删除仍然放行。
@@ -270,7 +414,10 @@ mod tests {
     fn action_aliases_work_end_to_end() {
         let s = store(
             vec![("alice", user(UserStatus::Enabled, &["ro"]))],
-            vec![("ro", policy(Effect::Allow, "s3:ListBucket", "arn:aws:s3:::photos"))],
+            vec![(
+                "ro",
+                policy(Effect::Allow, "s3:ListBucket", "arn:aws:s3:::photos"),
+            )],
         );
         // 实际操作名是 ListObjectsV2（或 ListObjects），都不是 "ListBucket"。
         assert_eq!(
@@ -289,12 +436,24 @@ mod tests {
         let s = store(
             vec![("alice", user(UserStatus::Enabled, &["a", "b"]))],
             vec![
-                ("a", policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::photos/*")),
-                ("b", policy(Effect::Allow, "s3:PutObject", "arn:aws:s3:::photos/*")),
+                (
+                    "a",
+                    policy(Effect::Allow, "s3:GetObject", "arn:aws:s3:::photos/*"),
+                ),
+                (
+                    "b",
+                    policy(Effect::Allow, "s3:PutObject", "arn:aws:s3:::photos/*"),
+                ),
             ],
         );
-        assert_eq!(s.authorize(Some("alice"), "s3:GetObject", PHOTO), Decision::Allow);
-        assert_eq!(s.authorize(Some("alice"), "s3:PutObject", PHOTO), Decision::Allow);
+        assert_eq!(
+            s.authorize(Some("alice"), "s3:GetObject", PHOTO),
+            Decision::Allow
+        );
+        assert_eq!(
+            s.authorize(Some("alice"), "s3:PutObject", PHOTO),
+            Decision::Allow
+        );
         assert_eq!(
             s.authorize(Some("alice"), "s3:DeleteObject", PHOTO),
             Decision::Deny(DenyReason::NoMatchingStatement)
@@ -305,7 +464,10 @@ mod tests {
     /// 但手工构造的 store 也不该因为查不到就放行。
     #[test]
     fn missing_policy_fails_closed() {
-        let s = store(vec![("alice", user(UserStatus::Enabled, &["ghost"]))], vec![]);
+        let s = store(
+            vec![("alice", user(UserStatus::Enabled, &["ghost"]))],
+            vec![],
+        );
         assert_eq!(
             s.authorize(Some("alice"), "s3:GetObject", PHOTO),
             Decision::Deny(DenyReason::NoMatchingStatement)
@@ -356,5 +518,182 @@ mod tests {
         assert_eq!(s.secret_key("ak"), Some("sk"));
         assert_eq!(s.user_count(), 0);
         assert_eq!(s.policy_count(), 0);
+    }
+
+    // ---- load() ----
+    //
+    // 这些用真实文件系统（tempfile），因为要测的正是「盘上长什么样 → 加载成什么」。
+
+    /// 建一个 IAM 目录并写入给定内容。`("users", "alice", json)` 写到 `users/alice.json`。
+    fn iam_dir(dir: &Path, files: &[(&str, &str, &str)]) {
+        for (sub, name, body) in files {
+            let d = dir.join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{name}.json")), body).unwrap();
+        }
+    }
+
+    fn load(dir: &Path) -> Result<IamStore, IamError> {
+        IamStore::load(dir, "root", "root-secret")
+    }
+
+    /// 只取错误信息，不碰 `Ok` 里的值。
+    ///
+    /// **`IamStore` 故意没有 `Debug`**：它有 `secret_key` 字段，一旦实现了
+    /// `Debug`，某个手滑的 `tracing::debug!(?iam)` 就会把全部密钥打进日志
+    /// （`docs/DESIGN.md` §18.3 要求 access_key 与 secret 脱敏）。
+    /// 代价是 `unwrap_err()` 用不了——它要求 `Ok` 类型是 `Debug`——所以这里
+    /// 走 `.err()`，它没有这个约束。
+    fn load_err(dir: &Path) -> String {
+        load(dir).err().expect("这个配置应当加载失败").to_string()
+    }
+
+    /// 目录不存在 = 没有非 root 用户，**不是错误**（设计 §3.4 / §7.1）。
+    #[test]
+    fn missing_directory_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load(&tmp.path().join("nope")).unwrap();
+        assert_eq!(s.user_count(), 0);
+        assert_eq!(s.policy_count(), 0);
+        assert_eq!(s.secret_key("root"), Some("root-secret"));
+    }
+
+    /// `users/` 与 `policies/` 缺失同样是正常的。
+    #[test]
+    fn missing_subdirectories_are_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load(tmp.path()).unwrap();
+        assert_eq!(s.user_count(), 0);
+    }
+
+    /// **文件名（去掉 `.json`）就是 access key**（设计 §3.1）。
+    #[test]
+    fn file_name_is_the_access_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(
+            tmp.path(),
+            &[
+                (
+                    "policies",
+                    "ro",
+                    r#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/*"}]}"#,
+                ),
+                (
+                    "users",
+                    "alice",
+                    r#"{"secret_key":"a-secret","status":"enabled","policies":["ro"]}"#,
+                ),
+                (
+                    "users",
+                    "robot.backup",
+                    r#"{"secret_key":"r-secret","status":"enabled","policies":["ro"]}"#,
+                ),
+            ],
+        );
+        let s = load(tmp.path()).unwrap();
+        assert_eq!(s.user_count(), 2);
+        assert_eq!(s.policy_count(), 1);
+        assert_eq!(s.secret_key("alice"), Some("a-secret"));
+        // 文件名里的 `.` 不算扩展名的一部分——`robot.backup.json` 的 stem 是 `robot.backup`。
+        assert_eq!(s.secret_key("robot.backup"), Some("r-secret"));
+        assert_eq!(
+            s.authorize(Some("alice"), "s3:GetObject", "arn:aws:s3:::photos/x"),
+            Decision::Allow
+        );
+    }
+
+    /// 非 `.json` 的文件被忽略——编辑器的 `.swp` 不该让服务起不来。
+    #[test]
+    fn non_json_files_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(
+            tmp.path(),
+            &[("users", "alice", r#"{"secret_key":"s","status":"enabled"}"#)],
+        );
+        std::fs::write(tmp.path().join("users/alice.json.swp"), b"junk").unwrap();
+        std::fs::write(tmp.path().join("users/README"), b"junk").unwrap();
+        let s = load(tmp.path()).unwrap();
+        assert_eq!(s.user_count(), 1);
+    }
+
+    /// 子目录要报错：说明放错了层级，静默忽略会让人以为配置生效了。
+    #[test]
+    fn subdirectory_in_users_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("users/nested")).unwrap();
+        let e = load_err(tmp.path());
+        assert!(e.contains("nested"), "实际：{e}");
+    }
+
+    /// JSON 语法错 / 必填字段缺失 → 拒绝启动，且错误信息里带**文件路径**。
+    #[test]
+    fn parse_errors_name_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(tmp.path(), &[("users", "alice", r#"{"secret_key":"s"}"#)]);
+        let e = load_err(tmp.path());
+        assert!(e.contains("alice.json"), "实际：{e}");
+        assert!(e.contains("status"), "实际：{e}");
+    }
+
+    /// **引用不存在的策略 → 拒绝启动**（设计 §7.1、不变量 #6），
+    /// 而不是运行时静默降级成「没这条策略」。
+    #[test]
+    fn unknown_policy_reference_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(
+            tmp.path(),
+            &[(
+                "users",
+                "alice",
+                r#"{"secret_key":"s","status":"enabled","policies":["ghost"]}"#,
+            )],
+        );
+        let e = load_err(tmp.path());
+        assert!(e.contains("ghost"), "实际：{e}");
+        assert!(e.contains("alice"), "实际：{e}");
+    }
+
+    /// 用户的 access key 与 root 相同 → 拒绝启动：那会产生
+    /// 「既是 root 又受限」的矛盾身份。
+    #[test]
+    fn user_shadowing_root_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(
+            tmp.path(),
+            &[(
+                "users",
+                "root",
+                r#"{"secret_key":"evil","status":"enabled"}"#,
+            )],
+        );
+        let e = load_err(tmp.path());
+        assert!(e.contains("root"), "实际：{e}");
+    }
+
+    /// 策略文件里的未知字段同样在加载期炸掉。
+    #[test]
+    fn policy_with_unknown_field_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        iam_dir(
+            tmp.path(),
+            &[(
+                "policies",
+                "p",
+                r#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":"s3:*","Resource":"*","Condition":{}}]}"#,
+            )],
+        );
+        let e = load_err(tmp.path());
+        assert!(e.contains("Condition"), "实际：{e}");
+    }
+
+    /// 空目录（`users/` 建了但没文件）也算正常。
+    #[test]
+    fn empty_subdirectories_are_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("users")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        assert_eq!(load(tmp.path()).unwrap().user_count(), 0);
     }
 }

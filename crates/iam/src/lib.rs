@@ -10,9 +10,11 @@
 
 pub mod action;
 pub mod arn;
+pub mod error;
 pub mod glob;
 pub mod policy;
 pub mod store;
 pub mod user;
 
+pub use error::IamError;
 pub use store::{Decision, DenyReason, IamStore};
