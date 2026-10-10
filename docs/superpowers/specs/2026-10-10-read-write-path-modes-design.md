@@ -582,7 +582,7 @@ workspace lint 是 `unsafe_code = "forbid"`。`testutil.rs` 的文档注释已�
 | `crates/server/src/startup.rs` | 两处构造点改走 `with_modes` |
 | `crates/server/src/wiring.rs` | 覆盖 `list_objects_from` |
 | `crates/store/benches/io_modes.rs` + `crates/store/Cargo.toml` | **新增**基准（`harness = false`，**不引 criterion**）+ `[[bench]]` |
-| `docs/io-modes-bench.md` | **新增**：跑出来的对比结果 |
+| `docs/benchmarks/io-modes/results.md` | **新增**：跑出来的对比结果 |
 | `docs/DESIGN.md` | §11 追加一句 |
 
 > **为什么不引 criterion**：§7.3 定的是「以确定性计数为主、墙钟为辅」。计数由基准

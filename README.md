@@ -11,6 +11,7 @@
 
 - 设计文档：[`docs/DESIGN.md`](docs/DESIGN.md)
 - 实施计划（含每条限制的来龙去脉）：[`docs/MVP.md`](docs/MVP.md)
+- 性能基准：[`docs/benchmarks/`](docs/benchmarks/)
 
 ---
 

@@ -1,0 +1,54 @@
+    Finished `bench` profile [optimized] target(s) in 0.23s
+     Running benches\io_modes.rs (target\release\deps\io_modes-73aab465ea0651b1.exe)
+READ/WRITE PATH IO MODES — 计数与墙钟
+规模：L1_SIZE=67108864 L2_HEADS=2000 L2_DISTINCT=100
+      L3_KEYS=600 L3_PAGE=100 L4_SIZE=16777216 L4_ITERS=4
+      REPEAT=2（取最小墙钟）
+
+=== L1 GET bytes=0-99（主测） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old          12       100676718          12          6         0       809680
+   new           6         1573056           6          0         0        15528
+
+=== L1 完整 GET（阴性对照：范围读无可省） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old          12       100676718          12          6         0       848639
+   new           6       100675584           6          0         0       774767
+
+=== L2 同一 key 2000 次 HEAD（主测） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old       12000         2256000       12000      12000         0      9634108
+   new           0               0           0          0         0         3308
+
+=== L2 100 个不同 key 各 HEAD 一次（阴性对照：缓存必然失效） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old         600         2554380         600        600         0       542008
+   new         600         2554278         600        600         0       638574
+
+=== L3 从 600 个 key 里凑满 100 条（主测） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old         600         2529582        2404      11430         0      3726180
+   new         600         2529768        1603       7230         0      2362243
+
+=== L3 列全桶（阴性对照：必须扫全） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old        5412        22989414        7216      16242         0      8104481
+   new        5412        22989960        7216      21654         0      9667492
+
+=== L4 PUT 16 MiB × N（主测） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old           0               0           0         24       256      2139371
+   new           0               0           0         24        16      2107767
+
+=== L4 PUT 512 KiB × N（阴性对照：单块，无复用机会） ===
+  mode       reads      read_bytes       stats      lists    allocs      wall_us
+   old           0               0           0         24        16       393862
+   new           0               0           0         24        16       378673
+
+注意：计数与墙钟来自**同一次**运行，`IoLog` 的原子自增会影响时序。
+读法：计数是主证据（确定性、可复现），墙钟是佐证。
+reads/read_bytes/stats/lists 四个机制各自对应的那一列应当差异巨大，
+其余三列（含 L4 的全部 IO 列）差异接近 0 是**预期**，不是没生效。
+L4 的证据在 `allocs` 列：旧 L4_ITERS×16×4 / 新 L4_ITERS×4，单块对照两行相同。
+它量的是**我们自己的代码显式增长分片缓冲的次数**，不是分配器的真实分配次数——
+全局分配器探针要 `unsafe`，而 workspace lint 是 `unsafe_code = "forbid"`。
