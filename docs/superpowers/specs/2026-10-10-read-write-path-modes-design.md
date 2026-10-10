@@ -224,21 +224,37 @@ pub async fn read_all(&self) -> Result<Vec<u8>, StoreError>
 对**每块盘**执行 `list_dir("{bucket}/{key}")`，跳过 `.staging-` 前缀，
 由此发现候选版本目录，再读元数据投票。每个 HEAD / GET 都要付这份代价。
 
-**新路径**：新增 `resolve_version_cached`：
+**新路径**：新增 `resolve_version_cached`，以及它背后的一张小表
+（`crates/store/src/resolve_cache.rs`）：
 
-- 表的每一格是 `(generation: u64, resolved: Resolved)`，按 `(bucket, key)` 索引；
-- `put_object` / `delete_object` 在它们**本来就持有**的 §16.1 对象写锁下
-  把该键的 `generation` 递增一格。**递增即失效**——读侧比对 generation，
-  对不上就当作未命中重新解析，不需要单独一条淘汰路径；
-- 复用 DESIGN §16.1 的分片 `RwLock` 表（按 key 哈希分片，不新造一套锁表），
-  读侧取读锁、写侧取写锁，与既有锁纪律一致。
+- 表按 `(bucket, key)` 索引，每一格的存的是 `(generation: u64, resolved: Arc<Resolved>)`；
+- 表**按 key 哈希分成固定的 16 片**，每片一把 `Mutex` + 一个**单调递增**的
+  `AtomicU64` 作为该片的代际。**缓存自带这套锁**：DESIGN §16.1 描述的那把分片
+  `RwLock` 表在代码里**并不存在**（全仓 `crates/store/src/` 里没有任何
+  `RwLock`/`Mutex`/`Semaphore`），它至今只是一条设计预留。所以这里不是"复用"，
+  是"头一次引入"——按 §16.1 的**意图**（按 key 哈希分片、不搞全局锁）来造，
+  而不是假装已经有一张表可以借；
+- `put_object` / `delete_object` **提交成功之后**调 `invalidate(bucket, key)`，
+  把该 key 所在那一片的代际 +1。**递增即失效**：读侧存条目时比对代际，对不上就
+  干脆不存。不需要单独一条淘汰路径，也不需要在**任意一处**改动调用点的既有锁；
 
 > **为什么用代际而不是「写时删表项」**
-> 写路径已经持有那把写锁，递增一个 `u64` 比删表项更便宜，也不会因为
-> 「先删表项、再写盘、写失败」而留下一个本该失效却被当作命中的表项。
-> 代际是单调的，所以任何**在飞**的慢读者最多是重解析一次，不会读到过期值。
+> 递增一个 `u64` 比删表项更便宜，也不会因为「先删表项、再写盘、写失败」而留下一个
+> 本该失效却被当作命中的表项。代际是**每片单调、永不回退**的，于是两件坏事都被挡住：
+> - 一个**在飞**的慢读者（先取代际、再解析、最后存条目）如果中途发生了写入，
+>   它存的时候会发现手上的代际已经不等于当前值，于是**放弃存**——最多重解析一次，
+>   绝不会把一份旧值塞进表里；
+> - 条目被容量挤掉、之后同名重建，也不会出现「旧读者的代际恰好等于新建条目的代际」
+>   这种 ABA（单调计数器不会回到旧值）。
 
-**调用点**：只有 `get_object` 与 `head_object` 走缓存版。
+**调用点**：只有 `get_object` 与 `head_object` 走缓存版。失效点只有两个：
+`put_object` 与 `delete_object` 各在**唯一的成功出口**上（两者都拆成
+`*_inner` + 薄包装，包装里做失效），所以两个返回分支（内联 / 分片）与将来新增的
+分支都不会漏掉。
+
+**错误不进缓存**：`ReadQuorum` 是暂时状态，把它记下来会让一次抖动变成持续失败。
+`Absent` **进**缓存——「这个 key 不存在」正是 HEAD 密集负载里最有价值的一类命中，
+而它被写入改变时由 `invalidate` 兜住。
 
 > **为什么这三处故意不接缓存**
 > - `crates/store/src/delete.rs`：写路径要的是**真相**，不是「最近为真」。删除决策建立在陈旧版本上会删错对象。
@@ -255,9 +271,16 @@ pub async fn read_all(&self) -> Result<Vec<u8>, StoreError>
 然后 `crates/s3/src/impl_s3.rs::list_objects_v2`（第 324 行）把**整个列表物化完**，才应用
 cursor / `max_keys` / `delimiter`。
 
-**新路径**：`candidate_keys` 改为有界增量有序遍历，返回 `(entries, more)`；
-S3 层保留 marker / delimiter / max-keys 语义，靠折叠循环反复调用。
-旧模式一次返回全部、`more = false`，忽略 marker 与 limit——行为与今天逐字节一致。
+**新路径**：**新增**一个有序增量遍历 `candidate_keys_ordered(bucket, after, want)`
+返回 `(keys, more)`，挂在新的 `list_objects_from(bucket, prefix, after, want)` 上。
+`candidate_keys`（全量 + `BTreeSet` 排序）**一字不动地留着**——它就是旧模式；
+`list_objects_from` 是**唯一**的分派点：开关关着就走旧遍历再在内存里做游标与限量，
+开着才走新遍历。`list_objects` 本身退化成 `list_objects_from(.., after = None, want = usize::MAX)`，
+所以它的行为与今天逐字节一致。
+
+S3 层的 `list_objects_v2` 保留 marker / delimiter / max-keys 语义，只是把「一次拿全量」
+换成「按批取、直到页满或 `more = false`」。**旧模式下第一批就带回全部且 `more = false`，
+于是那个批循环只转一圈——与今天的开销相同**，这正是两边能公平对比的前提。
 
 #### ⚠️ 这里有一个真陷阱：UUID 版本目录破坏了「有序路径 = 有序键」
 
@@ -273,14 +296,23 @@ S3 层保留 marker / delimiter / max-keys 语义，靠折叠循环反复调用�
 **错误做法**：下探到 `<uuid>` 再反推父路径。这既得不到有序输出，
 也无法区分「`p` 是对象」与「`p` 是前缀」（两者在盘上都表现为目录 `p`）。
 
-**正确做法**：**在键目录层级就决定并输出**。对 `p` 做一层前瞻——
-看它的子目录里有没有哪个直接含 `meta.xl`：
+**正确做法**：**在键目录层级就决定这个目录自己是不是一个键，并且先输出它、再下探**。
+对 `p` 做一层前瞻——看它的子目录里有没有哪个直接含 `meta.xl`：
 
-- 有 → `p` 是一个对象，输出键 `p`，**且不再下探**（不能再把 `p/` 当公共前缀吐一遍）；
-- 没有 → `p` 是前缀，输出 `p/` 作为公共前缀，继续下探它的子目录（跳过 `<uuid>` 形状的条目）。
+- 有 → `p` 是一个键，**先输出 `p`**，然后再下探那些**不含 `meta.xl`** 的子目录
+  （`p/-x`、`p/z` 这类更深的键的目录）；含 `meta.xl` 的子目录是版本目录，不再往下走；
+- 没有 → `p` 不是键，只下探它的子目录。
 
-代价是每层多一次前瞻 `stat`，但换来的是**有序输出 + 正确的对象/前缀二选一**，
-而且可以把「跳过的 UUID 目录」与「继续下探的键目录」区分开。
+因为 `p` 严格小于 `p/...`，**先输出自己再下探**就得到了升序；而同一个目录
+`p` 下「哪个子目录是版本目录」是靠「里面有没有 `meta.xl`」判的，与目录名的字典序无关，
+所以 UUID 陷阱不成立。
+
+代价是每层多一次前瞻 `list_dir`，但换来的是**有序输出 + 正确的对象判定**。
+配合一个**排除式游标**（`after`）与子树剪枝，收够 `want` 个候选就能立刻停手。
+
+**引擎只吐键，不吐公共前缀**：delimiter 折叠仍然留在 S3 层（`impl_s3.rs`），
+与今天一字不差。引擎侧的改动只有三件事——有序、跳过版本目录、够数即停。
+把折叠上移会让 S3 层的既有语义多出一处**第二实现**，那不是这次要动的东西。
 
 > **旧实现是靠什么绕过去的**
 > 它用 `BTreeSet` 收集全部再整体 sort——所以它**天然正确但天然全量**。
@@ -308,7 +340,6 @@ S3 层保留 marker / delimiter / max-keys 语义，靠折叠循环反复调用�
 struct ShardScratch {
     block: Vec<u8>,              // = read_block 的 BLOCK_SIZE 缓冲
     shards: Vec<Vec<u8>>,        // data_shards 份，按几何分配一次
-    allocs: u64,                 // 插桩计数，见 §6
 }
 ```
 
@@ -318,7 +349,7 @@ struct ShardScratch {
 > **这个机制的对照必须是「分配计数器」，不能拿 IO 计数糊弄**
 > 见 §7 的硬门槛 1。它**不会**减少任何一次 `read_exact_at` / `stat` / `list_dir`，
 > 所以如果只看 IO 计数，它必然显示 0 差异——那不是 bug，那是它本来的样子。
-> 它的证据形态是「16 MiB PUT 的分配次数」，与其余三个机制不同。
+> 它的证据形态是「16 MiB PUT 的分片缓冲增长次数」，与其余三个机制不同。
 
 **可选步骤二**：`rstore-erasure::encode_into`（把编码输出直接写进已有缓冲，而不是返回新 `Vec`）。
 **由计数器决定要不要做**，本文不预先承诺。若 `ShardScratch` 已经吃掉了绝大部分分配，就不做。
@@ -340,7 +371,20 @@ struct IoLog {
 }
 ```
 
-再加 `ShardScratch.allocs` 记录分配次数。
+**分配计数不在 `ShardScratch` 里，在 `ErasureSet` 上。** 原因是可见性：bench 是
+独立编译的 crate，看不到 `pub(crate)` 的东西，而计数要跨 `put_object` 的调用边界被
+读走。所以是 `ErasureSet::scratch_allocs: AtomicU64` + `pub fn take_scratch_allocs(&self) -> u64`
+（取值并归零），在 `write_shards_stream` 里按「这轮 `resize` 是否真的要新内存」
+（`shard.capacity() < shard_size_k`）累加。它**不减少任何一次 IO**，所以这个计数是
+L4 唯一的证据形态。
+
+> **为什么不做全局分配器探针**
+> 那要一个 `GlobalAlloc` 实现，而 `unsafe_code = "forbid"`（workspace lint）不允许。
+> 退一步也只能量到「进程内所有分配」，混进编码器、MD5、tokio 的噪声，判据反而更弱。
+>
+> **它量的是什么（别夸大）**：是**我们自己的代码显式增长分片缓冲的次数**，不是
+> 分配器的真实分配次数；外层 `Vec<Vec<u8>>` 不计。这个判据对 `Vec` 成立且确定性——
+> `clear()` 不释放容量，容量够时 `resize` 原地写。
 
 > **bench 必须自己重写一份，不能复用 `testutil`**
 > `crates/store/src/lib.rs` 里是 `#[cfg(test)] mod testutil;`，而 bench 目标
@@ -509,14 +553,30 @@ workspace lint 是 `unsafe_code = "forbid"`。`testutil.rs` 的文档注释已�
 |---|---|
 | `crates/common/src/modes.rs` | **新增**：`IoModes` |
 | `crates/common/src/lib.rs` | `pub mod modes;` |
-| `crates/store/src/set.rs` | 加 `modes` 字段、`with_modes`、`modes()`；`new` 委托 |
-| `crates/store/src/reader.rs` | 新增 `BitrotShardReader::read_range` |
-| `crates/store/src/get.rs` | `read_shards` 分支；新增 `resolve_version_cached`；`get_object` / `head_object` 接线 |
-| `crates/store/src/list.rs` | 新增有界增量遍历；`candidate_keys` 分派 |
-| `crates/store/src/put.rs` | `ShardScratch`；`write_shards_stream` / `read_block` 接线 |
-| `crates/server/src/config.rs` | `--io-mode` |
-| `crates/server/src/wiring.rs` | 传 `IoModes` |
-| `crates/store/src/lib.rs` | 等价性测试模块的登记（`#[cfg(test)]`） |
-| `crates/store/benches/` + `crates/store/Cargo.toml` | **新增** criterion bench + `[[bench]]` + dev-dep |
+| `crates/store/src/set.rs` | 加 `modes` / `resolve_cache` 字段、`with_modes`、`modes()`、`resolve_cache()`；`new` 委托 |
+| `crates/store/src/resolve_cache.rs` | **新增**：按 `(bucket, key)` 分片、按代际失效的版本解析缓存 |
+| `crates/store/src/reader.rs` | 新增 `checked_stat` / `block_count` / `block_data_len` / `read_blocks` / `read_range`；`read_all` 成为共用路径的薄封装 |
+| `crates/store/src/get.rs` | `read_shards` 认块区间；新增 `slice_blocks` / `resolve_version_cached`；`get_object` / `head_object` 接线 |
+| `crates/store/src/list.rs` | 新增 `candidate_keys_ordered` 与 `list_objects_from`；`candidate_keys` 一字不动，分派点在 `list_objects_from` |
+| `crates/store/src/put.rs` | 新增 `read_block_into` / `ShardScratch`；`write_shards_stream` 接线；`put_object` 拆成薄包装 + `_inner` |
+| `crates/store/src/delete.rs` | `delete_object` 拆成薄包装 + `_inner` |
+| `crates/store/src/testutil.rs` | 新增 `set_with_modes` / `set_with_recording_disks_modes`，旧的三个夹具委托过去 |
+| `crates/store/src/io_modes_equiv.rs` | **新增**：差分等价测试（§7.2 硬门槛 1） |
+| `crates/store/src/lib.rs` | `mod resolve_cache;` + `#[cfg(test)] mod io_modes_equiv;` |
+| `crates/api/src/lib.rs` | `ObjectStore::list_objects_from`（**带默认实现**，mock / nop 不必改） |
+| `crates/s3/src/impl_s3.rs` | `list_objects_v2` 改成分批取 |
+| `crates/server/src/config.rs` | `--io-mode`（只两档，默认 `old`） |
+| `crates/server/src/startup.rs` | 两处构造点改走 `with_modes` |
+| `crates/server/src/wiring.rs` | 覆盖 `list_objects_from` |
+| `crates/store/benches/io_modes.rs` + `crates/store/Cargo.toml` | **新增**基准（`harness = false`，**不引 criterion**）+ `[[bench]]` |
+| `docs/io-modes-bench.md` | **新增**：跑出来的对比结果 |
 | `docs/DESIGN.md` | §11 追加一句 |
-| `docs/read-write-path-design.md` | **提交**（目前 git 未跟踪，本文引用了它） |
+
+> **为什么不引 criterion**：§7.3 定的是「以确定性计数为主、墙钟为辅」。计数由基准
+> 自己的 `IoLog` 给出，criterion 的统计功利用不上，而它要拖一整套依赖进来。
+> 基准是一个 `harness = false` 的手写 `fn main`，跑 `cargo bench -p rstore-store --bench io_modes`。
+>
+> **基准不能复用 `crate::testutil`**：`lib.rs` 里是 `#[cfg(test)] mod testutil;`，
+> 而 bench 目标是独立编译的 crate，那个模块在它眼里根本不存在。可直接复用的只有
+> `DiskAPI` / `LocalDisk` / `Fault`，计数盘要在 bench 里重写一份。
+> 这也是等价性测试必须待在 `src/` 内的 `#[cfg(test)]` 模块里的原因——同一条理由的两个方向。
