@@ -118,17 +118,48 @@ pub async fn set_with_modes(total: u8, parity: u8, modes: IoModes) -> TestSet {
 }
 
 /// 写入长度日志。`Arc` 包一层是为了让 `RecordingDisk` 与测试各持一份。
+///
+/// 每条记录是 `(rel_path, payload 长度)`。**为什么要留路径**：`meta.xl` 的长度在
+/// 两次独立的 PUT 之间**本来就不一样**——它把两个 UUID 经 `HeaderWire` 的
+/// `[u8; 16]` 桥接字段编码，而 `rmp_serde` 对每个 ≥ 0x80 的字节用 2 字节的
+/// `uint8`（`0xcc`）、其余用 1 字节的正整数，于是同一个字段的编码长度在
+/// 19~35 字节之间随 UUID 的随机字节浮动（实测两份 `meta.xl` 相差 185~193）。
+/// 这是既有的格式性质，与任何一次写路径改动无关。要比「写入的形状没变」，
+/// 就只能比**受该改动影响的那部分**——见 [`WriteLog::sizes_of`]。
 #[derive(Clone, Default)]
-pub struct WriteLog(Arc<std::sync::Mutex<Vec<usize>>>);
+pub struct WriteLog(Arc<std::sync::Mutex<Vec<(String, usize)>>>);
 
 impl WriteLog {
     /// 所有写入 payload 的长度，`write_all` 与 `append` 合并、按时序。
     pub fn sizes(&self) -> Vec<usize> {
-        self.0.lock().expect("write log poisoned").clone()
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .iter()
+            .map(|(_, n)| *n)
+            .collect()
     }
 
-    fn record(&self, n: usize) {
-        self.0.lock().expect("write log poisoned").push(n);
+    /// 只取**最后一段路径等于 `file_name`** 的那些写入的长度（如 `"part.1"`）。
+    ///
+    /// **按最后一段匹配而不是全路径**：`rel_path` 里带着每次 PUT 都不一样的
+    /// `data_dir` uuid 与 `.staging-<txid>`，全路径比对永远不等。分片文件名
+    /// （`part.1`）才是两次 PUT 之间可比的部分。
+    pub fn sizes_of(&self, file_name: &str) -> Vec<usize> {
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .iter()
+            .filter(|(p, _)| p.rsplit('/').next() == Some(file_name))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    fn record(&self, rel_path: &str, n: usize) {
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .push((rel_path.to_string(), n));
     }
 }
 
@@ -157,12 +188,12 @@ impl RecordingDisk {
 #[async_trait::async_trait]
 impl DiskAPI for RecordingDisk {
     async fn write_all(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
-        self.log.record(data.len());
+        self.log.record(rel_path, data.len());
         self.inner.write_all(rel_path, data).await
     }
 
     async fn append(&self, rel_path: &str, data: &[u8]) -> Result<(), DiskError> {
-        self.log.record(data.len());
+        self.log.record(rel_path, data.len());
         self.inner.append(rel_path, data).await
     }
 
@@ -197,13 +228,22 @@ impl DiskAPI for RecordingDisk {
     }
 }
 
-/// [`set_with_disks`] 的变体：每块盘的最内层是 `RecordingDisk`，
-/// 所有盘的写入长度汇总到同一个 `WriteLog`。返回 `(set, log)`。
+/// [`set_with_recording_disks_modes`] 的旧模式特化。
+pub async fn set_with_recording_disks(total: u8, parity: u8) -> (TestSet, WriteLog) {
+    set_with_recording_disks_modes(total, parity, IoModes::default()).await
+}
+
+/// [`set_with_modes`] 的录制版：每块盘的最内层是 `RecordingDisk`，
+/// 所有盘的写入长度汇总到同一个 `WriteLog`，并指定读写路径模式。返回 `(set, log)`。
 ///
 /// 包装顺序是 `LocalDisk` → `RecordingDisk` → `FaultyDisk`。**这个顺序不能反**：
 /// `RecordingDisk` 记的是「最终落到盘上的那些写入」，若把它套在 `FaultyDisk`
 /// 外面，`Fault::DropWrites` 之类「假装成功」的故障就不会出现在日志里。
-pub async fn set_with_recording_disks(total: u8, parity: u8) -> (TestSet, WriteLog) {
+pub async fn set_with_recording_disks_modes(
+    total: u8,
+    parity: u8,
+    modes: IoModes,
+) -> (TestSet, WriteLog) {
     let dir = tempfile::TempDir::new().expect("create tempdir");
     let log = WriteLog::default();
 
@@ -222,7 +262,7 @@ pub async fn set_with_recording_disks(total: u8, parity: u8) -> (TestSet, WriteL
         disks.push(Some(erased));
     }
 
-    let set = ErasureSet::new(disks, parity).expect("valid erasure set geometry");
+    let set = ErasureSet::with_modes(disks, parity, modes).expect("valid erasure set geometry");
     (
         TestSet {
             set,

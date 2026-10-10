@@ -13,6 +13,7 @@
 //! 再由 `commit` 一次 rename 提交——「元数据可见」与「分片可见」是同一个原子事件。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,16 +93,17 @@ pub(crate) fn etag_of(data: &[u8]) -> String {
     format!("{:x}", Md5::digest(data))
 }
 
-/// 读「至多一个块」：读满 `BLOCK_SIZE` 或到 EOF 为止，两者取先到者。
+/// 读「至多一个块」进**调用方提供的** `buf`，返回读到的字节数。
 ///
-/// 返回长度 `< BLOCK_SIZE` 就说明已经读到流末尾——调用方据此判定「没有更多了」。
-/// **这是整条写路径唯一的缓冲点**，上界就是 `BLOCK_SIZE`。
-///
-/// 不用 `AsyncReadExt::take().read_to_end()`：`take` 消费接收者，而我们需要
-/// 在下一轮继续读同一个流，改回来要写 `(&mut *body).take(..)` 这类借用体操。
-/// 逐次 `read` 到填满更直白，也与 `fsx::read_exact_at` 的循环同一种写法。
-async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>, StoreError> {
-    let mut buf = vec![0u8; BLOCK_SIZE];
+/// 与 [`read_block`] 是同一件事，区别只在于缓冲由调用方提供、于是可以跨块复用。
+/// `truncate` 之后再 `resize` 会把新增的尾部清零——与 `vec![0u8; BLOCK_SIZE]`
+/// 的那次清零代价相同（都不省 memset），省下的是**分配**本身。
+async fn read_block_into(
+    body: &mut (dyn AsyncRead + Unpin + Send),
+    buf: &mut Vec<u8>,
+) -> Result<usize, StoreError> {
+    buf.clear();
+    buf.resize(BLOCK_SIZE, 0);
     let mut filled = 0usize;
     while filled < BLOCK_SIZE {
         let n = body
@@ -114,7 +116,36 @@ async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>
         filled += n;
     }
     buf.truncate(filled);
+    Ok(filled)
+}
+
+/// 读「至多一个块」：读满 `BLOCK_SIZE` 或到 EOF 为止，两者取先到者。
+///
+/// 返回长度 `< BLOCK_SIZE` 就说明已经读到流末尾——调用方据此判定「没有更多了」。
+/// **这是整条写路径唯一的缓冲点**，上界就是 `BLOCK_SIZE`。
+///
+/// 不用 `AsyncReadExt::take().read_to_end()`：`take` 消费接收者，而我们需要
+/// 在下一轮继续读同一个流，改回来要写 `(&mut *body).take(..)` 这类借用体操。
+/// 逐次 `read` 到填满更直白，也与 `fsx::read_exact_at` 的循环同一种写法。
+async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>, StoreError> {
+    let mut buf = Vec::new();
+    read_block_into(body, &mut buf).await?;
     Ok(buf)
+}
+
+/// 单次 PUT 内跨块复用的暂存缓冲（`pooled_write_buffers` 机制）。
+///
+/// **为什么是局部而不是全局池**：真实需求只有「一次 PUT 里别每块重新分配」。
+/// DESIGN §13.3 的四级池要 `Semaphore` + `ManuallyDrop` + `try_lock` 一整套，
+/// 而它解决的是跨请求、跨尺寸的复用——不是这次的对比目标。见设计文档 §5。
+///
+/// **它不减少任何一次 IO**，所以它的证据形态是**分配次数**，不是 IO 计数。
+/// 只看 IO 计数的对比会显示 0 差异，那不是 bug，那是它本来的样子。
+struct ShardScratch {
+    /// 当前块的读缓冲，容量在满载时为 `BLOCK_SIZE`。
+    block: Vec<u8>,
+    /// `data_shards` 份数据分片缓冲，跨块复用。
+    shards: Vec<Vec<u8>>,
 }
 
 /// 当前 unix 纳秒。GET 靠它在一个 key 存在多个版本目录时选出最新的那个（Task 4.7）。
@@ -395,6 +426,9 @@ impl ErasureSet {
         let parity = self.parity();
         let step = step as usize;
         let part_rel = format!("{staging}/part.1");
+        // 缓冲复用只在开关打开时启用。**关着时走上下一字不改的老路径**：
+        // 每块一个新 `Vec`，`block` 也每轮重新分配。
+        let pooled = self.modes().pooled_write_buffers;
 
         // 循环外为每块盘建一个写入器；掉线的槽位没有写入器。
         let mut writers: Vec<Option<BitrotShardWriter>> = self
@@ -408,32 +442,50 @@ impl ErasureSet {
 
         let mut md5 = Md5::new();
         let mut size: u64 = 0;
-        let mut block = first;
+        // `first` 是调用方已经读出来的第一个块——它天然就是这份暂存缓冲的起点。
+        let mut scratch = ShardScratch {
+            block: first,
+            shards: Vec::new(),
+        };
 
         loop {
             // 空块只可能在 EOF 时出现（且此时前面的判断已经 break），
             // 留着这道闸是为了不把「空块」喂进 `push_block`——它会当成布局错误拒绝。
-            if block.is_empty() {
+            if scratch.block.is_empty() {
                 break;
             }
 
-            md5.update(&block);
+            md5.update(&scratch.block);
             let shard_size_k =
-                even_ceil((block.len() as u64).div_ceil(u64::from(data_shards))) as usize;
+                even_ceil((scratch.block.len() as u64).div_ceil(u64::from(data_shards))) as usize;
 
+            // 关掉复用时就地把上一轮的分片缓冲全部丢掉，让下一轮重新分配——
+            // 与引入本机制之前一字不差。
+            if !pooled {
+                scratch.shards = Vec::new();
+            }
+            scratch.shards.resize_with(data_shards as usize, Vec::new);
             // 数据分片：按 `shard_size_k` 切，不足处补零。补零只可能落在最后一个
             // 分片的尾部，这正是读侧「顺序相接再截断到 L_k」的依据。
-            let mut shards: Vec<Vec<u8>> = (0..data_shards as usize)
-                .map(|i| {
-                    let s = i * shard_size_k;
-                    let mut shard = vec![0u8; shard_size_k];
-                    if s < block.len() {
-                        let e = (s + shard_size_k).min(block.len());
-                        shard[..e - s].copy_from_slice(&block[s..e]);
-                    }
-                    shard
-                })
-                .collect();
+            let mut grew = 0u64;
+            for (i, shard) in scratch.shards.iter_mut().enumerate() {
+                // 分配计数（Step 2b）：只有「这一轮 `resize` 真的会向分配器要内存」
+                // 才计数。`clear()` 不释放容量，容量够时 `resize` 就在原地写，
+                // 所以这个判据恰好就是「要不要新内存」。
+                // **只数分片数据缓冲**，外层 `Vec<Vec<u8>>`（24 字节/项）不计——
+                // 量的对象是分片数据本身。
+                if shard.capacity() < shard_size_k {
+                    grew += 1;
+                }
+                shard.clear();
+                shard.resize(shard_size_k, 0);
+                let s = i * shard_size_k;
+                if s < scratch.block.len() {
+                    let e = (s + shard_size_k).min(scratch.block.len());
+                    shard[..e - s].copy_from_slice(&scratch.block[s..e]);
+                }
+            }
+            self.scratch_allocs.fetch_add(grew, Ordering::Relaxed);
 
             let codec = self
                 .codec_cache()
@@ -444,13 +496,21 @@ impl ErasureSet {
                     ))
                 })?;
             let parity_shards = codec
-                .encode(&shards)
+                .encode(&scratch.shards)
                 .map_err(|e| StoreError::Internal(format!("erasure encode: {e}")))?;
-            // 分片编号沿用 `encode` 的输出顺序：`0..data` 数据分片，`data..N` 校验分片。
-            shards.extend(parity_shards);
 
-            // 分片 `kk` 落在盘 `dist[kk] - 1`。每块盘每块恰好收到一份（`dist` 是排列）。
-            for (kk, shard) in shards.iter().enumerate() {
+            // 分片编号沿用 `encode` 的输出顺序：`0..data` 数据分片，`data..N` 校验分片。
+            // 数据分片借自 `scratch.shards`、校验分片借自 `parity_shards`——两者拼成
+            // 同一串编号，但**不合成一个新的 `Vec`**（合成就把复用又还回去了）。
+            let total_shards = data_shards as usize + parity_shards.len();
+            for kk in 0..total_shards {
+                let shard: &[u8] = if kk < data_shards as usize {
+                    &scratch.shards[kk]
+                } else {
+                    &parity_shards[kk - data_shards as usize]
+                };
+
+                // 分片 `kk` 落在盘 `dist[kk] - 1`。每块盘每块恰好收到一份（`dist` 是排列）。
                 let physical = usize::from(dist[kk] - 1);
                 // 两种错误必须分开处理，**不能**一个 `?` 了事：
                 // - `ShardLayout` 是程序 bug（几何算错、块序颠倒），整次写入中止；
@@ -472,12 +532,17 @@ impl ErasureSet {
                 }
             }
 
-            size += block.len() as u64;
+            size += scratch.block.len() as u64;
             // 短块就是最后一块——这里 break，绝不再去读流，否则会多等一次 IO。
-            if block.len() < BLOCK_SIZE {
+            if scratch.block.len() < BLOCK_SIZE {
                 break;
             }
-            block = read_block(body).await?;
+            if pooled {
+                // 复用同一块缓冲：`read_block_into` 会先 clear + resize，旧内容不残留。
+                read_block_into(body, &mut scratch.block).await?;
+            } else {
+                scratch.block = read_block(body).await?;
+            }
         }
 
         let mut achieved = 0u8;
@@ -505,7 +570,10 @@ mod tests {
 
     use super::*;
     use crate::error::StoreError;
-    use crate::testutil::{body, set_with_disks, set_with_recording_disks, TestSet};
+    use crate::testutil::{
+        body, set_with_disks, set_with_recording_disks, set_with_recording_disks_modes, TestSet,
+    };
+    use rstore_common::modes::IoModes;
 
     /// 某块盘上 `bucket/key/<data_dir>` 里的文件名（已排序）。
     /// 走 `DiskAPI::list_dir` 而不是直接碰文件系统：夹具里的盘可能被 `FaultyDisk`
@@ -648,6 +716,137 @@ mod tests {
             "16 MiB / 1 MiB 应该远多于 16 次写入，实际 {}",
             sizes.len()
         );
+    }
+
+    /// 缓冲复用**不该改变任何可观察行为**。三组断言，一组比一组强：
+    /// 1. 内容/大小/etag 相同；
+    /// 2. `RecordingDisk` 记下的**分片写入长度序列逐项相同**；
+    /// 3. 读回来仍然逐字节正确（复用缓冲如果残留旧内容，会在这里显形）。
+    ///
+    /// **比的是 `part.1` 而不是整份日志**：`meta.xl` 的长度在两次 PUT 之间本来就
+    /// 会差几个字节（两个 UUID 走 `HeaderWire` 的 `[u8; 16]` 编码，`rmp_serde` 对
+    /// ≥ 0x80 的字节要多花一个 `uint8` 前缀），拿它做跨模式的逐项比对必然间歇性
+    /// 失败。分片写入才是这个机制动到的东西，也正是它该被钉住的部分。详见
+    /// [`crate::testutil::WriteLog::sizes_of`]。
+    #[tokio::test]
+    async fn pooled_write_buffers_is_observably_identical() {
+        // 3_000_000 = 2 个满块 + 一个短末块：末块是唯一会改变 `shard_size_k` 的地方，
+        // 也是「复用缓冲」最容易出错的块（长度变了，缓冲要 resize 而不是沿用）。
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+
+        let (plain, log_plain) = set_with_recording_disks_modes(6, 2, IoModes::default()).await;
+        let a = plain
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                body: body(data.clone()),
+                etag: None,
+            })
+            .await
+            .unwrap();
+
+        let (pooled, log_pooled) = set_with_recording_disks_modes(6, 2, IoModes::ALL).await;
+        let b = pooled
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                body: body(data.clone()),
+                etag: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(a.size, b.size);
+        assert_eq!(
+            a.etag, b.etag,
+            "etag 是内容的 MD5，相同内容必须给出相同 etag"
+        );
+
+        let shards_plain = log_plain.sizes_of("part.1");
+        let shards_pooled = log_pooled.sizes_of("part.1");
+        // 空向量之间的相等是**空洞的**，先钉住它确实记到了东西：3 个块 × 6 块盘。
+        assert_eq!(shards_plain.len(), 18, "3 个块 × 6 块盘");
+        assert_eq!(
+            shards_plain, shards_pooled,
+            "分片的写入长度序列必须逐项相同——缓冲复用不该改变写入的形状"
+        );
+
+        assert_eq!(plain.get_object("b", "k", None).await.unwrap().data, data);
+        assert_eq!(pooled.get_object("b", "k", None).await.unwrap().data, data);
+    }
+
+    /// L4 的**证据本身**：分配计数必须真的降下来。
+    ///
+    /// 这条断言的意义在于——IO 计数在两条模式下**必然相同**（这个机制不动 IO），
+    /// 所以上面两条测试拿不到任何区分度。只有分配计数能证明机制在工作。
+    ///
+    /// 算术：`(6, 2)` → `data_shards = 4`；3 个块（2 满 + 1 短）。
+    /// 旧模式每块 4 份新缓冲 = 12；新模式首块 4 份、之后 0 = 4。末块 `shard_size_k`
+    /// 变小不会触发增长，所以 4 是精确值。
+    #[tokio::test]
+    async fn pooled_write_buffers_cuts_shard_buffer_allocations() {
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+
+        let (plain, _log_plain) = set_with_recording_disks_modes(6, 2, IoModes::default()).await;
+        plain
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                body: body(data.clone()),
+                etag: None,
+            })
+            .await
+            .unwrap();
+
+        let (pooled, _log_pooled) = set_with_recording_disks_modes(6, 2, IoModes::ALL).await;
+        pooled
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                body: body(data.clone()),
+                etag: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(plain.take_scratch_allocs(), 12, "旧模式：3 块 × 4 份新缓冲");
+        assert_eq!(
+            pooled.take_scratch_allocs(),
+            4,
+            "新模式：首块 4 份，之后复用"
+        );
+        // `take_` 的语义是「取走并归零」——再取一次必须是 0，否则基准里的累计值
+        // 会把两次测量混在一起。
+        assert_eq!(pooled.take_scratch_allocs(), 0);
+    }
+
+    /// 单块对象没有第二块可复用——**这是这个机制的阴性对照**。
+    /// 两条模式的分片写入序列必须完全相同。
+    ///
+    /// **取 512 KiB 而不是「小于一个块就行」**：≤ 128 KiB 的对象走内联分支
+    /// （`should_inline`），数据进 `meta.xl`、**根本不产生 `part.1`**——那样比的是
+    /// 两个空向量，阴性对照会空洞地通过。512 KiB 高于 128 KiB 的内联阈值、
+    /// 又低于 `BLOCK_SIZE`（1 MiB），恰好落进「一个块、不内联」那唯一一段区间。
+    #[tokio::test]
+    async fn pooled_write_buffers_has_no_effect_on_a_single_block_object() {
+        let (plain, log_plain) = set_with_recording_disks_modes(6, 2, IoModes::default()).await;
+        let (pooled, log_pooled) = set_with_recording_disks_modes(6, 2, IoModes::ALL).await;
+
+        for set in [&plain, &pooled] {
+            set.put_object(PutArgs {
+                bucket: "b".into(),
+                key: "k".into(),
+                body: body(vec![0x5Au8; 512 * 1024]),
+                etag: None,
+            })
+            .await
+            .unwrap();
+        }
+        let shards_plain = log_plain.sizes_of("part.1");
+        let shards_pooled = log_pooled.sizes_of("part.1");
+        // 同样先确认真记到了东西：1 个块 × 6 块盘。
+        assert_eq!(shards_plain.len(), 6, "1 个块 × 6 块盘");
+        assert_eq!(shards_plain, shards_pooled);
     }
 
     /// 流式入口必须与原入口逐字节等价：同样的字节进去，同样的 etag / size / 盘上布局。

@@ -2635,6 +2635,61 @@ pub async fn set_with_recording_disks_modes(
 }
 ```
 
+- [ ] **Step 4b: 让 `WriteLog` 记住写入的路径**（执行时补记）
+
+原计划里 `WriteLog` 只记长度。**那样测不出「写入的形状没变」**：`meta.xl` 的两份
+独立 PUT 之间长度**本来就不同**——它把 `version_id` / `data_dir` 两个 UUID 经
+`HeaderWire` 的 `[u8; 16]` 桥接字段编码，而 `rmp_serde` 对每个 ≥ 0x80 的字节要多花
+一个 `uint8`（`0xcc`）前缀、其余用 1 字节正整数，于是同一个字段的编码长度在
+**19~35 字节之间随 UUID 的随机字节浮动**（用 `rmp_serde::to_vec(&[u8; 16])` 直接
+验过：全 `0xff` 是 35 字节、全 `0x01` 是 19 字节；两份 `meta.xl` 实测 185~193）。
+这是既有的格式性质，与写路径改动无关，但足以让「整份日志逐项比对」间歇性变红。
+
+修法：`WriteLog` 存 `(rel_path, len)`，并加一个按**最后一段**匹配的读取口。
+
+```rust
+#[derive(Clone, Default)]
+pub struct WriteLog(Arc<std::sync::Mutex<Vec<(String, usize)>>>);
+
+impl WriteLog {
+    /// 所有写入 payload 的长度，`write_all` 与 `append` 合并、按时序。
+    pub fn sizes(&self) -> Vec<usize> {
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .iter()
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    /// 只取**最后一段路径等于 `file_name`** 的那些写入的长度（如 `"part.1"`）。
+    ///
+    /// **按最后一段匹配而不是全路径**：`rel_path` 里带着每次 PUT 都不一样的
+    /// `data_dir` uuid 与 `.staging-<txid>`，全路径比对永远不等。分片文件名
+    /// （`part.1`）才是两次 PUT 之间可比的部分。
+    pub fn sizes_of(&self, file_name: &str) -> Vec<usize> {
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .iter()
+            .filter(|(p, _)| p.rsplit('/').next() == Some(file_name))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    fn record(&self, rel_path: &str, n: usize) {
+        self.0
+            .lock()
+            .expect("write log poisoned")
+            .push((rel_path.to_string(), n));
+    }
+}
+```
+
+`RecordingDisk` 里两处 `self.log.record(data.len())` 相应改成
+`self.log.record(rel_path, data.len())`。`sizes()` 保持原签名，既有的
+`write_path_never_emits_more_than_one_block` 一个字节都不用改。
+
 - [ ] **Step 5: 写测试**
 
 在 `crates/store/src/put.rs` 的 `mod tests` 里，找一个既能拿到 `TestSet` 又能拿到
@@ -2643,8 +2698,11 @@ pub async fn set_with_recording_disks_modes(
 ```rust
     /// 缓冲复用**不该改变任何可观察行为**。三组断言，一组比一组强：
     /// 1. 内容/大小/etag 相同；
-    /// 2. `RecordingDisk` 记下的**落盘写入长度序列逐项相同**；
+    /// 2. `RecordingDisk` 记下的**分片写入长度序列逐项相同**；
     /// 3. 读回来仍然逐字节正确（复用缓冲如果残留旧内容，会在这里显形）。
+    ///
+    /// **比的是 `part.1` 而不是整份日志**：原因见 Step 4b——`meta.xl` 的长度在两次
+    /// PUT 之间本来就会差几个字节，拿它做跨模式的逐项比对必然间歇性失败。
     #[tokio::test]
     async fn pooled_write_buffers_is_observably_identical() {
         // 3_000_000 = 2 个满块 + 一个短末块：末块是唯一会改变 `shard_size_k` 的地方，
@@ -2677,10 +2735,13 @@ pub async fn set_with_recording_disks_modes(
         assert_eq!(a.size, b.size);
         assert_eq!(a.etag, b.etag, "etag 是内容的 MD5，相同内容必须给出相同 etag");
 
+        let shards_plain = log_plain.sizes_of("part.1");
+        let shards_pooled = log_pooled.sizes_of("part.1");
+        // 空向量之间的相等是**空洞的**，先钉住它确实记到了东西：3 个块 × 6 块盘。
+        assert_eq!(shards_plain.len(), 18, "3 个块 × 6 块盘");
         assert_eq!(
-            log_plain.sizes(),
-            log_pooled.sizes(),
-            "落盘的写入长度序列必须逐项相同——缓冲复用不该改变写入的形状"
+            shards_plain, shards_pooled,
+            "分片的写入长度序列必须逐项相同——缓冲复用不该改变写入的形状"
         );
 
         assert_eq!(plain.get_object("b", "k", None).await.unwrap().data, data);
@@ -2728,8 +2789,13 @@ pub async fn set_with_recording_disks_modes(
         assert_eq!(pooled.take_scratch_allocs(), 0);
     }
 
-    /// 单块对象（小于一个块）没有第二块可复用——**这是这个机制的阴性对照**。
-    /// 两条模式的落盘写入序列必须完全相同。
+    /// 单块对象没有第二块可复用——**这是这个机制的阴性对照**。
+    /// 两条模式的分片写入序列必须完全相同。
+    ///
+    /// **取 512 KiB 而不是「小于一个块就行」**：≤ 128 KiB 的对象走内联分支
+    /// （`should_inline`），数据进 `meta.xl`、**根本不产生 `part.1`**——那样比的是
+    /// 两个空向量，阴性对照会空洞地通过。512 KiB 高于 128 KiB 的内联阈值、
+    /// 又低于 `BLOCK_SIZE`（1 MiB），恰好落进「一个块、不内联」那唯一一段区间。
     #[tokio::test]
     async fn pooled_write_buffers_has_no_effect_on_a_single_block_object() {
         let (plain, log_plain) = set_with_recording_disks_modes(6, 2, IoModes::default()).await;
@@ -2739,13 +2805,17 @@ pub async fn set_with_recording_disks_modes(
             set.put_object(PutArgs {
                 bucket: "b".into(),
                 key: "k".into(),
-                body: body(vec![0x5Au8; 64 * 1024]),
+                body: body(vec![0x5Au8; 512 * 1024]),
                 etag: None,
             })
             .await
             .unwrap();
         }
-        assert_eq!(log_plain.sizes(), log_pooled.sizes());
+        let shards_plain = log_plain.sizes_of("part.1");
+        let shards_pooled = log_pooled.sizes_of("part.1");
+        // 同样先确认真记到了东西：1 个块 × 6 块盘。
+        assert_eq!(shards_plain.len(), 6, "1 个块 × 6 块盘");
+        assert_eq!(shards_plain, shards_pooled);
     }
 ```
 
@@ -2756,21 +2826,24 @@ pub async fn set_with_recording_disks_modes(
 ```
 
 换成（`IoModes` 加在**测试模块内**，不是文件顶部——文件顶部加会在非 test 构建里
-变成未使用 import）：
+变成未使用 import。**原计划的这份里 `set_with_modes` 实际一次都没用到**，
+`clippy -D warnings` 会把它当 unused import 打回，别写进去）：
 
 ```rust
-    use rstore_common::modes::IoModes;
-
     use crate::testutil::{
-        body, set_with_disks, set_with_modes, set_with_recording_disks,
-        set_with_recording_disks_modes, TestSet,
+        body, set_with_disks, set_with_recording_disks, set_with_recording_disks_modes, TestSet,
     };
+    use rstore_common::modes::IoModes;
 ```
+
+**`scratch_allocs` 必须是 `pub(crate)`**（执行时补记）：`put.rs` 是 `set.rs` 的
+**兄弟模块**，字段可见性按模块划分，写成私有会以 `E0616` 编译不过。对外仍然只暴露
+`take_scratch_allocs()`。
 
 - [ ] **Step 6: 跑测试**
 
 Run: `cargo test -p rstore-store put::`
-Expected: 既有测试全绿 + 新增 2 条绿。
+Expected: 既有测试全绿 + 新增 3 条绿。
 
 - [ ] **Step 7: 全量校验并提交**
 
