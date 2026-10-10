@@ -12,3 +12,4 @@ pub mod action;
 pub mod arn;
 pub mod glob;
 pub mod policy;
+pub mod user;
