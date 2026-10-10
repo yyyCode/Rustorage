@@ -1,7 +1,10 @@
-// 面板的视图层：hash 路由 + 四个视图（登录 / 桶列表 / 对象浏览 / 服务状态）。
+// 面板的视图层：hash 路由 + 侧栏 + 四个视图（登录 / 桶列表 / 对象浏览 / 服务状态）。
 //
 // **一律用 `textContent` 或 `h()` 建节点，绝不拼 innerHTML**：对象 key 与服务端错误
 // 消息都是外部输入，拼 HTML 会让 `a<b>.txt` 这种 key 变成注入点。
+//
+// **样式一律走 style.css 的类名，不写内联 `style`**：CSP 是 `default-src 'self'`，
+// 内联样式会被浏览器直接拒掉。
 
 import {
   ConsoleError, clearCredentials, fetchMetricsText, fetchReady, getObjectBlob,
@@ -11,12 +14,27 @@ import { formatValue, labelText, parseMetrics } from './metrics.js';
 
 const view = document.getElementById('view');
 const nav = document.getElementById('nav');
+const bucketsNav = document.getElementById('buckets');
 const conn = document.getElementById('conn');
+const logoutBtn = document.getElementById('logout');
 
-/// 建元素。`class` / `text` / `on*` 有特殊含义，其余当属性写入。
+const NAV_ITEMS = [['概览', '#/'], ['服务状态', '#/status']];
+
+/// 侧栏缓存下来的桶名。`null` = 还没取过：登录成功与退出登录都要置回 `null`，
+/// 否则会拿别人的凭据看着上一个人的桶列表。
+let bucketNames = null;
+/// 侧栏要点亮的项，由各视图在渲染时设置。
+let currentNav = '#/';
+let activeBucket = null;
+
+// ---- 建节点 --------------------------------------------------------------
+
+/// 建元素。`class` / `text` / `on*` 有特殊含义，其余当属性写入；
+/// 值为 `null` / `false` 的属性跳过（`setAttribute(k, null)` 会写字面量 "null"）。
 function h(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
     if (k === 'class') node.className = v;
     else if (k === 'text') node.textContent = v;
     else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
@@ -47,12 +65,73 @@ function errorBox(err) {
   return h('p', { class: 'err', text: detail });
 }
 
-function setNav(items) {
+// ---- 侧栏 ----------------------------------------------------------------
+
+/// 侧栏的两块：主导航与桶列表。都由这一个函数画，谁改了状态就调它一次。
+function paintSidebar() {
   nav.replaceChildren();
-  for (const [label, href] of items) {
-    nav.append(h('a', { href, text: label }));
+  for (const [label, href] of NAV_ITEMS) {
+    const on = href === currentNav;
+    nav.append(h('a', {
+      href,
+      class: on ? 'nav-item on' : 'nav-item',
+      'aria-current': on ? 'page' : null,
+      text: label,
+    }));
+  }
+
+  bucketsNav.replaceChildren();
+  if (bucketNames === null) {
+    bucketsNav.append(h('p', { class: 'hint', text: '加载中……' }));
+  } else if (bucketNames.length === 0) {
+    bucketsNav.append(h('p', { class: 'hint', text: '还没有桶。' }));
+  } else {
+    for (const name of bucketNames) {
+      const on = name === activeBucket;
+      bucketsNav.append(h('a', {
+        href: `#/b/${encodeURIComponent(name)}/`,
+        class: on ? 'bucket-link on' : 'bucket-link',
+        title: name,
+        'aria-current': on ? 'page' : null,
+        text: name,
+      }));
+    }
   }
 }
+
+/// 侧栏取不到桶**不该**把主视图也带走：主视图自己会显示服务端返回的错误，
+/// 而这里失败只意味着侧栏暂时是空的。
+async function ensureBuckets() {
+  if (bucketNames === null) {
+    try {
+      bucketNames = await listBuckets();
+    } catch {
+      bucketNames = [];
+    }
+    paintSidebar();
+  }
+  return bucketNames;
+}
+
+function setSidebar(navHref, bucket = null) {
+  currentNav = navHref;
+  activeBucket = bucket;
+  paintSidebar();
+}
+
+/// 连接状态只在**真实调用成功之后**才说「已连接」——把它写在发请求之前，
+/// 凭据是错的时候页面会一边报 403 一边显示「已连接」。
+function setConn(text, bad = false) {
+  conn.textContent = text;
+  conn.classList.toggle('bad', bad);
+}
+
+logoutBtn.addEventListener('click', () => {
+  clearCredentials();
+  bucketNames = null;
+  location.hash = '#/';
+  render();
+});
 
 function go(hash) {
   location.hash = hash;
@@ -61,8 +140,6 @@ function go(hash) {
 // ---- 视图 ----------------------------------------------------------------
 
 function renderLogin(err) {
-  setNav([]);
-  conn.textContent = '';
   const access = h('input', { type: 'text', autocomplete: 'off' });
   const secret = h('input', { type: 'password', autocomplete: 'off' });
   const form = h('form', {
@@ -71,6 +148,7 @@ function renderLogin(err) {
       setCredentials({ accessKey: access.value, secretKey: secret.value });
       try {
         await listBuckets(); // 用一次真实调用验凭据，签名错自然 403
+        bucketNames = null;  // 换了凭据，侧栏的旧快照作废
         go('#/');
         render();
       } catch (e2) {
@@ -83,28 +161,33 @@ function renderLogin(err) {
     h('label', { text: 'Secret Key' }), secret,
     h('p', {}, h('button', { type: 'submit', text: '登录' })),
   );
-  view.replaceChildren(
-    h('h1', { text: '登录' }),
+  view.replaceChildren(h('div', { class: 'login' },
+    h('h1', { text: '登录 Rustorage' }),
+    h('p', { class: 'hint', text: '用与 aws-cli / mc 相同的 S3 凭据。' }),
     h('div', { class: 'card' }, form, err ? errorBox(err) : null),
     h('p', {
       class: 'hint',
       text: '凭据只存在本标签页的 sessionStorage 里，关闭标签页即失效。',
     }),
-  );
+  ));
 }
 
 async function renderBuckets() {
-  setNav([['桶', '#/'], ['服务状态', '#/status']]);
-  conn.textContent = '已连接';
-  view.replaceChildren(h('h1', { text: '桶' }), h('p', { class: 'hint', text: '加载中……' }));
+  setSidebar('#/', null);
+  setConn('连接中……');
+  view.replaceChildren(h('h1', { text: '概览' }), h('p', { class: 'hint', text: '加载中……' }));
   try {
     const names = await listBuckets();
+    bucketNames = names;
+    paintSidebar();
+    setConn('已连接');
     const rows = names.map((name) => h('tr', {
       class: 'clickable',
       onclick: () => go(`#/b/${encodeURIComponent(name)}/`),
     }, h('td', { class: 'mono', text: name })));
     view.replaceChildren(
-      h('h1', { text: `桶（${names.length}）` }),
+      h('h1', { text: '概览' }),
+      h('p', { class: 'hint', text: `${names.length} 个桶` }),
       names.length === 0
         ? h('p', { class: 'hint', text: '还没有桶。' })
         : h('table', {}, h('thead', {}, h('tr', {}, h('th', { text: '名称' }))), h('tbody', {}, ...rows)),
@@ -112,33 +195,36 @@ async function renderBuckets() {
       // 而不是显示空白或假值（设计 §5.4）。
     );
   } catch (err) {
-    view.replaceChildren(h('h1', { text: '桶' }), h('div', { class: 'card' }, errorBox(err)));
+    setConn('连接异常', true);
+    view.replaceChildren(h('h1', { text: '概览' }), h('div', { class: 'card' }, errorBox(err)));
   }
 }
 
 async function renderBrowse(bucket, prefix) {
-  setNav([['桶', '#/'], ['服务状态', '#/status']]);
-  conn.textContent = '已连接';
+  setSidebar('#/', bucket);
+  setConn('连接中……');
+  ensureBuckets(); // 从侧栏直接点进来的，侧栏可能还没取过桶
   const crumb = h('div', { class: 'crumb' });
-  crumb.append(h('a', { href: '#/', text: '桶' }), h('span', { text: ' / ' }));
+  crumb.append(h('a', { href: '#/', text: '概览' }), h('span', { text: '/' }));
   crumb.append(h('a', { href: `#/b/${encodeURIComponent(bucket)}/`, text: bucket }));
   if (prefix) {
     const segs = prefix.replace(/\/$/, '').split('/');
     segs.forEach((seg, i) => {
-      crumb.append(h('span', { text: ' / ' }));
+      crumb.append(h('span', { text: '/' }));
       crumb.append(h('a', {
         href: `#/b/${encodeURIComponent(bucket)}/${segs.slice(0, i + 1).join('/')}/`,
         text: seg,
       }));
     });
   }
-  view.replaceChildren(h('h1', { text: bucket }), crumb, h('p', { class: 'hint', text: '加载中……' }));
+  view.replaceChildren(h('h1', { class: 'mono', text: bucket }), crumb, h('p', { class: 'hint', text: '加载中……' }));
   try {
     const page = await listObjects(bucket, { prefix });
+    setConn('已连接');
     const rows = [
       // 前缀（「文件夹」）排在对象前面，与各家控制台的习惯一致。
       ...page.prefixes.map((p) => h('tr', {
-        class: 'clickable',
+        class: 'clickable row-prefix',
         onclick: () => go(`#/b/${encodeURIComponent(bucket)}/${p}`),
       }, h('td', { class: 'mono', text: p }), h('td', {}), h('td', {}))),
       ...page.keys.map((o) => {
@@ -150,7 +236,7 @@ async function renderBrowse(bucket, prefix) {
       }),
     ];
     view.replaceChildren(
-      h('h1', { text: bucket }),
+      h('h1', { class: 'mono', text: bucket }),
       crumb,
       rows.length === 0
         ? h('p', { class: 'hint', text: '这个前缀下没有对象。' })
@@ -177,7 +263,8 @@ async function renderBrowse(bucket, prefix) {
       h('p', { class: 'hint', text: `前缀：${prefix || '（根）'}　·　服务端无索引，大桶下列表较慢` }),
     );
   } catch (err) {
-    view.replaceChildren(h('h1', { text: bucket }), crumb, h('div', { class: 'card' }, errorBox(err)));
+    setConn('连接异常', true);
+    view.replaceChildren(h('h1', { class: 'mono', text: bucket }), crumb, h('div', { class: 'card' }, errorBox(err)));
   }
 }
 
@@ -222,8 +309,9 @@ async function showDetail(bucket, key) {
 }
 
 async function renderStatus() {
-  setNav([['桶', '#/'], ['服务状态', '#/status']]);
-  conn.textContent = '已连接';
+  setSidebar('#/status');
+  setConn('连接中……');
+  ensureBuckets();
   const ready = h('div', { class: 'card' },
     h('h2', { text: '就绪探针 /ready' }), h('p', { class: 'hint', text: '查询中……' }));
   const metrics = h('div', { class: 'card' },
@@ -231,6 +319,7 @@ async function renderStatus() {
   view.replaceChildren(h('h1', { text: '服务状态' }), ready, metrics);
 
   const r = await fetchReady();
+  setConn(r.ok ? '已连接' : '未就绪', !r.ok);
   ready.replaceChildren(
     h('h2', { text: '就绪探针 /ready' }),
     r.ok
@@ -262,7 +351,12 @@ async function renderStatus() {
 // ---- 路由 ----------------------------------------------------------------
 
 function render() {
-  if (!hasCredentials()) {
+  // 登录与否决定侧栏收不收起来（样式在 style.css 里按 data-state 分支）。
+  const authed = hasCredentials();
+  document.body.dataset.state = authed ? 'authed' : 'anon';
+  if (!authed) {
+    bucketNames = null;
+    setConn('');
     renderLogin(null);
     return;
   }
