@@ -3,3 +3,4 @@
 pub mod consts;
 pub mod disk_id;
 pub mod error;
+pub mod modes;

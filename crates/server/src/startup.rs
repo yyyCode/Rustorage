@@ -250,7 +250,7 @@ pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome> {
     if formats.is_empty() && should_initialize(&disk_errs) {
         let disks = initialize_disks(cfg).await?;
         let set = Arc::new(
-            ErasureSet::new(disks, cfg.parity())
+            ErasureSet::with_modes(disks, cfg.parity(), cfg.modes())
                 .map_err(|e| anyhow!("构造 erasure set 失败: {e}"))?,
         );
         return Ok(OpenOutcome { set });
@@ -309,7 +309,8 @@ pub async fn open_disks(cfg: &Config) -> anyhow::Result<OpenOutcome> {
     }
 
     let set = Arc::new(
-        ErasureSet::new(disks, cfg.parity()).map_err(|e| anyhow!("构造 erasure set 失败: {e}"))?,
+        ErasureSet::with_modes(disks, cfg.parity(), cfg.modes())
+            .map_err(|e| anyhow!("构造 erasure set 失败: {e}"))?,
     );
     Ok(OpenOutcome { set })
 }
@@ -411,6 +412,7 @@ mod tests {
             metrics: false,
             console: false,
             iam_dir: None,
+            io_mode: "old".into(),
         }
     }
 

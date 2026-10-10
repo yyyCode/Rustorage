@@ -6,6 +6,8 @@ use rstore_common::disk_id::DiskId;
 use rstore_common::error::DiskError;
 use rstore_disk::{DiskAPI, Fault, FaultyDisk, FileStat, LocalDisk};
 
+use rstore_common::modes::IoModes;
+
 use crate::set::ErasureSet;
 
 /// 内存 `AsyncRead`：各模块的测试用它把 `Vec<u8>` 喂进流式的
@@ -78,12 +80,21 @@ impl TestSet {
     }
 }
 
-/// 建 `total` 块盘、`parity` 为 `parity` 的 set（`data = total - parity`）。
-/// **`set_with_disks(6, 2)` 读作「6 块盘、parity=2、data=4」**——整个 M4 的测试都用这个约定。
+/// [`set_with_modes`] 的旧模式特化。**`set_with_disks(6, 2)` 读作「6 块盘、parity=2、
+/// data=4、四个机制全关」**——整个 M4 的测试都用这个约定。
+///
+/// 它就是「旧模式」在夹具层的定义：`set_with_disks` 与
+/// `set_with_modes(.., IoModes::default())` 必须永远等价，由
+/// `set_with_disks_is_old_mode` 钉住。
+pub async fn set_with_disks(total: u8, parity: u8) -> TestSet {
+    set_with_modes(total, parity, IoModes::default()).await
+}
+
+/// 建 `total` 块盘、`parity` 为 `parity` 的 set，并指定读写路径模式。
 ///
 /// 盘 `i` 的根是独立子目录 `{tmp}/disk{i}`：同根的话 6 块「盘」其实是同一个目录，
 /// 「6 副本、掉 2 块还能读」这些性质会退化成同义反复，测试全绿却什么都没测到。
-pub async fn set_with_disks(total: u8, parity: u8) -> TestSet {
+pub async fn set_with_modes(total: u8, parity: u8, modes: IoModes) -> TestSet {
     let dir = tempfile::TempDir::new().expect("create tempdir");
 
     let mut disks: Vec<Option<Arc<dyn DiskAPI>>> = Vec::with_capacity(total as usize);
@@ -98,7 +109,7 @@ pub async fn set_with_disks(total: u8, parity: u8) -> TestSet {
         disks.push(Some(erased));
     }
 
-    let set = ErasureSet::new(disks, parity).expect("valid erasure set geometry");
+    let set = ErasureSet::with_modes(disks, parity, modes).expect("valid erasure set geometry");
     TestSet {
         set,
         faulties,
@@ -284,5 +295,17 @@ mod tests {
         d.write_all("a", b"x")
             .await
             .expect("healthy again after clear");
+    }
+
+    /// `set_with_disks` 必须恰好是「旧模式」。谁要是让默认夹具悄悄带上新模式，
+    /// 整个 M4 的单测都会在测另一条路径，而所有断言照样是绿的。
+    #[tokio::test]
+    async fn set_with_disks_is_old_mode() {
+        let set = set_with_disks(2, 0).await;
+        assert_eq!(set.modes(), IoModes::default());
+
+        let set = set_with_modes(2, 0, IoModes::ALL).await;
+        assert_eq!(set.modes(), IoModes::ALL);
+        assert_eq!(set.total(), 2, "模式不该影响几何");
     }
 }
