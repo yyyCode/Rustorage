@@ -51,7 +51,7 @@
 | `crates/s3/src/impl_s3.rs` | 改 | `list_objects_v2` 改成分批取 |
 | `crates/store/benches/io_modes.rs` | 新增 | 基准（`harness = false`） |
 | `crates/store/Cargo.toml` | 改 | `[[bench]]` |
-| `docs/io-modes-bench.md` | 新增 | 跑出来的对比结果 |
+| `docs/benchmarks/io-modes/` | 新增 | 跑出来的对比结果（方法/结果/局限 + `raw/` 原始输出） |
 | `docs/DESIGN.md` | 改 | §11 追加范围读的 bitrot 语义 |
 
 ---
@@ -3770,19 +3770,25 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ## Task 9: 跑基准、写对比结果、同步文档
 
 **Files:**
-- Create: `docs/io-modes-bench.md`
+- Create: `docs/benchmarks/io-modes/{README,method,results,limitations}.md` + `raw/*.txt`
 - Modify: `docs/DESIGN.md:502-514`（§11）
+
+> **执行期修正（回填）：** 原计划把结果写成**单文件** `docs/io-modes-bench.md`。
+> 实际按用户要求改成了**独立文件夹** `docs/benchmarks/io-modes/`：方法、结果、
+> 局限各一份，原始输出原样存进 `raw/`。下面的骨架仍然成立，只是被拆到了
+> `results.md` 与 `limitations.md` 两个文件里。
 
 - [x] **Step 1: 跑基准，把输出原样记下来**
 
 Run: `cargo bench -p rstore-store --bench io_modes 2>&1 | tee /tmp/io-modes-bench.txt`
 
 **跑两次**：这条基准的价值有一半在「调用计数逐次相同」，只跑一次就没有这个证据。
+每次的完整输出都要**原样存档**进 `raw/`，不做整理。
 
 - [x] **Step 2: 写结果文档**
 
-创建 `docs/io-modes-bench.md`，**把上一步的真实输出填进去**（不要手抄成好看的形状——
-原样贴，附上机器与日期）。结构：
+创建 `docs/benchmarks/io-modes/` 下的四份文档 + `raw/`，**把上一步的真实输出填进去**
+（不要手抄成好看的形状——原样贴，附上机器与日期）。`results.md` 的结构：
 
 ```markdown
 # 读写路径新旧模式对比
@@ -3797,7 +3803,7 @@ L4_SIZE=16 MiB L4_ITERS=4 REPEAT=2
 
 ## 原始输出
 
-（原样贴 `cargo bench` 的输出，见 `docs/io-modes-bench.md`「原始输出」一节）
+（原样贴 `cargo bench` 的输出，见 `docs/benchmarks/io-modes/raw/`）
 
 ## 怎么读
 
@@ -3820,7 +3826,7 @@ L4_SIZE=16 MiB L4_ITERS=4 REPEAT=2
 ## 结论
 
 （逐条写：哪个机制在哪个负载上带来多少差、对照位是否干净、有哪些数字出乎预期。
-见 `docs/io-modes-bench.md`「结论」一节。**L3 列全桶是负数**——新模式多 33% 的
+见 `docs/benchmarks/io-modes/results.md`。**L3 列全桶是负数**——新模式多 33% 的
 `list_dir`、慢 13%，这是设计预告过的代价，报告里必须写出来，不能只报好消息。）
 
 ## 已知局限
@@ -3869,7 +3875,7 @@ git status --short docs/superpowers/specs/
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-git add docs/io-modes-bench.md docs/DESIGN.md docs/superpowers/plans/ docs/superpowers/specs/
+git add docs/benchmarks/ docs/DESIGN.md docs/superpowers/plans/ docs/superpowers/specs/
 git commit -m "docs: 读写路径新旧模式的对比结果 + DESIGN §11 同步
 
 记录 cargo bench 的原始输出与规模参数，并写清读法：计数是主证据、
@@ -3894,10 +3900,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 1. 把获胜路径合并成唯一路径；
 2. 删 `crates/common/src/modes.rs`、`ErasureSet` 的 `modes` / `resolve_cache` /
    `scratch_allocs` 字段与 `take_scratch_allocs()`、`with_modes`、`--io-mode`、
-   `config.rs` 的 `io_mode`、`startup.rs` 的传参、`docs/io-modes-bench.md`；
+   `config.rs` 的 `io_mode`、`startup.rs` 的传参；
 3. 等价测试改写成针对新行为的**回归测试**（不再测「新旧一致」）；
 4. 基准折叠成单模式，但**保留阴性对照**；
-5. 验收：全仓 grep 不到 `IoModes` / `io_mode` / `io-mode`。
+5. **`docs/benchmarks/io-modes/` 保留不删。** 设计规格 §10 第 4 条说的是基准保留；
+   这份对比文档是那次基准的证据，删掉它就只剩结论没有依据。合并之后它从「新旧对比」
+   变成「新路径为什么长这样」的历史记录，仍然有用。
+6. 验收：全仓 grep 不到 `IoModes` / `io_mode` / `io-mode`。
 
 ---
 
