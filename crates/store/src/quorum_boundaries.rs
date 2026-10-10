@@ -6,7 +6,7 @@ use rstore_disk::faulty::Fault;
 
 use crate::error::StoreError;
 use crate::put::PutArgs;
-use crate::testutil::{set_with_disks, TestSet};
+use crate::testutil::{body, set_with_disks, TestSet};
 // 本文件不需要 `ByteRange`：矩阵只跑整对象读。别顺手 import 它——
 // `cargo clippy --all-targets -- -D warnings` 会把未使用的导入判成失败。
 
@@ -27,7 +27,7 @@ enum Expect {
 /// 对象大小固定 2 MiB：跨 2 个 block，既走真编码路径又不至于让 7 个用例跑太久。
 const BODY: usize = 2 * 1024 * 1024;
 
-fn body(seed: u8) -> Vec<u8> {
+fn payload(seed: u8) -> Vec<u8> {
     let mut v = vec![0u8; BODY];
     for (i, b) in v.iter_mut().enumerate() {
         *b = (i as u8) ^ seed;
@@ -42,13 +42,14 @@ fn body(seed: u8) -> Vec<u8> {
 /// 「看起来测了，其实测的是别的东西」的假绿。PUT 阶段掉线数必须是 0。
 async fn run_case(offline: usize, op: Op, expect: Expect) {
     let set = set_with_disks(6, 2).await;
-    let data = body(7);
+    let data = payload(7);
 
     if matches!(op, Op::Read | Op::Delete) {
         set.put_object(PutArgs {
             bucket: "b".into(),
             key: "k".into(),
-            data: data.clone(),
+            body: body(data.clone()),
+            etag: None,
         })
         .await
         .expect("健康状态下 PUT 必须成功");
@@ -68,7 +69,8 @@ async fn run_case(offline: usize, op: Op, expect: Expect) {
             .put_object(PutArgs {
                 bucket: "b".into(),
                 key: "w".into(),
-                data: body(9),
+                body: body(payload(9)),
+                etag: None,
             })
             .await
             .map(|_| ()),
@@ -113,12 +115,13 @@ async fn matrix_4_plus_2() {
 #[tokio::test]
 async fn bitrot_on_minority_still_reads_correctly() {
     let set = set_with_disks(6, 2).await;
-    let data = body(3);
+    let data = payload(3);
     let out = set
         .put_object(PutArgs {
             bucket: "b".into(),
             key: "k".into(),
-            data: data.clone(),
+            body: body(data.clone()),
+            etag: None,
         })
         .await
         .unwrap();
@@ -137,12 +140,13 @@ async fn bitrot_on_minority_still_reads_correctly() {
 #[tokio::test]
 async fn bitrot_on_majority_exposes_corruption_not_wrong_data() {
     let set = set_with_disks(6, 2).await;
-    let data = body(5);
+    let data = payload(5);
     let out = set
         .put_object(PutArgs {
             bucket: "b".into(),
             key: "k".into(),
-            data: data.clone(),
+            body: body(data.clone()),
+            etag: None,
         })
         .await
         .unwrap();

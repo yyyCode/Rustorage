@@ -154,7 +154,7 @@ mod tests {
 
     use crate::error::StoreError;
     use crate::put::PutArgs;
-    use crate::testutil::{set_with_disks, TestSet};
+    use crate::testutil::{body, set_with_disks, TestSet};
 
     /// 对象内容取一段与长度绑定的可辨识字节，读到半截时断言能看出来。
     fn expected() -> Vec<u8> {
@@ -218,7 +218,8 @@ mod tests {
                 .put_object(PutArgs {
                     bucket: "b".into(),
                     key: "k".into(),
-                    data: expected(),
+                    body: body(expected()),
+                    etag: None,
                 })
                 .await;
             for i in 0..6 {
@@ -248,7 +249,8 @@ mod tests {
             set.put_object(PutArgs {
                 bucket: "b".into(),
                 key: "k".into(),
-                data: vec![1u8; 2_000_000],
+                body: body(vec![1u8; 2_000_000]),
+                etag: None,
             })
             .await
             .unwrap();
@@ -266,7 +268,8 @@ mod tests {
                 .put_object(PutArgs {
                     bucket: "b".into(),
                     key: "k".into(),
-                    data: vec![2u8; 2_000_000],
+                    body: body(vec![2u8; 2_000_000]),
+                    etag: None,
                 })
                 .await;
             for i in 0..6 {
@@ -370,7 +373,8 @@ mod tests {
         set.put_object(PutArgs {
             bucket: "b".into(),
             key: "k".into(),
-            data: vec![9u8; 1_000_000],
+            body: body(vec![9u8; 1_000_000]),
+            etag: None,
         })
         .await
         .unwrap();

@@ -507,11 +507,8 @@ push_block 因此变成 async（要 await append），三处调用点同步更�
 在 `crates/store/src/put.rs` 的 `mod tests` 里加一个夹具与两条测试：
 
 ```rust
-    /// 内存 body。tokio 给 `std::io::Cursor<T: AsRef<[u8]>>` 实现了 `AsyncRead`
-    /// （tokio-1.53.2/src/io/async_read.rs:111），所以不必自己造一个读取器。
-    fn body(data: Vec<u8>) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
-        Box::new(std::io::Cursor::new(data))
-    }
+    /// 内存 body。**不要在这里定义**——放到 `crate::testutil`（Step 7 有说明），
+    /// 七个测试模块都要用它。这里只需 `use crate::testutil::{body, set_with_disks, TestSet};`。
 
     /// 流式入口必须与原入口逐字节等价：同样的字节进去，同样的 etag / size / 盘上布局。
     #[tokio::test]
@@ -912,14 +909,42 @@ use md5::{Digest, Md5};
 并把 `etag_of` 里的那行局部 `use` 删掉。`md-5` 已是 `rstore-store` 的依赖
 （`crates/store/Cargo.toml`）。
 
-这个方法有 7 个参数（`body` / `first` / `dist` / `staging` / `write_quorum` /
-`step` / `etag`，不含 `&self`），正好在 `clippy::too_many_arguments` 的默认阈值 7 上
-——**不会报警**，不要加 `#[allow]`。仓库里同文件的 `build_meta` 也是 7 个参数、
-没有 allow，可作参照。若 `cargo clippy` 实际报了这条，再按报出来的数字处理。
+**`etag` 不是这个方法的参数**（原计划把它列进来了，实测两者都错）：
 
-- [ ] **Step 7: 更新 `mod tests` 里 4 处 `PutArgs` 构造**
+- **clippy 对方法会把 `&self` 计进 `too_many_arguments`**（默认阈值 7），所以
+  **方法**的名额只有 6 个，而自由函数才是 7 个。原计划拿 `build_meta`（自由函数、
+  7 个参数、无 allow）当参照，那是错的——照抄会直接 `-D warnings` 失败。
+- 更顺的修法不是加 `#[allow]`，而是**把 `etag` 挪出签名**：写入器的职责是
+  「写下去 + 算摘要」，「用算出来的还是调用方给的」是策略。内联分支本来就是这个分派
+  （`etag.unwrap_or_else(|| etag_of(&first))`），挪出去两支就对称了。
+  于是返回 `(shard_len, size, md5)`，调用方 `let etag = etag.unwrap_or(md5);`。
+- 改完参数是 `body` / `first` / `dist` / `staging` / `write_quorum` / `step` 六个，
+  加 `&self` 恰好 7，不报警。
 
-四处：`put_small_object_inlines_it`（399–403 行）、`put_large_object_creates_shards`
+- [ ] **Step 7: 更新**全 crate**的 `PutArgs` 构造点**
+
+**原计划只数了 `put.rs` 里的 4 处，那是错的**——`PutArgs` 是全 crate 的测试夹具，
+`cargo test -p rstore-store` 会一次性暴露其余 12 处。清单：
+
+| 位置 | 形态 | 改法 |
+|---|---|---|
+| `put.rs` 的 3 处直构造 | `data: …` | `body: body(…), etag: None` |
+| `bucket.rs:134` / `list.rs:153` | `fn put_args(bucket, key, n)` 辅助函数 | 函数体内改一次 |
+| `delete.rs:119` / `get.rs:480` | `fn put_args(bucket, key, data)` 辅助函数 | 函数体内改一次 |
+| `quorum_boundaries.rs` 3 处直构造 | `data: payload(n)` / `data: data.clone()` | 见下 |
+| `reconcile.rs` 4 处直构造 | 同上 | 同上 |
+
+`quorum_boundaries.rs` 里**已有一个本地 `fn body(seed: u8) -> Vec<u8>`**（造 payload 用），
+与本节新加的共享 helper 撞名。把它改名为 `payload`——它本来就是造 payload 的，
+新名字更贴切，改完 5 处调用点即可，然后从 `testutil` 导入 `body`。
+`crate::testutil::body(body(..))` 那种写法不要留。
+
+本节新加的 `fn body(data: Vec<u8>) -> Box<dyn AsyncRead + Unpin + Send>` **不放在
+`put.rs` 的测试模块里，而是放进 `crates/store/src/testutil.rs`**（`pub(crate)`）：
+上面那张表里已经有七个模块要用它，各自抄一份就是七份复制品。
+`testutil` 本来就是 `#[cfg(test)]` 门控的共用夹具（`lib.rs:18`）。
+
+以下针对 `put.rs` 本身：四处：`put_small_object_inlines_it`（399–403 行）、`put_large_object_creates_shards`
 （441–445 行）、`put_fails_below_write_quorum`（493–497 行）、以及 Step 1 新加的两条
 （它们已经用了新形态）。前三处把 `data: data.clone()` / `data: vec![0u8; 1_000_000]`
 换成 `body: body(data.clone())` / `body: body(vec![0u8; 1_000_000])`，并补

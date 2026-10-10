@@ -23,7 +23,10 @@ use rstore_meta::{
     encode, encode_body, ChecksumAlgo, FileVersionHeader, Flags, InlineData, ObjectBody,
     ObjectMeta, PartInfo, ShallowVersion, StorageClass, VersionType,
 };
+use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
+
+use md5::{Digest, Md5};
 
 use crate::commit::commit;
 use crate::delete::gc_superseded;
@@ -34,11 +37,18 @@ use crate::writer::BitrotShardWriter;
 /// 对象分块大小：1 MiB。写入器与读取器的 `block_size` 由几何算出（见 [`shard_step`]）。
 pub const BLOCK_SIZE: usize = 1 << 20;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一次写入的输入。
+///
+/// **不复用 `Debug` / `Clone` / `PartialEq`**：`body` 是流，这三者都派不出来
+/// （改造前它持有 `Vec<u8>`，所以曾经可以）。
 pub struct PutArgs {
     pub bucket: String,
     pub key: String,
-    pub data: Vec<u8>,
+    /// 请求体。**读一次就没了**——消费方不该假设它能重放。
+    pub body: Box<dyn AsyncRead + Unpin + Send>,
+    /// `Some` = 直接用这个 etag（P2 的 multipart Complete 传合成值）；
+    /// `None` = 边读边算整份内容的 MD5。
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +89,32 @@ pub(crate) fn expected_shard_len(size: u64, data: u8) -> u64 {
 /// S3 的 etag：真 MD5 的小写十六进制。**不能是自造摘要**——`aws-cli` / `mc` /
 /// `rclone` 单部分上传后比对的就是 MD5，换成别的会让它们在 PUT 成功后报校验失败。
 pub(crate) fn etag_of(data: &[u8]) -> String {
-    use md5::{Digest, Md5};
     format!("{:x}", Md5::digest(data))
+}
+
+/// 读「至多一个块」：读满 `BLOCK_SIZE` 或到 EOF 为止，两者取先到者。
+///
+/// 返回长度 `< BLOCK_SIZE` 就说明已经读到流末尾——调用方据此判定「没有更多了」。
+/// **这是整条写路径唯一的缓冲点**，上界就是 `BLOCK_SIZE`。
+///
+/// 不用 `AsyncReadExt::take().read_to_end()`：`take` 消费接收者，而我们需要
+/// 在下一轮继续读同一个流，改回来要写 `(&mut *body).take(..)` 这类借用体操。
+/// 逐次 `read` 到填满更直白，也与 `fsx::read_exact_at` 的循环同一种写法。
+async fn read_block(body: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Vec<u8>, StoreError> {
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let mut filled = 0usize;
+    while filled < BLOCK_SIZE {
+        let n = body
+            .read(&mut buf[filled..])
+            .await
+            .map_err(|e| StoreError::Internal(format!("read request body: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 /// 当前 unix 纳秒。GET 靠它在一个 key 存在多个版本目录时选出最新的那个（Task 4.7）。
@@ -167,9 +201,16 @@ pub(crate) fn build_delete_meta(version_id: Uuid) -> Result<ObjectMeta, StoreErr
 
 impl ErasureSet {
     /// 写入一个对象并提交。达到 `write_quorum` 才算成功。
+    ///
+    /// **流式**：请求体逐块读入、逐块编码落盘，峰值内存与对象大小无关（上界
+    /// `BLOCK_SIZE` + 一份分片）。
     pub async fn put_object(&self, args: PutArgs) -> Result<PutOut, StoreError> {
-        let PutArgs { bucket, key, data } = args;
-        let size = data.len() as u64;
+        let PutArgs {
+            bucket,
+            key,
+            mut body,
+            etag,
+        } = args;
         let total = self.total();
         let data_shards = self.data();
         let write_quorum = self.write_quorum();
@@ -202,13 +243,19 @@ impl ErasureSet {
             });
         }
 
-        let etag = etag_of(&data);
+        // 先读一个块。**这一步同时定尺寸**：读不满一个满块就说明整个对象到此为止，
+        // 于是 `known_len` 是精确值；读满了则说明对象至少一个块，后续长度不影响
+        // `shard_step`（它只看 `size.min(BLOCK_SIZE)`，见该函数的文档）。
+        let first = read_block(&mut *body).await?;
+        let known_len = (first.len() < BLOCK_SIZE).then_some(first.len() as u64);
 
-        if should_inline(size, /* versioned_bucket = */ false) {
+        if known_len.is_some_and(|s| should_inline(s, /* versioned_bucket = */ false)) {
             // 内联分支：数据进 meta.xl，不产生 part.*。阈值只此一份来源，
             // 绝不在本文件里再写一个常量。
+            let size = first.len() as u64;
+            let etag = etag.unwrap_or_else(|| etag_of(&first));
             let mut inline = InlineData::new();
-            inline.insert("null", data.clone());
+            inline.insert("null", first);
             let mut flags = Flags::empty();
             flags.insert(Flags::INLINE_DATA);
             let body = ObjectBody {
@@ -226,33 +273,56 @@ impl ErasureSet {
             meta.inline = inline;
             let bytes = encode(&meta)?;
             self.write_meta_all(&staging, &bytes).await;
-        } else {
-            self.write_shards(&data, size, &dist, &staging, write_quorum)
-                .await?;
 
-            let shard_len = expected_shard_len(size, data_shards);
-            let mut flags = Flags::empty();
-            // 本版本确实用了数据目录（目录名就是 data_dir）。
-            flags.insert(Flags::USES_DATA_DIR);
-            let body = ObjectBody {
-                id: Some(data_dir),
-                parts: vec![PartInfo {
-                    number: 1,
-                    size: shard_len,
-                    actual_size: size,
-                    etag: etag.clone(),
-                    index: None,
-                }],
-                ec_dist: dist.clone(),
-                checksum_algo: ChecksumAlgo::Crc32c,
-                storage_class: StorageClass::Standard,
-                meta_user: BTreeMap::new(),
-                meta_sys: BTreeMap::new(),
-            };
-            let meta = build_meta(size, data_shards, total, data_dir, version_id, flags, body)?;
-            let bytes = encode(&meta)?;
-            self.write_meta_all(&staging, &bytes).await;
+            // 提交：rename 达到 quorum 才算成功；低于时由 `commit` best-effort 回滚
+            // 它自己 rename 过去的那些目录。
+            commit(self, &staging, &final_rel, write_quorum).await?;
+
+            // **先提交、后 GC，顺序不可颠倒**：反过来就是在删还没提交的数据。
+            gc_superseded(self, &bucket, &key, &data_dir.to_string()).await;
+
+            return Ok(PutOut {
+                size,
+                etag,
+                data_dir,
+                version_id,
+            });
         }
+
+        // 分片分支。
+        //
+        // `shard_step` 只需要 `size.min(BLOCK_SIZE)`：已知总长时传它；未知时说明
+        // 对象至少有一个满块，`min` 的结果恒为 `BLOCK_SIZE`，传哪个够大的值都一样。
+        let step = shard_step(known_len.unwrap_or(BLOCK_SIZE as u64), data_shards);
+
+        let (shard_len, size, md5) = self
+            .write_shards_stream(&mut *body, first, &dist, &staging, write_quorum, step)
+            .await?;
+        // 调用方给了 etag 就用它（P2 的 multipart Complete 传的是合成的 `-N` 形式）；
+        // 否则用边读边算出来的真 MD5。策略在这里拍板，写入器只管算。
+        let etag = etag.unwrap_or(md5);
+
+        let mut flags = Flags::empty();
+        // 本版本确实用了数据目录（目录名就是 data_dir）。
+        flags.insert(Flags::USES_DATA_DIR);
+        let body = ObjectBody {
+            id: Some(data_dir),
+            parts: vec![PartInfo {
+                number: 1,
+                size: shard_len,
+                actual_size: size,
+                etag: etag.clone(),
+                index: None,
+            }],
+            ec_dist: dist.clone(),
+            checksum_algo: ChecksumAlgo::Crc32c,
+            storage_class: StorageClass::Standard,
+            meta_user: BTreeMap::new(),
+            meta_sys: BTreeMap::new(),
+        };
+        let meta = build_meta(size, data_shards, total, data_dir, version_id, flags, body)?;
+        let bytes = encode(&meta)?;
+        self.write_meta_all(&staging, &bytes).await;
 
         // 提交：rename 达到 quorum 才算成功；低于时由 `commit` best-effort 回滚
         // 它自己 rename 过去的那些目录。
@@ -280,22 +350,33 @@ impl ErasureSet {
         }
     }
 
-    /// 大对象分支：按几何把对象切成 `data` 个分片、编码出 `parity` 个校验分片，
-    /// 按 `dist` 派到各盘的单个 `part.1` 写入器，最后统一 `finish`。
+    /// 分片写入：从 `body` 逐块读、逐块编码、逐块追加到各盘的 `part.1`。
+    ///
+    /// 返回 `(每块盘上的分片字节数, 对象总长, 内容的 MD5)`。分片字节数是读侧构造
+    /// 读取器时要的 `shard_len`，由 `expected_shard_len` 用**实际读到的总长**复算——
+    /// 与读侧共用同一个函数，两边各算各的必然漂移。
+    ///
+    /// **这里只算 MD5，不决定最终 etag**：写入器的职责是「写下去 + 算摘要」，
+    /// 「用算出来的还是用调用方给的」是策略，归调用方（内联分支也是这么分派的），
+    /// 两支因此对称。顺带把参数压到 6 个——clippy 对**方法**会把 `&self` 计进
+    /// `too_many_arguments`（阈值 7），所以方法的名额只有 6 个。
+    ///
+    /// `first` 是调用方已经读出来的第一个块（可能已到 EOF，即一个短块）。
     ///
     /// 低于 quorum 直接返回错误，**且不清理已写的分片**：残留由对账流程回收
     /// （DESIGN §12.2）。主动清理反而会把崩溃残留抹掉，让对账的可回收性无处可测。
-    async fn write_shards(
+    async fn write_shards_stream(
         &self,
-        data: &[u8],
-        size: u64,
+        body: &mut (dyn AsyncRead + Unpin + Send),
+        first: Vec<u8>,
         dist: &[u8],
         staging: &str,
         write_quorum: u8,
-    ) -> Result<(), StoreError> {
+        step: u64,
+    ) -> Result<(u64, u64, String), StoreError> {
         let data_shards = self.data();
         let parity = self.parity();
-        let step = shard_step(size, data_shards) as usize;
+        let step = step as usize;
         let part_rel = format!("{staging}/part.1");
 
         // 循环外为每块盘建一个写入器；掉线的槽位没有写入器。
@@ -308,11 +389,18 @@ impl ErasureSet {
             })
             .collect();
 
-        let n = size.div_ceil(BLOCK_SIZE as u64);
-        for k in 0..n {
-            let start = (k * BLOCK_SIZE as u64) as usize;
-            let end = ((k + 1) * BLOCK_SIZE as u64).min(size) as usize;
-            let block = &data[start..end];
+        let mut md5 = Md5::new();
+        let mut size: u64 = 0;
+        let mut block = first;
+
+        loop {
+            // 空块只可能在 EOF 时出现（且此时前面的判断已经 break），
+            // 留着这道闸是为了不把「空块」喂进 `push_block`——它会当成布局错误拒绝。
+            if block.is_empty() {
+                break;
+            }
+
+            md5.update(&block);
             let shard_size_k =
                 even_ceil((block.len() as u64).div_ceil(u64::from(data_shards))) as usize;
 
@@ -366,6 +454,13 @@ impl ErasureSet {
                     writers[physical] = None;
                 }
             }
+
+            size += block.len() as u64;
+            // 短块就是最后一块——这里 break，绝不再去读流，否则会多等一次 IO。
+            if block.len() < BLOCK_SIZE {
+                break;
+            }
+            block = read_block(body).await?;
         }
 
         let mut achieved = 0u8;
@@ -380,7 +475,9 @@ impl ErasureSet {
                 required: write_quorum,
             });
         }
-        Ok(())
+
+        let shard_len = expected_shard_len(size, data_shards);
+        Ok((shard_len, size, format!("{:x}", md5.finalize())))
     }
 }
 
@@ -391,7 +488,7 @@ mod tests {
 
     use super::*;
     use crate::error::StoreError;
-    use crate::testutil::{set_with_disks, TestSet};
+    use crate::testutil::{body, set_with_disks, TestSet};
 
     /// 某块盘上 `bucket/key/<data_dir>` 里的文件名（已排序）。
     /// 走 `DiskAPI::list_dir` 而不是直接碰文件系统：夹具里的盘可能被 `FaultyDisk`
@@ -414,7 +511,8 @@ mod tests {
             .put_object(PutArgs {
                 bucket: "b".into(),
                 key: "small".into(),
-                data: data.clone(),
+                body: body(data.clone()),
+                etag: None,
             })
             .await
             .unwrap();
@@ -451,12 +549,12 @@ mod tests {
     #[tokio::test]
     async fn put_large_object_creates_shards() {
         let set = set_with_disks(6, 2).await;
-        let data = vec![7u8; 1_500_000]; // 2 个 block：1 MiB + 451 424
         let out = set
             .put_object(PutArgs {
                 bucket: "b".into(),
                 key: "big".into(),
-                data: data.clone(),
+                body: body(vec![7u8; 1_500_000]), // 2 个 block：1 MiB + 451 424
+                etag: None,
             })
             .await
             .unwrap();
@@ -490,6 +588,58 @@ mod tests {
         }
     }
 
+    /// 流式入口必须与原入口逐字节等价：同样的字节进去，同样的 etag / size / 盘上布局。
+    #[tokio::test]
+    async fn streaming_put_matches_buffered_put() {
+        let set = set_with_disks(6, 2).await;
+        let data: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+        let out = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "streamed".into(),
+                body: body(data.clone()),
+                etag: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(out.size, 1_500_000);
+        // etag 必须还是真 MD5——边读边算的实现在这里最容易退化成「半个对象的 MD5」。
+        assert_eq!(out.etag, etag_of(&data));
+
+        // 盘上分片长度与读侧独立复算的那个数一致（与 put_large_object_creates_shards 同款断言）。
+        let step = shard_step(out.size, 4);
+        let expect_on_disk = rstore_checksum::bitrot_size(expected_shard_len(out.size, 4), step);
+        for i in 0..6 {
+            let d = set.disks()[i].as_ref().unwrap();
+            let st = d
+                .stat(&format!("b/streamed/{}/part.1", out.data_dir))
+                .await
+                .unwrap()
+                .expect("part.1 必须存在");
+            assert_eq!(st.size, expect_on_disk, "disk {i}");
+        }
+    }
+
+    /// 调用方给了 etag 就必须用它，而不是算出来的 MD5。P2 的 multipart Complete
+    /// 靠这条把合成的 `-N` 形式写进对象。
+    #[tokio::test]
+    async fn supplied_etag_wins_over_computed_md5() {
+        let set = set_with_disks(6, 2).await;
+        let data = vec![3u8; 1_500_000];
+        let out = set
+            .put_object(PutArgs {
+                bucket: "b".into(),
+                key: "given".into(),
+                body: body(data.clone()),
+                etag: Some("d41d8cd98f00b204e9800998ecf8427e-2".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.etag, "d41d8cd98f00b204e9800998ecf8427e-2");
+        assert_ne!(out.etag, etag_of(&data), "必须不是算出来的那个");
+    }
+
     /// etag 是给 S3 客户端比对的，必须是真 MD5。这条用已知向量钉死，
     /// 免得后来有人「优化」成自造摘要——那会让客户端在 PUT 成功后报校验失败。
     #[test]
@@ -508,7 +658,8 @@ mod tests {
             .put_object(PutArgs {
                 bucket: "b".into(),
                 key: "k".into(),
-                data: vec![0u8; 1_000_000],
+                body: body(vec![0u8; 1_000_000]),
+                etag: None,
             })
             .await;
         // `WriteQuorum` 是 struct 变体，`matches!` 里必须带 `{ .. }`（原计划漏了，
