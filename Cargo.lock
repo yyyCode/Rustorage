@@ -1431,6 +1431,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rstore-iam"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rstore-meta"
 version = "0.1.0"
 dependencies = [

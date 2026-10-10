@@ -19,6 +19,9 @@ rstore-store     = { path = "crates/store" }
 rstore-api       = { path = "crates/api" }
 rstore-s3        = { path = "crates/s3" }
 rstore-s3-compat = { path = "crates/s3-compat" }
+# 身份与访问管理。**叶子 crate，不依赖任何其他 rstore-***：动作名与资源名
+# 都只是 &str，所以策略引擎的单测不需要起 HTTP。
+rstore-iam       = { path = "crates/iam" }
 
 # 外部
 tokio = { version = "1", features = ["full"] }
